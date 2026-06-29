@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# vcam-setup – diagnose and configure v4l2loopback for Chromium compatibility
+#
+# Chromium-based browsers pick the FIRST /dev/video* node by default.
+# If that's your real camera and vcam is using it, you get NotReadableError.
+# The fix is to make the v4l2loopback device sit at a LOWER video_nr than
+# the real camera.
+#
+# This script:
+#   - lists current video devices and analyses ordering
+#   - writes /etc/modprobe.d/vcam.conf with video_nr=0 + correct params
+#   - detects whether the system uses systemd, OpenRC, runit, or none of
+#     those, and gives you concrete next steps for YOUR init system
+#
+# Run with sudo to install.
+
+set -eu
+
+# ── help ─────────────────────────────────────────────────────
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    sed -n '/^# vcam-setup/,/^$/p' "$0" | sed 's/^# \?//'
+    echo "Usage:"
+    echo "  vcam-setup              show current state and diagnosis"
+    echo "  sudo vcam-setup --install    install /etc/modprobe.d/vcam.conf"
+    echo "  sudo vcam-setup --uninstall  remove it"
+    exit 0
+fi
+
+INIT_SYSTEM=""
+detect_init() {
+    if [[ -d /run/systemd/system ]]; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-status &>/dev/null && rc-status &>/dev/null; then
+        INIT_SYSTEM="openrc"
+    elif command -v sv &>/dev/null && [[ -d /etc/service || -d /var/service ]]; then
+        INIT_SYSTEM="runit"
+    elif [[ -d /etc/rc.d || -d /etc/init.d ]]; then
+        INIT_SYSTEM="sysv-or-bsd"
+    else
+        INIT_SYSTEM="unknown"
+    fi
+}
+
+list_devices() {
+    echo "── Current /dev/video* devices ─────────────────────────"
+    for dev in /dev/video*; do
+        [[ -e $dev ]] || continue
+        local name="" driver=""
+        if command -v v4l2-ctl &>/dev/null; then
+            name=$(v4l2-ctl -d "$dev" --info 2>/dev/null | \
+                   awk -F': ' '/Card type/ {print $2; exit}')
+            driver=$(v4l2-ctl -d "$dev" --info 2>/dev/null | \
+                     awk -F': ' '/Driver name/ {print $2; exit}')
+        fi
+        printf "  %-15s  %-25s  (driver: %s)\n" "$dev" "${name:-?}" "${driver:-?}"
+    done
+    echo ""
+}
+
+# ── show current state ───────────────────────────────────────
+list_devices
+detect_init
+
+LOOPBACK_DEV=""
+REAL_CAMS=()
+for dev in /dev/video*; do
+    [[ -e $dev ]] || continue
+    if command -v v4l2-ctl &>/dev/null; then
+        driver=$(v4l2-ctl -d "$dev" --info 2>/dev/null | \
+                 awk -F': ' '/Driver name/ {print $2; exit}')
+        if [[ "$driver" == "v4l2 loopback" ]]; then
+            LOOPBACK_DEV="$dev"
+        elif [[ -n "$driver" ]]; then
+            REAL_CAMS+=("$dev")
+        fi
+    fi
+done
+
+# ── analysis ─────────────────────────────────────────────────
+echo "── Analysis ────────────────────────────────────────────"
+echo "  Init system : $INIT_SYSTEM"
+if [[ -z "$LOOPBACK_DEV" ]]; then
+    echo "  Loopback    : NOT FOUND"
+else
+    echo "  Loopback    : $LOOPBACK_DEV"
+fi
+if [[ ${#REAL_CAMS[@]} -eq 0 ]]; then
+    echo "  Real cam    : NOT FOUND"
+else
+    echo "  Real cam(s) : ${REAL_CAMS[*]}"
+fi
+echo ""
+
+if [[ -n "$LOOPBACK_DEV" && ${#REAL_CAMS[@]} -gt 0 ]]; then
+    loopback_nr=${LOOPBACK_DEV#/dev/video}
+    # Find the lowest-numbered real cam
+    lowest_real=999
+    for rc in "${REAL_CAMS[@]}"; do
+        n=${rc#/dev/video}
+        (( n < lowest_real )) && lowest_real=$n
+    done
+    echo "── Chromium compatibility ──────────────────────────────"
+    if (( loopback_nr < lowest_real )); then
+        echo "  OK — loopback at $LOOPBACK_DEV comes before real cam at /dev/video$lowest_real"
+        echo "  Chromium should pick the loopback by default."
+    else
+        echo "  PROBLEM — loopback ($LOOPBACK_DEV) is AFTER real cam (/dev/video$lowest_real)"
+        echo "  Chromium will try /dev/video$lowest_real first → NotReadableError."
+        echo ""
+        echo "  To fix:  sudo $0 --install"
+    fi
+    echo ""
+fi
+
+# ── install ──────────────────────────────────────────────────
+if [[ "${1:-}" == "--install" ]]; then
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: --install requires root." >&2
+        exit 1
+    fi
+
+    # /etc/modprobe.d/ works regardless of init system — it's read by
+    # modprobe itself, not by an init system.
+    mkdir -p /etc/modprobe.d
+    cat > /etc/modprobe.d/vcam.conf <<MODPROBE
+# vcam virtual camera (v4l2loopback)
+# video_nr=0       claim /dev/video0 so Chromium picks it by default
+# card_label       human-readable name in browser camera lists
+# exclusive_caps=1 advertise only V4L2_CAP_VIDEO_CAPTURE — required for Firefox/Chromium
+# max_buffers=2    real-camera-like buffer count
+options v4l2loopback video_nr=0 card_label="vcam" exclusive_caps=1 max_buffers=2
+MODPROBE
+    echo "Wrote /etc/modprobe.d/vcam.conf"
+
+    # Also write systemd's modules-load.d if the directory exists, since
+    # it's harmless on other systems and helpful where systemd is present.
+    if [[ -d /etc/modules-load.d ]]; then
+        echo "v4l2loopback" > /etc/modules-load.d/vcam.conf
+        echo "Wrote /etc/modules-load.d/vcam.conf (systemd-style autoload)"
+    fi
+
+    echo ""
+    echo "── Init-system-specific next steps ─────────────────────"
+    case "$INIT_SYSTEM" in
+      systemd)
+        cat <<MSG
+  systemd: /etc/modules-load.d/vcam.conf already written above.
+  systemd will auto-load v4l2loopback at boot before USB devices.
+  To activate now without rebooting:
+      sudo modprobe -r uvcvideo
+      sudo modprobe -r v4l2loopback
+      sudo modprobe v4l2loopback
+      sudo modprobe uvcvideo
+MSG
+        ;;
+      openrc)
+        cat <<MSG
+  OpenRC: append the module name to the modules autoload list:
+      echo "v4l2loopback" | sudo tee -a /etc/conf.d/modules
+  Then to activate immediately:
+      sudo modprobe -r uvcvideo
+      sudo modprobe -r v4l2loopback
+      sudo modprobe v4l2loopback
+      sudo modprobe uvcvideo
+MSG
+        ;;
+      runit)
+        cat <<MSG
+  runit (e.g. Void Linux): add v4l2loopback to the kernel module loader:
+      echo "v4l2loopback" | sudo tee -a /etc/modules.d/vcam.conf
+  Some distros instead use /etc/modules — try both.
+  Activate immediately:
+      sudo modprobe -r uvcvideo
+      sudo modprobe -r v4l2loopback
+      sudo modprobe v4l2loopback
+      sudo modprobe uvcvideo
+MSG
+        ;;
+      *)
+        cat <<MSG
+  Manual / unknown init: load v4l2loopback at boot via whatever
+  mechanism you normally use (rc.local, /etc/modules, an init script,
+  etc.). The key requirement is that v4l2loopback is loaded BEFORE
+  the uvcvideo module / before USB cameras enumerate.
+
+  Activate immediately:
+      sudo modprobe -r uvcvideo
+      sudo modprobe -r v4l2loopback
+      sudo modprobe v4l2loopback
+      sudo modprobe uvcvideo
+
+  Or for a permanent setup on a manual init system, add this to your
+  boot script (e.g. /etc/rc.local) before any device setup:
+      modprobe v4l2loopback
+MSG
+        ;;
+    esac
+
+    echo ""
+    echo "After reloading the modules, run this script again to verify."
+    echo "Then start vcam with the new device numbers, e.g.:"
+    echo "    vcam -i /dev/video1 -o /dev/video0"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: --uninstall requires root." >&2
+        exit 1
+    fi
+    rm -f /etc/modprobe.d/vcam.conf
+    rm -f /etc/modules-load.d/vcam.conf 2>/dev/null || true
+    echo "Removed /etc/modprobe.d/vcam.conf"
+    echo "Reload modules or reboot to fully revert."
+    exit 0
+fi
+
+echo "Usage:"
+echo "  $0              show current state and diagnosis"
+echo "  sudo $0 --install    install /etc/modprobe.d/vcam.conf"
+echo "  sudo $0 --uninstall  remove it"

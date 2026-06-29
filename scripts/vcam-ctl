@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+#
+# vcam-ctl – complete runtime control for a running vcam process.
+#
+# Usage:
+#   vcam-ctl <command> [args...]
+#
+# Overlay commands:
+#   list                                                  show active overlays
+#                                                         (draw order: first = bottom,
+#                                                          last = on top)
+#   add img      <id> <x> <y> [<w> [<h>]] <file>          image (PNG/JPEG)
+#   add vid      <id> <x> <y> [<w> [<h>]] <file>          video (loops)
+#   add vid-once <id> <x> <y> [<w> [<h>]] <file>          video (plays once)
+#   add screen   <id> <x> <y> [<w> [<h>]] <WxH+X+Y>       live screen region
+#   add webcam   <id> <x> <y> [<w> [<h>]] [-]            same webcam as the main
+#                                                         pipeline, shown at <x,y>
+#                                                         scaled to <w x h>. Path arg
+#                                                         is unused — pass "-" or
+#                                                         anything. Multiple webcam
+#                                                         overlays are fine; they
+#                                                         all share one capture.
+#   remove <id>                                           remove one overlay
+#   remove all                                            remove every overlay
+#   move   <id> [x=N|N] [y=N|N]    Positional or x=/y=. Each value may
+#                                  be a number, "keep", or "-" (= keep).
+#                                  Missing = keep current. Default action
+#                                  for positions is "keep".
+#   resize <id> [w=N|N] [h=N|N]    Positional or w=/h=. Each value may
+#                                  be a number, "keep", or "auto" / "-"
+#                                  (derive from source aspect ratio).
+#                                  Missing = auto. Default action for
+#                                  resize is "auto".
+#   raise  <id>                    bring overlay to the top (drawn last)
+#   lower  <id>                    send overlay to the bottom (drawn first)
+#   z      <id> <N>                explicit z-index: 0 = bottom, -1 = top,
+#                                  -2 = second-from-top, etc.
+#
+# Filter commands:
+#   filter help                                           list available filters
+#   filter list                                           show active chain
+#   filter add <name> [<param>]
+#   filter set <index> <param>                            update parameter live
+#   filter remove <index>
+#   filter clear
+#
+# Screen commands (formerly the vcam-screen script):
+#   screen                       Pick a region with slurp/slop and add it.
+#                                Auto-picks a free ID (screen, screen2, …).
+#   screen --full                Capture the whole monitor. If multiple
+#                                monitors are connected and you didn't pass
+#                                --monitor, an interactive picker appears.
+#   screen --monitor <name|N>    Pick a specific monitor for --full, by
+#                                connector name (e.g. DP-1, HDMI-A-1) or
+#                                1-based index. Suppresses the picker.
+#   screen --monitors            List connected monitors and exit.
+#   screen --list                List active screen overlays.
+#   screen --remove [id]         Remove a screen overlay (default id: "screen").
+#   screen --remove-all          Remove all active screen overlays.
+#
+#   Screen options accepted with or without --full:
+#     -i <id>      Overlay ID                  (default: auto)
+#     -x <px>      Destination X               (default: 0)
+#     -y <px>      Destination Y               (default: 0)
+#     -w <px>      Destination width           (only -w preserves aspect)
+#     -h <px>      Destination height
+#     -r           Replace existing overlay with the same ID first
+#
+# Webcam-as-overlay quick command (great for screencasting):
+#   webcam <tl|tr|bl|br|center|full> [width] [id]
+#                                Add a webcam overlay that shares the
+#                                main pipeline's V4L2 capture. Multiple
+#                                instances are fine — pass a different
+#                                <id> to avoid replacing. Default id is
+#                                "cam", default width 320, position tr.
+#                                "full" stretches it to the full output.
+#   webcam off                   Remove the "cam" overlay.
+#
+# Other:
+#   help                                                  IPC command list
+#   --help, -h                                            this message
+#
+# Notes:
+#   - Passing only <w> (no <h>) preserves source aspect ratio for overlays.
+#   - Default socket path is /tmp/vcam.sock. Override with VCAM_SOCK.
+#   - See also: vcam-tune (interactive filter dial), vcam-setup (boot config).
+
+SOCK="${VCAM_SOCK:-/tmp/vcam.sock}"
+
+show_help() { sed -n '/^# vcam-ctl/,/^$/p' "$0" | sed 's/^# \?//'; }
+
+# ── basic usage / help ───────────────────────────────────────
+if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then
+    show_help
+    exit 0
+fi
+
+# ── check vcam is alive ──────────────────────────────────────
+require_running() {
+    if [[ ! -S "$SOCK" ]]; then
+        echo "Error: vcam is not running (socket $SOCK not found)" >&2
+        exit 1
+    fi
+}
+
+# ── send an IPC command and print the reply ──────────────────
+ipc_send() {
+    require_running
+    printf '%s\nquit\n' "$*" | ncat -U "$SOCK"
+}
+
+# ── bare-metal monitor detection ─────────────────────────────
+# Lists connected monitors as one line each: "NAME WxH X Y"
+# Uses /sys/class/drm for resolution (works everywhere). For accurate
+# X/Y positions on multi-monitor setups, falls back to swaymsg if
+# present — without it we report 0,0 for all monitors (correct for
+# single-monitor; possibly wrong offset for non-primary on multi).
+detect_monitors() {
+    # Try sway first — it gives us real positions, not just resolutions.
+    if command -v swaymsg >/dev/null 2>&1 \
+       && swaymsg -t get_outputs --pretty 2>/dev/null | grep -q "^Output "; then
+        swaymsg -t get_outputs --pretty 2>/dev/null | awk '
+            /^Output / { name=$2 }
+            /Current mode: / { mode=$3 }
+            /Position: / {
+                gsub(",", " ", $2)
+                if (name && mode) {
+                    split($2, p, " ")
+                    print name, mode, p[1], p[2]
+                    name=""; mode=""
+                }
+            }
+        '
+        return 0
+    fi
+    # Bare-metal fallback: /sys/class/drm — only gives resolution.
+    for status_file in /sys/class/drm/card*/status; do
+        [[ -r "$status_file" ]] || continue
+        [[ "$status_file" =~ /card[0-9]+-[^/]+/status$ ]] || continue
+        if [[ "$(cat "$status_file")" == "connected" ]]; then
+            local dir="${status_file%/status}"
+            local name mode
+            name=$(basename "$dir" | sed 's/^card[0-9]*-//')
+            mode=$(head -1 "$dir/modes" 2>/dev/null)
+            if [[ -n "$mode" && "$mode" =~ ^[0-9]+x[0-9]+$ ]]; then
+                echo "$name $mode 0 0"
+            fi
+        fi
+    done
+}
+
+# Resolves a monitor selector (name or 1-based index) to a "NAME WxH X Y"
+# line. Empty selector + single monitor → that monitor. Empty selector +
+# multiple monitors → interactive prompt.
+resolve_monitor() {
+    local selector="$1"
+    local lines
+    lines=$(detect_monitors)
+    [[ -z "$lines" ]] && { return 1; }
+
+    local count
+    count=$(echo "$lines" | wc -l)
+
+    # Specific selector
+    if [[ -n "$selector" ]]; then
+        if [[ "$selector" =~ ^[0-9]+$ ]]; then
+            echo "$lines" | sed -n "${selector}p"
+        else
+            echo "$lines" | awk -v n="$selector" '$1 == n { print; exit }'
+        fi
+        return 0
+    fi
+
+    # Single monitor: just use it
+    if [[ $count -eq 1 ]]; then
+        echo "$lines"
+        return 0
+    fi
+
+    # Multiple monitors: interactive prompt
+    # Only require stdin to be a TTY — stdout is captured by $(...) so
+    # -t 1 would always fail when called via command substitution.
+    if [[ ! -t 0 ]]; then
+        echo "$lines" | head -1
+        return 0
+    fi
+
+    echo "Multiple monitors connected:" >&2
+    local i=0
+    while IFS= read -r line; do
+        i=$((i+1))
+        read -r name mode x y <<< "$line"
+        printf "  %d) %-12s %s  at (%d,%d)\n" "$i" "$name" "$mode" "$x" "$y" >&2
+    done <<< "$lines"
+    printf "Select monitor (1-%d, default 1): " "$count" >&2
+    local choice
+    read -r choice
+    [[ -z "$choice" ]] && choice=1
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > count )); then
+        echo "Invalid selection" >&2; return 1
+    fi
+    echo "$lines" | sed -n "${choice}p"
+}
+
+# ──────────────────────────────────────────────────────────────
+# screen subcommand — fully merged from old vcam-screen
+# ──────────────────────────────────────────────────────────────
+if [[ "$1" == "screen" ]]; then
+    shift
+    require_running
+
+    ID=""
+    DST_X=0; DST_Y=0; DST_W=0; DST_H=0
+    REPLACE=0
+    FULL=0
+    MONITOR=""
+    ACTION="add"   # add | list | remove | remove-all | monitors
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help) show_help; exit 0 ;;
+            -i) ID="$2"; shift 2 ;;
+            -x) DST_X="$2"; shift 2 ;;
+            -y) DST_Y="$2"; shift 2 ;;
+            -w) DST_W="$2"; shift 2 ;;
+            -h) DST_H="$2"; shift 2 ;;
+            --full) FULL=1; shift ;;
+            --monitor) MONITOR="$2"; shift 2 ;;
+            --monitors) ACTION="monitors"; shift ;;
+            -r|--replace) REPLACE=1; shift ;;
+            --list) ACTION="list"; shift ;;
+            --remove)
+                ACTION="remove"
+                if [[ $# -ge 2 && "$2" != -* ]]; then ID="$2"; shift 2
+                else ID="screen"; shift; fi ;;
+            --remove-all) ACTION="remove-all"; shift ;;
+            *) echo "Unknown screen option: $1  (try --help)" >&2; exit 1 ;;
+        esac
+    done
+
+    # ── list / remove / monitors paths ──
+    if [[ "$ACTION" == "monitors" ]]; then
+        lines=$(detect_monitors)
+        if [[ -z "$lines" ]]; then
+            echo "No monitors detected." >&2; exit 1
+        fi
+        i=0
+        while IFS= read -r line; do
+            i=$((i+1))
+            read -r name mode x y <<< "$line"
+            printf "  %d) %-12s %s  at (%d,%d)\n" "$i" "$name" "$mode" "$x" "$y"
+        done <<< "$lines"
+        exit 0
+    fi
+
+    if [[ "$ACTION" == "list" ]]; then
+        ipc_send list | grep '\[screen\]' || echo "no screen overlays"
+        exit 0
+    fi
+    if [[ "$ACTION" == "remove" ]]; then
+        ipc_send "remove $ID"
+        exit 0
+    fi
+    if [[ "$ACTION" == "remove-all" ]]; then
+        ipc_send list | grep -oE '\[screen\] id=[^ ]+' | \
+            awk -F= '{print $2}' | while read -r oid; do
+                [[ -n "$oid" ]] && { echo "removing $oid"; ipc_send "remove $oid"; }
+            done
+        exit 0
+    fi
+
+    # ── add path ──
+    # Auto-pick a free ID if user didn't provide one
+    if [[ -z "$ID" ]]; then
+        EXISTING=$(ipc_send list 2>/dev/null | grep -oE 'id=[^ ]+' | awk -F= '{print $2}')
+        if ! echo "$EXISTING" | grep -qx "screen"; then
+            ID="screen"
+        else
+            i=2
+            while echo "$EXISTING" | grep -qx "screen$i"; do i=$((i+1)); done
+            ID="screen$i"
+        fi
+    fi
+
+    # Detect display server
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then DS="wayland"
+    elif [[ -n "${DISPLAY:-}" ]]; then       DS="x11"
+    else
+        echo "Error: neither WAYLAND_DISPLAY nor DISPLAY is set" >&2; exit 1
+    fi
+
+    # Obtain geometry
+    GEOMETRY=""
+    if [[ $FULL -eq 1 ]]; then
+        SEL=$(resolve_monitor "$MONITOR")
+        if [[ -z "$SEL" ]]; then
+            echo "Could not resolve monitor selection." >&2
+            echo "Run 'vcam-ctl screen --monitors' to list connected monitors." >&2
+            exit 1
+        fi
+        read -r MNAME MMODE MX MY <<< "$SEL"
+        GEOMETRY="${MMODE}+${MX}+${MY}"
+        echo "Full screen on $MNAME: $GEOMETRY"
+    else
+        echo "Select a screen region..." >&2
+        if [[ "$DS" == "wayland" ]]; then
+            command -v slurp >/dev/null || { echo "slurp not installed" >&2; exit 1; }
+            SLURP_RAW=$(slurp 2>/dev/null) || { echo "Cancelled." >&2; exit 1; }
+            SX=$(echo "$SLURP_RAW" | cut -d',' -f1)
+            SY=$(echo "$SLURP_RAW" | cut -d',' -f2 | cut -d' ' -f1)
+            SW=$(echo "$SLURP_RAW" | cut -d' ' -f2 | cut -d'x' -f1)
+            SH=$(echo "$SLURP_RAW" | cut -d' ' -f2 | cut -d'x' -f2)
+            GEOMETRY="${SW}x${SH}+${SX}+${SY}"
+        else
+            if command -v slop >/dev/null; then
+                GEOMETRY=$(slop -f "%wx%h+%x+%y" 2>/dev/null) || { echo "Cancelled." >&2; exit 1; }
+            else
+                echo "slop not installed. Enter geometry manually (WxH+X+Y):" >&2
+                read -r GEOMETRY
+            fi
+        fi
+        echo "Selected: $GEOMETRY" >&2
+    fi
+
+    if [[ $REPLACE -eq 1 ]]; then
+        echo "Removing existing overlay '$ID'..." >&2
+        ipc_send "remove $ID" >/dev/null || true
+    fi
+
+    ARGS="add screen $ID $DST_X $DST_Y"
+    if   [[ $DST_W -gt 0 && $DST_H -gt 0 ]]; then ARGS="$ARGS $DST_W $DST_H"
+    elif [[ $DST_W -gt 0 ]];                    then ARGS="$ARGS $DST_W"
+    elif [[ $DST_H -gt 0 ]];                    then ARGS="$ARGS 0 $DST_H"
+    fi
+    ARGS="$ARGS $GEOMETRY"
+
+    echo "Adding screen overlay '$ID'..." >&2
+    ipc_send $ARGS
+    echo "" >&2
+    echo "Screen overlay '$ID' is live." >&2
+    echo "  Remove:  vcam-ctl screen --remove $ID" >&2
+    echo "  Move:    vcam-ctl move   $ID <x|-> [<y|->]" >&2
+    echo "  Resize:  vcam-ctl resize $ID <w|-> [<h|->]" >&2
+    exit 0
+fi
+
+# ──────────────────────────────────────────────────────────────
+# webcam subcommand — add the webcam as a movable overlay
+# ──────────────────────────────────────────────────────────────
+# Useful in --no-input mode (or with a second camera) to show yourself
+# in the corner while screensharing. Internally the webcam is an
+# overlay just like images/videos, so move/resize/raise/lower work on
+# it identically.
+#
+# Usage:
+#   vcam-ctl webcam <position>     [width] [device]
+#   vcam-ctl webcam off
+#
+#   position: tl|tr|bl|br|center   (top/bottom × left/right, or center)
+#   width:    overlay width in px  (default 320; height auto from aspect)
+#   device:   /dev/video<N>         (default /dev/video1)
+#
+# Examples:
+#   vcam-ctl webcam tr             # 320-wide PiP in the top-right
+#   vcam-ctl webcam br 480         # bigger, bottom-right
+#   vcam-ctl webcam center         # centered on screen
+#   vcam-ctl webcam off            # remove the webcam overlay
+#
+# Default ID is "cam". To run multiple webcam overlays, add them with
+# the lower-level: vcam-ctl add webcam myid <x> <y> [<w>] <device>
+if [[ "$1" == "webcam" ]]; then
+    shift
+    require_running
+    POS="${1:-tr}"; WIDTH="${2:-320}"; ID="${3:-cam}"
+
+    if [[ "$POS" == "off" || "$POS" == "remove" ]]; then
+        ipc_send "remove $ID"
+        exit 0
+    fi
+
+    # Output frame size — needed to compute corner positions.
+    OUT="${VCAM_OUTPUT:-/dev/video0}"
+    OUT_SIZE=""
+    if command -v v4l2-ctl >/dev/null 2>&1; then
+        OUT_SIZE=$(v4l2-ctl -d "$OUT" --get-fmt-video 2>/dev/null \
+                   | awk -F'/' '/Width\/Height/{print $2}' | tr -d ' ')
+    fi
+    [[ "$OUT_SIZE" =~ ^[0-9]+x[0-9]+$ ]] || OUT_SIZE="1280x720"
+    OUT_W="${OUT_SIZE%x*}"; OUT_H="${OUT_SIZE#*x}"
+
+    # Webcam is 16:9 (height computed from width)
+    HEIGHT=$(( WIDTH * 9 / 16 ))
+    PAD=10
+    case "$POS" in
+        tl)     X=$PAD;                       Y=$PAD ;;
+        tr)     X=$(( OUT_W - WIDTH - PAD )); Y=$PAD ;;
+        bl)     X=$PAD;                       Y=$(( OUT_H - HEIGHT - PAD )) ;;
+        br)     X=$(( OUT_W - WIDTH - PAD )); Y=$(( OUT_H - HEIGHT - PAD )) ;;
+        center) X=$(( (OUT_W - WIDTH) / 2 )); Y=$(( (OUT_H - HEIGHT) / 2 )) ;;
+        full)   X=0; Y=0; WIDTH=$OUT_W; HEIGHT=$OUT_H ;;
+        *) echo "Unknown position '$POS' (use tl|tr|bl|br|center|full|off)" >&2; exit 1 ;;
+    esac
+
+    # Replace any existing overlay with this ID
+    ipc_send "remove $ID" >/dev/null 2>&1 || true
+    echo "Adding webcam overlay '$ID' at $POS (${X},${Y}) width=$WIDTH"
+    # The webcam overlay shares the main pipeline's capture; pass "-" as
+    # the path argument since the type doesn't need one.
+    ipc_send "add webcam $ID $X $Y $WIDTH -"
+
+    echo ""
+    echo "Webcam overlay '$ID' is live. Tweak with:"
+    echo "  vcam-ctl move   $ID x=N y=N"
+    echo "  vcam-ctl resize $ID w=N"
+    echo "  vcam-ctl raise  $ID         # bring to top"
+    echo "  vcam-ctl lower  $ID         # send to bottom"
+    echo "  vcam-ctl z      $ID <N>     # explicit z-index"
+    echo "  vcam-ctl webcam off          # remove (if id was 'cam')"
+    exit 0
+fi
+
+# ── default: pass everything else straight to the IPC server ─
+ipc_send "$*"

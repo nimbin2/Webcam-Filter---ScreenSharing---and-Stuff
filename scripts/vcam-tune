@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+#
+# vcam-tune – interactively adjust filter parameters with the keyboard.
+#
+# Three modes:
+#
+#   vcam-tune                  WALK MODE — navigate all active filters,
+#                              adjust each, remove or reset as you go.
+#
+#   vcam-tune <name> [<step>]  Add the named filter (with its default
+#                              parameter) and immediately dial it.
+#
+#   vcam-tune <index> [<step>] Dial an existing filter at the given
+#                              index (see 'vcam-ctl filter list').
+#
+# Keys (single-filter and walk mode):
+#   ↑ / k        increase current filter's parameter
+#   ↓ / j        decrease current filter's parameter
+#   r            reset current filter to its default value
+#   x            remove current filter and exit
+#   q / Esc      quit (filter stays at its current value)
+#
+# Walk-mode-only keys:
+#   → / l / Tab  next filter
+#   ← / h        previous filter
+
+set -eu
+
+SOCK="${VCAM_SOCK:-/tmp/vcam.sock}"
+
+# ── help ─────────────────────────────────────────────────────
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    sed -n '/^# vcam-tune/,/^$/p' "$0" | sed 's/^# \?//'
+    exit 0
+fi
+
+if [[ ! -S "$SOCK" ]]; then
+    echo "Error: vcam is not running (socket $SOCK not found)" >&2
+    exit 1
+fi
+
+# ── IPC helpers ──────────────────────────────────────────────
+ipc() {
+    printf '%s\nquit\n' "$*" | ncat -U "$SOCK" 2>/dev/null | head -1
+}
+ipc_lines() {
+    printf '%s\nquit\n' "$*" | ncat -U "$SOCK" 2>/dev/null
+}
+
+# Read current filter list as parallel arrays: NAMES[], PARAMS[]
+declare -a NAMES PARAMS DEFAULTS
+read_filters() {
+    NAMES=(); PARAMS=(); DEFAULTS=()
+    local lines name param
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^OK\ ([0-9]+):\ ([a-z]+)\ param=([0-9.\-]+) ]]; then
+            local idx="${BASH_REMATCH[1]}"
+            name="${BASH_REMATCH[2]}"
+            param="${BASH_REMATCH[3]}"
+            NAMES[idx]="$name"
+            PARAMS[idx]="$param"
+        fi
+    done < <(ipc_lines "filter list")
+}
+
+# Sensible default step per filter type
+default_step() {
+    case "$1" in
+        blur|pixelate|posterize|chromashift|wave|painterly|vangogh) echo 1 ;;
+        kaleidoscope|picasso|voronoi|sine|modulo) echo 1 ;;
+        bitcrush) echo 1 ;;
+        cartoon|solarize) echo 5 ;;
+        brightness|contrast|swirl|rainbow) echo 0.1 ;;
+        vignette|glitch|dream|bloom|glow|pinch|bulge|modern|cyberpunk|romantic|xor|polar) echo 0.05 ;;
+        melt|popart|displace|ripple) echo 0.05 ;;
+        *) echo 0.1 ;;
+    esac
+}
+
+# Get the default parameter for a filter type by querying vcam.
+# We add a temp filter just to learn its default, then remove it.
+default_param_for() {
+    case "$1" in
+        pixelate) echo 8 ;;
+        blur) echo 2 ;;
+        vignette) echo 0.6 ;;
+        brightness) echo 1.2 ;;
+        contrast) echo 1.4 ;;
+        posterize) echo 4 ;;
+        chromashift) echo 5 ;;
+        glitch) echo 0.3 ;;
+        kaleidoscope) echo 6 ;;
+        swirl) echo 1 ;;
+        wave) echo 10 ;;
+        cartoon) echo 50 ;;
+        solarize) echo 128 ;;
+        rainbow) echo 1 ;;
+        dream|bloom|glow|pinch|bulge|modern|cyberpunk|romantic|polar) echo 0.5 ;;
+        painterly|vangogh) echo 3 ;;
+        picasso) echo 8 ;;
+        sine) echo 15 ;;
+        xor) echo 0.5 ;;
+        modulo) echo 64 ;;
+        voronoi) echo 20 ;;
+        bitcrush) echo 3 ;;
+        melt|displace|ripple) echo 0.5 ;;
+        popart) echo 1 ;;
+        *) echo 1 ;;
+    esac
+}
+
+# Portable float arithmetic
+calc() { awk "BEGIN { printf \"%g\", $1 }"; }
+
+# ── set a single parameter ───────────────────────────────────
+set_param() {
+    local index=$1 value=$2
+    local resp
+    resp=$(ipc "filter set $index $value")
+    if [[ "$resp" =~ ^OK ]]; then
+        PARAMS[index]="$value"
+        return 0
+    fi
+    return 1
+}
+
+# ── single-filter mode ───────────────────────────────────────
+if [[ $# -ge 1 ]]; then
+    ARG="$1"
+    STEP="${2:-}"
+
+    if [[ "$ARG" =~ ^[0-9]+$ ]]; then
+        # Dial existing filter at index
+        read_filters
+        INDEX="$ARG"
+        if [[ -z "${NAMES[INDEX]:-}" ]]; then
+            echo "No filter at index $INDEX" >&2; exit 1
+        fi
+        NAME="${NAMES[INDEX]}"
+        DEFAULT=$(default_param_for "$NAME")
+    else
+        # Add the filter, then dial it
+        NAME="$ARG"
+        RESP=$(ipc "filter add $NAME")
+        if [[ "$RESP" =~ ^ERR ]]; then
+            echo "$RESP" >&2; exit 1
+        fi
+        read_filters
+        INDEX=$((${#NAMES[@]} - 1))
+        DEFAULT=$(default_param_for "$NAME")
+    fi
+
+    [[ -z "$STEP" ]] && STEP=$(default_step "$NAME")
+    CURRENT="${PARAMS[INDEX]}"
+    REMOVE_ON_EXIT=0
+
+    stty_orig=$(stty -g)
+    trap 'stty "$stty_orig"; echo' EXIT
+    stty -echo -icanon time 0 min 1
+
+    echo "vcam-tune  '$NAME' (index $INDEX)   step=$STEP"
+    echo "  ↑/k=up  ↓/j=down  r=reset to $DEFAULT  q=quit  x=remove+quit"
+    echo ""
+
+    draw() { printf '\r\033[K  %s = %s  ' "$NAME" "$CURRENT"; }
+    draw
+
+    while :; do
+        IFS= read -rsn1 c
+        if [[ "$c" == $'\x1b' ]]; then
+            IFS= read -rsn1 -t 0.05 c2 || c2=""
+            [[ -z "$c2" ]] && break
+            if [[ "$c2" == "[" ]]; then
+                IFS= read -rsn1 c3
+                case "$c3" in
+                    A) set_param "$INDEX" "$(calc "$CURRENT + $STEP")" && CURRENT="${PARAMS[INDEX]}" ;;
+                    B) set_param "$INDEX" "$(calc "$CURRENT - $STEP")" && CURRENT="${PARAMS[INDEX]}" ;;
+                esac
+            fi
+        else
+            case "$c" in
+                k|K) set_param "$INDEX" "$(calc "$CURRENT + $STEP")" && CURRENT="${PARAMS[INDEX]}" ;;
+                j|J) set_param "$INDEX" "$(calc "$CURRENT - $STEP")" && CURRENT="${PARAMS[INDEX]}" ;;
+                r|R) set_param "$INDEX" "$DEFAULT" && CURRENT="${PARAMS[INDEX]}" ;;
+                q|Q) break ;;
+                x|X) REMOVE_ON_EXIT=1; break ;;
+            esac
+        fi
+        draw
+    done
+
+    stty "$stty_orig"
+    echo ""
+    if [[ "$REMOVE_ON_EXIT" == "1" ]]; then
+        ipc "filter remove $INDEX" >/dev/null
+        echo "Removed."
+    else
+        echo "Final value: $NAME = $CURRENT  (active at index $INDEX)"
+    fi
+    exit 0
+fi
+
+# ── walk mode ────────────────────────────────────────────────
+read_filters
+if [[ ${#NAMES[@]} -eq 0 ]]; then
+    echo "No filters active. Add some with 'vcam-ctl filter add <name>'." >&2
+    echo "Or pass a filter name to this tool: 'vcam-tune <name>'." >&2
+    exit 1
+fi
+
+CURRENT_IDX=0
+NUM_FILTERS=${#NAMES[@]}
+
+stty_orig=$(stty -g)
+trap 'stty "$stty_orig"; echo' EXIT
+stty -echo -icanon time 0 min 1
+
+echo "vcam-tune walk mode  —  $NUM_FILTERS active filter(s)"
+echo "  ↑/k=up  ↓/j=down  →/l/Tab=next  ←/h=prev  r=reset  x=remove  q=quit"
+echo ""
+
+draw() {
+    local idx=$CURRENT_IDX
+    printf '\r\033[K'
+    printf '[%d/%d]  ' $((idx + 1)) "$NUM_FILTERS"
+    for i in "${!NAMES[@]}"; do
+        if [[ $i -eq $idx ]]; then
+            printf '\033[1;36m▶ %s=%s \033[0m' "${NAMES[i]}" "${PARAMS[i]}"
+        else
+            printf '  %s=%s ' "${NAMES[i]}" "${PARAMS[i]}"
+        fi
+    done
+}
+draw
+
+while :; do
+    IFS= read -rsn1 c
+    if [[ "$c" == $'\x1b' ]]; then
+        IFS= read -rsn1 -t 0.05 c2 || c2=""
+        [[ -z "$c2" ]] && break  # plain Esc
+        if [[ "$c2" == "[" ]]; then
+            IFS= read -rsn1 c3
+            case "$c3" in
+                A) # up
+                    name="${NAMES[CURRENT_IDX]}"
+                    step=$(default_step "$name")
+                    set_param "$CURRENT_IDX" "$(calc "${PARAMS[CURRENT_IDX]} + $step")"
+                    ;;
+                B) # down
+                    name="${NAMES[CURRENT_IDX]}"
+                    step=$(default_step "$name")
+                    set_param "$CURRENT_IDX" "$(calc "${PARAMS[CURRENT_IDX]} - $step")"
+                    ;;
+                C) # right
+                    CURRENT_IDX=$(( (CURRENT_IDX + 1) % NUM_FILTERS )) ;;
+                D) # left
+                    CURRENT_IDX=$(( (CURRENT_IDX - 1 + NUM_FILTERS) % NUM_FILTERS )) ;;
+            esac
+        fi
+    else
+        case "$c" in
+            k|K)
+                name="${NAMES[CURRENT_IDX]}"
+                step=$(default_step "$name")
+                set_param "$CURRENT_IDX" "$(calc "${PARAMS[CURRENT_IDX]} + $step")"
+                ;;
+            j|J)
+                name="${NAMES[CURRENT_IDX]}"
+                step=$(default_step "$name")
+                set_param "$CURRENT_IDX" "$(calc "${PARAMS[CURRENT_IDX]} - $step")"
+                ;;
+            l|L|$'\t')
+                CURRENT_IDX=$(( (CURRENT_IDX + 1) % NUM_FILTERS )) ;;
+            h|H)
+                CURRENT_IDX=$(( (CURRENT_IDX - 1 + NUM_FILTERS) % NUM_FILTERS )) ;;
+            r|R)
+                name="${NAMES[CURRENT_IDX]}"
+                def=$(default_param_for "$name")
+                set_param "$CURRENT_IDX" "$def"
+                ;;
+            x|X)
+                ipc "filter remove $CURRENT_IDX" >/dev/null
+                read_filters
+                NUM_FILTERS=${#NAMES[@]}
+                if [[ $NUM_FILTERS -eq 0 ]]; then
+                    echo ""
+                    echo "All filters removed."
+                    exit 0
+                fi
+                if [[ $CURRENT_IDX -ge $NUM_FILTERS ]]; then
+                    CURRENT_IDX=$((NUM_FILTERS - 1))
+                fi
+                ;;
+            q|Q) break ;;
+        esac
+    fi
+    draw
+done
+
+stty "$stty_orig"
+echo ""
+echo "Done. Final filter chain:"
+ipc_lines "filter list" | grep "^OK [0-9]" | sed 's/^OK /  /'
