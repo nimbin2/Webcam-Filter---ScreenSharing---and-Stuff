@@ -1,4 +1,8 @@
 CC      := gcc
+
+PREFIX  ?= /usr/local
+BINDIR  := $(PREFIX)/bin
+
 CFLAGS  := -std=c11 -O2 -Wall -Wextra -Wpedantic \
             -D_POSIX_C_SOURCE=200809L \
             -I include \
@@ -30,10 +34,11 @@ src/%.o: src/%.c include/vcam.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 install: $(BIN)
-	install -m 755 $(BIN) /usr/local/bin/
-	install -m 755 scripts/vcam-ctl /usr/local/bin/
-	install -m 755 scripts/vcam-setup /usr/local/bin/
-	install -m 755 scripts/vcam-tune /usr/local/bin/
+	install -d "$(DESTDIR)$(BINDIR)"
+	install -m 755 $(BIN) "$(DESTDIR)$(BINDIR)/"
+	install -m 755 scripts/vcam-ctl "$(DESTDIR)$(BINDIR)/"
+	install -m 755 scripts/vcam-setup "$(DESTDIR)$(BINDIR)/"
+	install -m 755 scripts/vcam-tune "$(DESTDIR)$(BINDIR)/"
 
 clean:
 	rm -f $(OBJS) $(BIN) $(TEST)
