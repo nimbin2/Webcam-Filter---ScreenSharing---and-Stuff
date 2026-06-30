@@ -358,7 +358,7 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 int ox, oy, ow, oh;
                 overlay_get_rect(s->overlay, &ox, &oy, &ow, &oh);
                 snprintf(buf, sizeof buf,
-                         "OK z=%d: [%s] id=%s pos=(%d,%d) size=%dx%d%s",
+                         "OK %d: [%s] id=%s pos=(%d,%d) size=%dx%d%s",
                          i, type_str, s->id, ox, oy, ow, oh,
                          (i == reg->count - 1) ? " (top)" :
                          (i == 0)              ? " (bottom)" : "");

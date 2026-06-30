@@ -76,6 +76,16 @@
 #                                "full" stretches it to the full output.
 #   webcam off                   Remove the "cam" overlay.
 #
+# Recording (capture the vcam output to a file):
+#   record start [-o <file>] [-m <alsa-dev>] [--no-audio] [--crf N]
+#   record stop                  Flush + close file cleanly.
+#   record pause / record resume Pause/resume in place (SIGSTOP/SIGCONT).
+#   record status                "recording" / "paused" / "stopped".
+#   record info                  Detailed status + elapsed duration.
+#   record mics                  List ALSA capture devices.
+#   record bar                   Print swaybar JSON for status_command.
+#   record help                  Full record usage.
+#
 # Other:
 #   help                                                  IPC command list
 #   --help, -h                                            this message
@@ -415,6 +425,372 @@ if [[ "$1" == "webcam" ]]; then
     echo "  vcam-ctl lower  $ID         # send to bottom"
     echo "  vcam-ctl z      $ID <N>     # explicit z-index"
     echo "  vcam-ctl webcam off          # remove (if id was 'cam')"
+    exit 0
+fi
+
+# ──────────────────────────────────────────────────────────────
+# record subcommand — drive an ffmpeg child to capture the vcam
+# output (and optionally a microphone).
+#
+# State lives in three small files under /tmp so any tool (swaybar,
+# polybar, conky, custom scripts) can read them without going through
+# IPC:
+#
+#   /tmp/vcam-record.pid     ← PID of the running ffmpeg child
+#   /tmp/vcam-record.status  ← "recording" or "paused"
+#   /tmp/vcam-record.info    ← key=value lines: file, mic, started, format
+#   /tmp/vcam-record.log     ← ffmpeg stderr (for debugging)
+#
+# Recording survives a vcam restart — it's an independent ffmpeg
+# process. State files self-clean when stale.
+# ──────────────────────────────────────────────────────────────
+REC_PID="/tmp/vcam-record.pid"
+REC_STATUS="/tmp/vcam-record.status"
+REC_INFO="/tmp/vcam-record.info"
+REC_LOG="/tmp/vcam-record.log"
+
+rec_is_active() {
+    [[ -f "$REC_PID" ]] || return 1
+    local pid; pid=$(cat "$REC_PID" 2>/dev/null) || return 1
+    [[ -z "$pid" ]] && return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+rec_cleanup_stale() {
+    if ! rec_is_active; then
+        rm -f "$REC_PID" "$REC_STATUS" "$REC_INFO"
+    fi
+}
+
+rec_list_mics() {
+    if ! command -v arecord >/dev/null 2>&1; then
+        echo "arecord not installed (sudo apt install alsa-utils)" >&2
+        return 1
+    fi
+    echo "Hardware capture devices:"
+    arecord -l 2>/dev/null | grep -E "^card|^  Subdev" \
+        | awk -F: '/^card/{c=$1$2; printf "  %s\n", $0} /^  Subdev/{print "      " $0}'
+    echo ""
+    echo "ALSA PCM names (use with --mic):"
+    # Filter to interesting ones — skip null/iec/loopback/dmix internals
+    arecord -L 2>/dev/null | awk '
+        /^[a-zA-Z]/ && !/^null$/ && !/^iec/ && !/^Loopback/ \
+            && !/^dmix/ && !/^dsnoop/ && !/^plugequal/ \
+            { name=$0; getline desc; printf "  %-25s %s\n", name, desc }'
+}
+
+rec_default_output() {
+    local dir="${XDG_VIDEOS_DIR:-$HOME/Videos}"
+    [[ -d "$dir" ]] || dir="$HOME"
+    echo "$dir/vcam-$(date +%Y-%m-%d_%H-%M-%S).mkv"
+}
+
+if [[ "$1" == "record" ]]; then
+    shift
+    ACTION="${1:-help}"
+    shift || true
+
+    case "$ACTION" in
+        # ── start ────────────────────────────────────────────
+        start)
+            rec_cleanup_stale
+            if rec_is_active; then
+                echo "Already recording (pid $(cat $REC_PID))." >&2
+                echo "Use 'vcam-ctl record stop' first, or pass --replace." >&2
+                # Allow --replace
+                if [[ " $* " != *" --replace "* && " $* " != *" -r "* ]]; then
+                    exit 1
+                fi
+                kill -TERM "$(cat $REC_PID)" 2>/dev/null
+                sleep 0.5
+                rm -f "$REC_PID" "$REC_STATUS" "$REC_INFO"
+            fi
+
+            OUT=""; MIC=""; NO_AUDIO=0; CRF=23
+            VCODEC="libx264"; VPRESET="veryfast"
+            VCAM_OUT="${VCAM_OUTPUT:-/dev/video0}"
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    -o|--output)   OUT="$2"; shift 2 ;;
+                    -m|--mic)      MIC="$2"; shift 2 ;;
+                    --no-audio)    NO_AUDIO=1; shift ;;
+                    --crf)         CRF="$2"; shift 2 ;;
+                    --vcodec)      VCODEC="$2"; shift 2 ;;
+                    --preset)      VPRESET="$2"; shift 2 ;;
+                    -r|--replace)  shift ;;   # already handled
+                    *) echo "Unknown record start option: $1" >&2; exit 1 ;;
+                esac
+            done
+
+            OUT="${OUT:-$(rec_default_output)}"
+            mkdir -p "$(dirname "$OUT")"
+
+            if ! command -v ffmpeg >/dev/null 2>&1; then
+                echo "ffmpeg not installed. (sudo apt install ffmpeg)" >&2
+                exit 1
+            fi
+
+            # Auto-pick a microphone if user didn't ask for --no-audio and
+            # didn't supply --mic. We try the ALSA "default" PCM first
+            # (works on most systems including PipeWire's ALSA shim), then
+            # fall back to the first hardware capture card we find via
+            # arecord -l. Pass --no-audio to skip this entirely.
+            if [[ $NO_AUDIO -eq 0 && -z "$MIC" ]]; then
+                if arecord -L 2>/dev/null | grep -q '^default$'; then
+                    MIC="default"
+                elif command -v arecord >/dev/null 2>&1; then
+                    # Parse "card N: ..., device M: ..." → "hw:N,M"
+                    FIRST_HW=$(arecord -l 2>/dev/null \
+                        | grep -E '^card [0-9]+' \
+                        | head -1 \
+                        | sed -E 's/^card ([0-9]+).* device ([0-9]+).*/hw:\1,\2/')
+                    if [[ -n "$FIRST_HW" && "$FIRST_HW" =~ ^hw: ]]; then
+                        MIC="$FIRST_HW"
+                    fi
+                fi
+                if [[ -n "$MIC" ]]; then
+                    echo "[record] auto-selected mic: $MIC" \
+                         "(override with --mic, or skip with --no-audio)"
+                else
+                    echo "[record] no ALSA capture device found — recording video only"
+                fi
+            fi
+
+            # Query the loopback's CURRENT format so ffmpeg doesn't try to
+            # change it (which v4l2loopback rejects while vcam is writing
+            # to it — that's what was making recording fail while ffplay/
+            # browsers had the cam open). Passing matching parameters
+            # turns ffmpeg's S_FMT call into a no-op.
+            FMT_W=""; FMT_H=""; FMT_PIX=""; FMT_FPS=""
+            if command -v v4l2-ctl >/dev/null 2>&1; then
+                FMT_LINE=$(v4l2-ctl -d "$VCAM_OUT" --get-fmt-video 2>/dev/null \
+                           | tr -d ' ')
+                FMT_W=$(echo "$FMT_LINE" | awk -F'Width/Height:' '{print $2}' \
+                        | awk -F'/' '{print $1}')
+                FMT_H=$(echo "$FMT_LINE" | awk -F'Width/Height:' '{print $2}' \
+                        | awk -F'/' '{print $2}' | awk -F',' '{print $1}')
+                # PixelFormat is like "PixelFormat:'YUYV'(YUYV4:2:2)"
+                FMT_RAW=$(v4l2-ctl -d "$VCAM_OUT" --get-fmt-video 2>/dev/null \
+                          | awk -F"'" '/Pixel Format/{print $2}')
+                # ffmpeg names: YUYV -> yuyv422, NV12 -> nv12, etc.
+                case "$FMT_RAW" in
+                    YUYV) FMT_PIX="yuyv422" ;;
+                    UYVY) FMT_PIX="uyvy422" ;;
+                    NV12) FMT_PIX="nv12" ;;
+                    RGB3) FMT_PIX="rgb24" ;;
+                    BGR3) FMT_PIX="bgr24" ;;
+                    *)    FMT_PIX="" ;; # let ffmpeg figure it out
+                esac
+                # Frame rate
+                FMT_FPS=$(v4l2-ctl -d "$VCAM_OUT" --get-parm 2>/dev/null \
+                          | awk '/Frames per second/{print $4; exit}')
+            fi
+
+            # Build ffmpeg command — read the vcam loopback output.
+            # v4l2loopback supports multiple readers, so this doesn't
+            # interfere with browsers/OBS/ffplay also reading the cam,
+            # as long as we don't ask for a format change.
+            CMD=(ffmpeg -y -hide_banner -loglevel warning)
+
+            # Pre-input options must come BEFORE -i
+            [[ -n "$FMT_PIX" ]] && CMD+=(-input_format "$FMT_PIX")
+            [[ -n "$FMT_W" && -n "$FMT_H" ]] && CMD+=(-video_size "${FMT_W}x${FMT_H}")
+            [[ -n "$FMT_FPS" ]] && CMD+=(-framerate "$FMT_FPS")
+
+            CMD+=(-f v4l2 -i "$VCAM_OUT")
+
+            if [[ $NO_AUDIO -eq 0 && -n "$MIC" ]]; then
+                # Try ALSA first. Many "PipeWire" systems still expose
+                # ALSA via the pipewire-alsa plugin, so "default" usually
+                # works without going to pulse/pipewire-pulse.
+                CMD+=(-f alsa -ac 2 -i "$MIC")
+            fi
+
+            CMD+=(-c:v "$VCODEC" -preset "$VPRESET" -crf "$CRF" -pix_fmt yuv420p)
+            if [[ $NO_AUDIO -eq 0 && -n "$MIC" ]]; then
+                CMD+=(-c:a aac -b:a 160k)
+            fi
+            CMD+=("$OUT")
+
+            # Spawn detached so it survives this shell exiting
+            nohup "${CMD[@]}" </dev/null >"$REC_LOG" 2>&1 &
+            PID=$!
+            disown 2>/dev/null || true
+
+            # Give it a moment to fail fast (bad device etc.)
+            sleep 0.3
+            if ! kill -0 "$PID" 2>/dev/null; then
+                echo "ffmpeg exited immediately — see $REC_LOG:" >&2
+                tail -n 5 "$REC_LOG" >&2
+                exit 1
+            fi
+
+            echo "$PID" > "$REC_PID"
+            echo "recording" > "$REC_STATUS"
+            {
+                echo "file=$OUT"
+                echo "mic=${MIC:-none}"
+                echo "started=$(date +%s)"
+                echo "started_human=$(date '+%Y-%m-%d %H:%M:%S')"
+                echo "format=${OUT##*.}"
+                echo "vcodec=$VCODEC"
+                echo "crf=$CRF"
+            } > "$REC_INFO"
+
+            echo "● Recording started"
+            echo "   file: $OUT"
+            echo "   pid:  $PID"
+            [[ -n "$MIC" ]] && echo "   mic:  $MIC"
+            ;;
+
+        # ── stop ─────────────────────────────────────────────
+        stop)
+            if ! rec_is_active; then
+                echo "Not currently recording." >&2
+                rec_cleanup_stale
+                exit 1
+            fi
+            PID=$(cat "$REC_PID")
+            # Send 'q' on stdin? We redirected to /dev/null so use SIGINT,
+            # which makes ffmpeg flush + write the trailer cleanly.
+            kill -INT "$PID" 2>/dev/null || true
+            for _ in $(seq 1 50); do
+                kill -0 "$PID" 2>/dev/null || break
+                sleep 0.1
+            done
+            if kill -0 "$PID" 2>/dev/null; then
+                kill -TERM "$PID" 2>/dev/null
+                sleep 0.5
+                kill -KILL "$PID" 2>/dev/null
+            fi
+            OUT=$(grep '^file=' "$REC_INFO" 2>/dev/null | cut -d= -f2-)
+            rm -f "$REC_PID" "$REC_STATUS" "$REC_INFO"
+            echo "■ Recording stopped"
+            [[ -n "$OUT" ]] && echo "   saved: $OUT"
+            ;;
+
+        # ── pause ────────────────────────────────────────────
+        # SIGSTOP halts ffmpeg in place. Audio device may buffer a bit
+        # of data while stopped; expect a tiny glitch on resume.
+        pause)
+            if ! rec_is_active; then echo "Not recording." >&2; exit 1; fi
+            PID=$(cat "$REC_PID")
+            kill -STOP "$PID"
+            echo "paused" > "$REC_STATUS"
+            echo "⏸ Recording paused (pid $PID)"
+            ;;
+
+        # ── resume ───────────────────────────────────────────
+        resume|continue)
+            if [[ ! -f "$REC_PID" ]]; then echo "No paused recording." >&2; exit 1; fi
+            PID=$(cat "$REC_PID")
+            kill -CONT "$PID"
+            echo "recording" > "$REC_STATUS"
+            echo "● Recording resumed (pid $PID)"
+            ;;
+
+        # ── status ───────────────────────────────────────────
+        # Outputs one of: "recording", "paused", "stopped".
+        # Designed for swaybar / polybar polling — exit code mirrors
+        # the state so 'vcam-ctl record status >/dev/null' is enough.
+        status)
+            if rec_is_active; then
+                cat "$REC_STATUS" 2>/dev/null || echo "recording"
+                exit 0
+            else
+                rec_cleanup_stale
+                echo "stopped"
+                exit 1
+            fi
+            ;;
+
+        # ── info ─────────────────────────────────────────────
+        info)
+            if ! rec_is_active; then
+                rec_cleanup_stale
+                echo "Not currently recording."
+                exit 1
+            fi
+            echo "state=$(cat $REC_STATUS 2>/dev/null || echo recording)"
+            echo "pid=$(cat $REC_PID)"
+            [[ -f "$REC_INFO" ]] && cat "$REC_INFO"
+            # Duration on the fly
+            if [[ -f "$REC_INFO" ]]; then
+                START=$(grep '^started=' "$REC_INFO" | cut -d= -f2)
+                if [[ -n "$START" ]]; then
+                    NOW=$(date +%s)
+                    DUR=$((NOW - START))
+                    printf "duration=%02d:%02d:%02d\n" \
+                        $((DUR/3600)) $(((DUR%3600)/60)) $((DUR%60))
+                fi
+            fi
+            ;;
+
+        # ── mics: list available ALSA capture devices ─────────
+        mics|devices)
+            rec_list_mics
+            ;;
+
+        # ── bar: emit swaybar-compatible JSON (for status_command) ─
+        bar)
+            if rec_is_active; then
+                STATE=$(cat "$REC_STATUS" 2>/dev/null || echo recording)
+                START=$(grep '^started=' "$REC_INFO" 2>/dev/null | cut -d= -f2)
+                NOW=$(date +%s)
+                DUR=$((NOW - ${START:-NOW}))
+                LBL=$(printf "%02d:%02d:%02d" $((DUR/3600)) $(((DUR%3600)/60)) $((DUR%60)))
+                if [[ "$STATE" == "paused" ]]; then
+                    printf '{"text":"⏸ REC %s","class":"paused","color":"#ffaa00"}\n' "$LBL"
+                else
+                    printf '{"text":"● REC %s","class":"recording","color":"#ff5555"}\n' "$LBL"
+                fi
+            else
+                printf '{"text":"","class":"idle"}\n'
+            fi
+            ;;
+
+        help|--help|-h|"")
+            cat <<'HLP'
+vcam-ctl record — capture the vcam loopback output to a file.
+
+  record start [options]    Start recording.
+    -o, --output <path>     Output file (default: $XDG_VIDEOS_DIR/vcam-<ts>.mkv)
+    -m, --mic <device>      ALSA capture device (e.g. "default", "hw:1,0").
+                            If omitted, vcam-ctl auto-picks: ALSA "default"
+                            if present, otherwise the first hw:N,M from
+                            'arecord -l'. Use 'vcam-ctl record mics' to see
+                            available devices.
+    --no-audio              Record video only (skip mic auto-detect).
+    --crf <n>               x264 quality 0–51 (default 23, lower = better)
+    --vcodec <name>         video codec (default libx264)
+    --preset <name>         x264 preset (default veryfast)
+    -r, --replace           kill any existing recording first
+
+  record stop                Flush & close, write the file out cleanly.
+  record pause               SIGSTOP the ffmpeg process (audio may glitch on resume).
+  record resume              SIGCONT the ffmpeg process.
+  record status              Print "recording" / "paused" / "stopped". Exit code
+                             0 if active, 1 if not — handy for shell scripts.
+  record info                Detailed info about the current recording.
+  record mics                List available ALSA capture devices.
+  record bar                 Emit one line of swaybar JSON for status_command.
+
+State files (live under /tmp, readable by anything):
+  /tmp/vcam-record.pid      PID of ffmpeg
+  /tmp/vcam-record.status   "recording" or "paused"
+  /tmp/vcam-record.info     file=, mic=, started=, format=
+  /tmp/vcam-record.log      ffmpeg's own stderr
+
+Swaybar (~/.config/sway/config):
+  bar { status_command while date +'%T'; do vcam-ctl record bar; sleep 1; done }
+
+Or simpler, use a custom status block that polls 'vcam-ctl record status'.
+HLP
+            ;;
+
+        *) echo "Unknown record action: $ACTION (try 'vcam-ctl record help')" >&2; exit 1 ;;
+    esac
     exit 0
 fi
 

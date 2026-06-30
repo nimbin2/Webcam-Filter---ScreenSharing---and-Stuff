@@ -1,5 +1,10 @@
 # vcam — virtual webcam pipeline
 
+> 🤖 **This is 100% Vibecode by ClaudeCode.** Every line of C, every shell
+> script, and every word of this README was written by Claude through a
+> long iterative back-and-forth. No human authored any of it directly —
+> only the prompts that shaped it.
+
 Real-time virtual webcam written in C. Reads from a physical webcam, runs
 your frames through a chain of pixel effects, composites images / looping
 videos / live screen regions on top, and writes the result to a
@@ -44,7 +49,14 @@ sudo apt install \
 # 2. Build & install
 git clone <repo-url> vcam && cd vcam
 make
-sudo make install      # vcam, vcam-ctl, vcam-setup, vcam-tune
+make
+sudo make install                          # default → /usr/local/bin
+# or pick your own destination:
+#   make install PREFIX=$HOME/.local        # ~/.local/bin (no sudo)
+#   make install PREFIX=/usr                # system-wide
+#   make install DESTDIR=/tmp/pkg PREFIX=/usr   # staged for packaging
+# Uninstall:
+#   sudo make uninstall                     # uses the same PREFIX/DESTDIR
 
 # 3. ONE-TIME: make v4l2loopback land at /dev/video0 (Chromium needs this)
 sudo vcam-setup --install
@@ -410,6 +422,82 @@ vcam-ctl filter add voronoi 30 && vcam-ctl filter add xor 0.4   # math art
 
 ---
 
+## Recording the vcam output
+
+`vcam-ctl record` drives a detached `ffmpeg` child to capture whatever
+vcam is currently outputting on `/dev/video0`. Because v4l2loopback
+allows multiple readers, you can record at the same time a browser or
+OBS or whatever is also using the cam — no contention.
+
+```bash
+vcam-ctl record start                                # auto-picks a mic if one's
+                                                     # available (ALSA "default"
+                                                     # if present, else first
+                                                     # hw:N,M from arecord -l).
+                                                     # Falls back to video-only.
+vcam-ctl record start --no-audio                     # force video-only
+vcam-ctl record start -m hw:1,0 -o ~/Videos/out.mkv  # explicit mic + filename
+vcam-ctl record start --crf 18 --preset slower       # higher quality
+vcam-ctl record pause                                # SIGSTOP ffmpeg
+vcam-ctl record resume                               # SIGCONT ffmpeg
+vcam-ctl record stop                                 # flush + close cleanly
+vcam-ctl record status                               # → "recording" | "paused" | "stopped"
+vcam-ctl record info                                 # detailed + elapsed time
+vcam-ctl record mics                                 # list available ALSA devices
+```
+
+Audio policy: ALSA only by design (no Pulse/PipeWire daemon dependency).
+On systems running PipeWire, the pipewire-alsa compatibility plugin
+generally exposes `default` as a working capture device, which `record
+start` will pick automatically. If you have multiple capture cards or a
+preferred one, list them with `record mics` and pass `-m hw:N,M`.
+
+The recording lives in a separate process from vcam, so it survives a
+vcam restart. State is published in three plain files under `/tmp` so any
+status bar can read them with `cat`:
+
+| File | Contents |
+|---|---|
+| `/tmp/vcam-record.pid`    | PID of the ffmpeg child |
+| `/tmp/vcam-record.status` | `recording` or `paused` (absent when stopped) |
+| `/tmp/vcam-record.info`   | `file=`, `mic=`, `started=`, `format=`, etc. |
+| `/tmp/vcam-record.log`    | ffmpeg's own stderr |
+
+### Swaybar integration
+
+`vcam-ctl record bar` emits one line of swaybar-compatible JSON:
+
+```json
+{"text":"● REC 00:01:23","class":"recording","color":"#ff5555"}
+```
+
+Drop into `~/.config/sway/config`:
+
+```
+bar {
+    status_command while date +'%T'; do
+        printf '%s | %s\n' "$(vcam-ctl record bar)" "$(date +%T)"
+        sleep 1
+    done
+}
+```
+
+Or feed it into [waybar](https://github.com/Alexays/Waybar) / i3blocks /
+[i3status-rust](https://github.com/greshake/i3status-rust). The
+simplest possible integration is `vcam-ctl record status` — exits 0 if
+recording, 1 if not.
+
+### Pause caveat
+
+`pause` sends `SIGSTOP` to the ffmpeg process — it literally halts in
+place. Video resumes cleanly because v4l2loopback just queues frames,
+but the ALSA capture device may buffer a small amount of audio data
+while stopped and produce a tiny pop or skip on resume. For long pauses
+prefer `stop` + a fresh `start` (the auto-generated filename includes a
+timestamp so you won't collide).
+
+---
+
 ## vcam-tune — interactive parameter dial
 
 Walk mode (no args) navigates every active filter; the highlighted one is
@@ -500,7 +588,8 @@ scripts/
 ```bash
 make              # build vcam and test_screen with -Wall -Wextra -Wpedantic -O2
 make clean
-sudo make install # all four scripts + vcam to /usr/local/bin
+sudo make install                       # → /usr/local/bin
+make install PREFIX=$HOME/.local        # user-local, no root needed
 ```
 
 To add a new source file, drop it in `src/` and append to `SRCS` in the

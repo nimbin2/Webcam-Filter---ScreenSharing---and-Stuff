@@ -1,8 +1,4 @@
 CC      := gcc
-
-PREFIX  ?= /usr/local
-BINDIR  := $(PREFIX)/bin
-
 CFLAGS  := -std=c11 -O2 -Wall -Wextra -Wpedantic \
             -D_POSIX_C_SOURCE=200809L \
             -I include \
@@ -13,13 +9,21 @@ LDFLAGS := $(shell pkg-config --libs libavcodec libavformat libavutil libswscale
             $(shell pkg-config --libs libpng) \
             -lpthread -lm
 
+# Installation paths — overridable on the command line:
+#   make install                       (default: /usr/local)
+#   make install PREFIX=$HOME/.local   (user-local)
+#   make install PREFIX=/usr           (system-wide)
+#   make install DESTDIR=/tmp/stage    (staged install for packaging)
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+
 SRCS := src/main.c src/frame.c src/capture.c src/output.c \
         src/overlay.c src/registry.c src/ipc.c src/filter.c
 OBJS := $(SRCS:.c=.o)
 BIN  := vcam
 TEST := test_screen
 
-.PHONY: all clean install
+.PHONY: all clean install uninstall
 
 all: $(BIN) $(TEST)
 
@@ -34,11 +38,20 @@ src/%.o: src/%.c include/vcam.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 install: $(BIN)
-	install -d "$(DESTDIR)$(BINDIR)"
-	install -m 755 $(BIN) "$(DESTDIR)$(BINDIR)/"
-	install -m 755 scripts/vcam-ctl "$(DESTDIR)$(BINDIR)/"
-	install -m 755 scripts/vcam-setup "$(DESTDIR)$(BINDIR)/"
-	install -m 755 scripts/vcam-tune "$(DESTDIR)$(BINDIR)/"
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 755 $(BIN)               $(DESTDIR)$(BINDIR)/
+	install -m 755 scripts/vcam-ctl     $(DESTDIR)$(BINDIR)/
+	install -m 755 scripts/vcam-setup   $(DESTDIR)$(BINDIR)/
+	install -m 755 scripts/vcam-tune    $(DESTDIR)$(BINDIR)/
+	@echo
+	@echo "Installed to $(DESTDIR)$(BINDIR)/"
+	@echo "Make sure that's on your PATH."
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
+	rm -f $(DESTDIR)$(BINDIR)/vcam-ctl
+	rm -f $(DESTDIR)$(BINDIR)/vcam-setup
+	rm -f $(DESTDIR)$(BINDIR)/vcam-tune
 
 clean:
 	rm -f $(OBJS) $(BIN) $(TEST)
