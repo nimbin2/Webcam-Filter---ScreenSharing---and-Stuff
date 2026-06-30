@@ -42,6 +42,8 @@ static volatile bool    g_running = true;
 static OverlayRegistry  g_registry;
 static IPCServer        g_ipc;
 FilterChain             g_filters; /* extern'd by ipc.c */
+int                     g_output_w = 0; /* extern'd by overlay.c */
+int                     g_output_h = 0;
 
 static void on_signal(int sig)
 {
@@ -237,6 +239,8 @@ int main(int argc, char *argv[])
         registry_destroy(&g_registry); filter_chain_destroy(&g_filters);
         return 1;
     }
+    g_output_w = width;
+    g_output_h = height;
 
     /* ── start IPC server ── */
     if (!ipc_start(&g_ipc, &g_registry)) {

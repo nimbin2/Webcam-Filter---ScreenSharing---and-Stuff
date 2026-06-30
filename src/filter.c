@@ -61,12 +61,19 @@ static const struct { const char *name; FilterType t; } NAMES[] = {
     {"modulo",      FX_MODULO},
     {"polar",       FX_POLAR},
     {"voronoi",     FX_VORONOI},
+    {"julia",       FX_JULIA},
     /* pixel-crazy */
     {"bitcrush",    FX_BITCRUSH},
     {"melt",        FX_MELT},
     {"popart",      FX_POPART},
     {"displace",    FX_DISPLACE},
     {"ripple",      FX_RIPPLE},
+    {"scanlines",   FX_SCANLINES},
+    /* new effect additions */
+    {"saturate",    FX_SATURATE},
+    {"crt",         FX_CRT},
+    {"velvet",      FX_VELVET},
+    {"noir",        FX_NOIR},
 };
 
 FilterType filter_type_from_name(const char *name)
@@ -123,6 +130,13 @@ float filter_default_param(FilterType t)
     case FX_POPART:      return 1.0f;
     case FX_DISPLACE:    return 0.5f;
     case FX_RIPPLE:      return 0.5f;
+    case FX_EDGES:       return 1.0f;
+    case FX_SATURATE:    return 1.5f;
+    case FX_CRT:         return 0.7f;
+    case FX_VELVET:      return 0.6f;
+    case FX_NOIR:        return 0.8f;
+    case FX_JULIA:       return 0.5f;
+    case FX_SCANLINES:   return 3.0f;
     default:             return 0.0f;
     }
 }
@@ -370,9 +384,12 @@ static void fx_posterize(Frame *f, int levels)
         p[i] = (uint8_t)((p[i] / step) * step);
 }
 
-static void fx_edges(Frame *f)
+static void fx_edges(Frame *f, float strength)
 {
-    /* Simple Sobel on luma */
+    /* Simple Sobel on luma. strength multiplies the gradient magnitude
+     * before clamping: 0..2 → 0=black, 1=normal, 2=more punchy. */
+    if (strength < 0) strength = 0;
+    if (strength > 4) strength = 4;
     int w = f->width, h = f->height;
     uint8_t *luma = malloc((size_t)w * h);
     if (!luma) return;
@@ -389,7 +406,7 @@ static void fx_edges(Frame *f)
                      +luma[(y-1)*w + (x+1)] + 2*luma[y*w + (x+1)] + luma[(y+1)*w + (x+1)];
             int gy = -luma[(y-1)*w + (x-1)] - 2*luma[(y-1)*w + x] - luma[(y-1)*w + (x+1)]
                      +luma[(y+1)*w + (x-1)] + 2*luma[(y+1)*w + x] + luma[(y+1)*w + (x+1)];
-            int v = abs(gx) + abs(gy);
+            int v = (int)((abs(gx) + abs(gy)) * strength);
             uint8_t e = clamp_u8(v);
             dst[x*3+0] = dst[x*3+1] = dst[x*3+2] = e;
         }
@@ -1326,6 +1343,219 @@ static void fx_ripple(Frame *f, float strength)
     free(tmp);
 }
 
+/* ══════════════════════════════════════════════════════════════
+ * NEW: one filter per category — saturate, crt, velvet, noir,
+ * julia, scanlines.
+ * ══════════════════════════════════════════════════════════════ */
+
+/* ── saturate: chroma-distance multiplier around luma (Basic) ── */
+static void fx_saturate(Frame *f, float factor)
+{
+    if (factor < 0) factor = 0;
+    if (factor > 4) factor = 4;
+    int n = f->width * f->height;
+    for (int i = 0; i < n; i++) {
+        uint8_t *p = f->data + i * 3;
+        int luma = (p[2]*299 + p[1]*587 + p[0]*114) / 1000;
+        p[0] = clamp_u8((int)(luma + (p[0] - luma) * factor));
+        p[1] = clamp_u8((int)(luma + (p[1] - luma) * factor));
+        p[2] = clamp_u8((int)(luma + (p[2] - luma) * factor));
+    }
+}
+
+/* ── crt: TV CRT scanlines + slight barrel + R/B fringing (Fancy) ── */
+static void fx_crt(Frame *f, float strength)
+{
+    if (strength < 0) strength = 0;
+    if (strength > 1) strength = 1;
+    int w = f->width, h = f->height;
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+
+    float cx = w / 2.0f, cy = h / 2.0f;
+    float barrel = strength * 0.15f;
+    int shift   = (int)(strength * 3);
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        float ny = (y - cy) / cy;
+        for (int x = 0; x < w; x++) {
+            float nx = (x - cx) / cx;
+            float r2 = nx*nx + ny*ny;
+            /* Slight barrel distortion toward edges */
+            float dx = nx * (1.0f + barrel * r2);
+            float dy = ny * (1.0f + barrel * r2);
+            int sx = (int)(dx * cx + cx);
+            int sy = (int)(dy * cy + cy);
+            if (sx < 0) sx = 0;
+            if (sx >= w) sx = w-1;
+            if (sy < 0) sy = 0;
+            if (sy >= h) sy = h-1;
+
+            /* R/B channel shift for chromatic aberration */
+            int rxr = sx + shift; if (rxr >= w) rxr = w-1;
+            int rxb = sx - shift; if (rxb < 0)  rxb = 0;
+
+            const uint8_t *sR = tmp + sy * w * 3 + rxr * 3;
+            const uint8_t *sG = tmp + sy * w * 3 + sx  * 3;
+            const uint8_t *sB = tmp + sy * w * 3 + rxb * 3;
+            uint8_t r = sR[2], g = sG[1], b = sB[0];
+
+            /* Scanline darken every other row */
+            int dark = ((y & 1) == 0) ? (int)(strength * 60) : 0;
+            dst[x*3+0] = clamp_u8(b - dark);
+            dst[x*3+1] = clamp_u8(g - dark);
+            dst[x*3+2] = clamp_u8(r - dark);
+        }
+    }
+    free(tmp);
+}
+
+/* ── velvet: desat + warm tint + soft blur (Soft) ─────────────── */
+static void fx_velvet(Frame *f, float strength)
+{
+    if (strength < 0) strength = 0;
+    if (strength > 1) strength = 1;
+    int w = f->width, h = f->height;
+
+    /* 3x3 box blur in place using a one-row scratch buffer to avoid
+     * reading freshly-written pixels (cheap separable approximation). */
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+
+    for (int y = 0; y < h; y++) {
+        int y0 = y > 0 ? y - 1 : 0;
+        int y1 = y < h - 1 ? y + 1 : h - 1;
+        uint8_t *dst = f->data + y * f->stride;
+        for (int x = 0; x < w; x++) {
+            int x0 = x > 0 ? x - 1 : 0;
+            int x1 = x < w - 1 ? x + 1 : w - 1;
+            int sb = 0, sg = 0, sr = 0;
+            for (int yy = y0; yy <= y1; yy++) {
+                for (int xx = x0; xx <= x1; xx++) {
+                    const uint8_t *p = tmp + yy * w * 3 + xx * 3;
+                    sb += p[0]; sg += p[1]; sr += p[2];
+                }
+            }
+            int n = (y1 - y0 + 1) * (x1 - x0 + 1);
+            int bb = sb / n, gg = sg / n, rr = sr / n;
+
+            /* Desat toward luma */
+            int luma = (rr*299 + gg*587 + bb*114) / 1000;
+            float desat = 0.5f * strength;
+            bb = (int)(bb * (1 - desat) + luma * desat);
+            gg = (int)(gg * (1 - desat) + luma * desat);
+            rr = (int)(rr * (1 - desat) + luma * desat);
+
+            /* Warm tint */
+            rr = clamp_u8(rr + (int)(20 * strength));
+            gg = clamp_u8(gg + (int)( 8 * strength));
+            bb = clamp_u8(bb - (int)(15 * strength));
+
+            /* Blend with original by strength so '0' = no-op */
+            const uint8_t *orig = tmp + y * w * 3 + x * 3;
+            dst[x*3+0] = (uint8_t)(orig[0] * (1 - strength) + bb * strength);
+            dst[x*3+1] = (uint8_t)(orig[1] * (1 - strength) + gg * strength);
+            dst[x*3+2] = (uint8_t)(orig[2] * (1 - strength) + rr * strength);
+        }
+    }
+    free(tmp);
+}
+
+/* ── noir: high-contrast B&W with split-tone shadows (Themed) ── */
+static void fx_noir(Frame *f, float strength)
+{
+    if (strength < 0) strength = 0;
+    if (strength > 1) strength = 1;
+    int n = f->width * f->height;
+    for (int i = 0; i < n; i++) {
+        uint8_t *p = f->data + i * 3;
+        int luma = (p[2]*299 + p[1]*587 + p[0]*114) / 1000;
+
+        /* Sigmoid-ish contrast boost around 128 */
+        float l = luma / 255.0f;
+        l = (l - 0.5f) * (1.0f + strength * 1.2f) + 0.5f;
+        if (l < 0) l = 0;
+        if (l > 1) l = 1;
+        int v = (int)(l * 255);
+
+        /* Split-tone: cool blue in shadows, warm sepia in highlights */
+        int rb, gg, bb;
+        if (v < 128) {
+            float t = v / 128.0f;
+            rb = (int)(v * (0.85f + 0.15f * t));
+            gg = (int)(v * (0.95f + 0.05f * t));
+            bb = (int)(v * (1.15f - 0.05f * t));
+        } else {
+            float t = (v - 128) / 127.0f;
+            rb = (int)(v * (1.10f + 0.05f * t));
+            gg = (int)(v * (1.00f));
+            bb = (int)(v * (0.85f - 0.05f * t));
+        }
+
+        /* Mix with original by strength */
+        p[0] = clamp_u8((int)(p[0] * (1 - strength) + bb * strength));
+        p[1] = clamp_u8((int)(p[1] * (1 - strength) + gg * strength));
+        p[2] = clamp_u8((int)(p[2] * (1 - strength) + rb * strength));
+    }
+}
+
+/* ── julia: Julia-fractal coloured overlay blended with image (Math) ── */
+static void fx_julia(Frame *f, float strength)
+{
+    if (strength < 0) strength = 0;
+    if (strength > 1) strength = 1;
+    int w = f->width, h = f->height;
+
+    /* Animate the constant c slowly over time */
+    unsigned long t = anim_tick();
+    float ang = t * 0.01f;
+    float cr = 0.7885f * cosf(ang);
+    float ci = 0.7885f * sinf(ang);
+
+    const int max_iter = 32;
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        float zy0 = (y - h / 2.0f) * 3.0f / h;
+        for (int x = 0; x < w; x++) {
+            float zx = (x - w / 2.0f) * 3.0f / w;
+            float zy = zy0;
+            int iter = 0;
+            while (iter < max_iter && zx*zx + zy*zy < 4.0f) {
+                float nzx = zx*zx - zy*zy + cr;
+                zy = 2 * zx * zy + ci;
+                zx = nzx;
+                iter++;
+            }
+            /* Map iter to a colour gradient (HSV-ish) */
+            float fi = iter / (float)max_iter;
+            int rr = (int)(255 * fi);
+            int gg = (int)(255 * sinf(fi * 3.14159f));
+            int bb = (int)(255 * (1 - fi));
+
+            /* Blend with the image by strength */
+            dst[x*3+0] = clamp_u8((int)(dst[x*3+0] * (1 - strength) + bb * strength));
+            dst[x*3+1] = clamp_u8((int)(dst[x*3+1] * (1 - strength) + gg * strength));
+            dst[x*3+2] = clamp_u8((int)(dst[x*3+2] * (1 - strength) + rr * strength));
+        }
+    }
+}
+
+/* ── scanlines: hard black lines every N rows (Pixel-crazy) ─── */
+static void fx_scanlines(Frame *f, float gap)
+{
+    int g = (int)gap;
+    if (g < 2) g = 2;
+    if (g > 16) g = 16;
+    for (int y = 0; y < f->height; y++) {
+        if ((y % g) == 0) {
+            memset(f->data + y * f->stride, 0, f->width * 3);
+        }
+    }
+}
+
 void filter_chain_apply(FilterChain *fc, Frame *frame)
 {
     pthread_mutex_lock(&fc->lock);
@@ -1349,7 +1579,8 @@ void filter_chain_apply(FilterChain *fc, Frame *frame)
         case FX_BRIGHTNESS:   fx_brightness(frame, f->param); break;
         case FX_CONTRAST:     fx_contrast(frame, f->param); break;
         case FX_POSTERIZE:    fx_posterize(frame, (int)f->param); break;
-        case FX_EDGES:        fx_edges(frame); break;
+        case FX_EDGES:        fx_edges(frame, f->param); break;
+        case FX_SATURATE:     fx_saturate(frame, f->param); break;
         case FX_CHROMASHIFT:  fx_chromashift(frame, (int)f->param); break;
         case FX_GLITCH:       fx_glitch(frame, f->param); break;
         case FX_KALEIDOSCOPE: fx_kaleidoscope(frame, (int)f->param); break;
@@ -1360,27 +1591,32 @@ void filter_chain_apply(FilterChain *fc, Frame *frame)
         case FX_CARTOON:      fx_cartoon(frame, f->param); break;
         case FX_SOLARIZE:     fx_solarize(frame, (int)f->param); break;
         case FX_RAINBOW:      fx_rainbow(frame, f->param); break;
+        case FX_CRT:          fx_crt(frame, f->param); break;
         case FX_DREAM:        fx_dream(frame, f->param); break;
         case FX_BLOOM:        fx_bloom(frame, f->param); break;
         case FX_GLOW:         fx_glow(frame, f->param); break;
         case FX_PINCH:        fx_pinch(frame, f->param); break;
         case FX_BULGE:        fx_bulge(frame, f->param); break;
         case FX_PAINTERLY:    fx_painterly(frame, (int)f->param); break;
+        case FX_VELVET:       fx_velvet(frame, f->param); break;
         case FX_MODERN:       fx_modern(frame, f->param); break;
         case FX_CYBERPUNK:    fx_cyberpunk(frame, f->param); break;
         case FX_ROMANTIC:     fx_romantic(frame, f->param); break;
         case FX_VANGOGH:      fx_vangogh(frame, f->param); break;
         case FX_PICASSO:      fx_picasso(frame, f->param); break;
+        case FX_NOIR:         fx_noir(frame, f->param); break;
         case FX_SINE:         fx_sine(frame, f->param); break;
         case FX_XOR:          fx_xor(frame, f->param); break;
         case FX_MODULO:       fx_modulo(frame, f->param); break;
         case FX_POLAR:        fx_polar(frame, f->param); break;
         case FX_VORONOI:      fx_voronoi(frame, f->param); break;
+        case FX_JULIA:        fx_julia(frame, f->param); break;
         case FX_BITCRUSH:     fx_bitcrush(frame, f->param); break;
         case FX_MELT:         fx_melt(frame, f->param); break;
         case FX_POPART:       fx_popart(frame, f->param); break;
         case FX_DISPLACE:     fx_displace(frame, f->param); break;
         case FX_RIPPLE:       fx_ripple(frame, f->param); break;
+        case FX_SCANLINES:    fx_scanlines(frame, f->param); break;
         default: break;
         }
     }

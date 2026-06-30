@@ -156,7 +156,8 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   brightness <mult>              multiply brightness, default 1.2");
             send_line(client_fd, "OK   contrast <mult>                contrast around 128, default 1.4");
             send_line(client_fd, "OK   posterize <levels>             reduce color levels, default 4");
-            send_line(client_fd, "OK   edges                          Sobel edge detection");
+            send_line(client_fd, "OK   edges <strength>               Sobel edge detection, 0..2, default 1.0");
+            send_line(client_fd, "OK   saturate <factor>              chroma boost, 0=gray, 1=normal, 0..3, default 1.5");
             send_line(client_fd, "OK");
             send_line(client_fd, "OK fancy filters:");
             send_line(client_fd, "OK   chromashift <offset>           VHS-style RGB channel split, default 5");
@@ -169,6 +170,7 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   cartoon <edge_thresh>          posterize + dark edges, default 50");
             send_line(client_fd, "OK   solarize <threshold>           invert pixels above value, default 128");
             send_line(client_fd, "OK   rainbow <speed>                animated hue rotation, default 1.0");
+            send_line(client_fd, "OK   crt <strength>                 CRT scanlines + barrel + RGB fringe, 0..1, default 0.7");
             send_line(client_fd, "OK");
             send_line(client_fd, "OK soft & dreamy filters:");
             send_line(client_fd, "OK   dream <strength>               hazy soft glow, 0..1, default 0.5");
@@ -177,6 +179,7 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   pinch <strength>               radial inward pull, 0..1, default 0.5");
             send_line(client_fd, "OK   bulge <strength>               fisheye-like outward push, 0..1, default 0.5");
             send_line(client_fd, "OK   painterly <radius>             oil-painting effect, 1..5, default 3");
+            send_line(client_fd, "OK   velvet <strength>              soft desat + warm tint + blur, 0..1, default 0.6");
             send_line(client_fd, "OK");
             send_line(client_fd, "OK themed looks:");
             send_line(client_fd, "OK   modern <strength>              teal-orange cinematic grade, default 0.7");
@@ -184,6 +187,7 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   romantic <strength>            soft warm haze, default 0.7");
             send_line(client_fd, "OK   vangogh <radius>               heavy painterly + saturation, 1..5, default 3");
             send_line(client_fd, "OK   picasso <segments>             cubist: kaleidoscope+poster+edges, 4..16, default 8");
+            send_line(client_fd, "OK   noir <strength>                high-contrast B&W + split-tone, 0..1, default 0.8");
             send_line(client_fd, "OK");
             send_line(client_fd, "OK mathematical patterns:");
             send_line(client_fd, "OK   sine <amplitude>               sin-wave x/y distortion, default 15");
@@ -191,6 +195,7 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   modulo <divisor>               color mod N, 2..128, default 64");
             send_line(client_fd, "OK   polar <strength>               polar-coordinate warp, 0..1, default 0.7");
             send_line(client_fd, "OK   voronoi <cells>                voronoi cell mosaic, 4..64, default 20");
+            send_line(client_fd, "OK   julia <strength>               animated Julia fractal overlay, 0..1, default 0.5");
             send_line(client_fd, "OK");
             send_line(client_fd, "OK pixel-crazy / animated:");
             send_line(client_fd, "OK   bitcrush <bits>                quantize bits per channel, 1..8, default 3");
@@ -198,6 +203,7 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   popart <strength>              Warhol 2x2 tinted quadrants, 0..1, default 1");
             send_line(client_fd, "OK   displace <strength>            luma-driven horizontal shift, 0..1, default 0.5");
             send_line(client_fd, "OK   ripple <strength>              animated water ripple from center, 0..1, default 0.5");
+            send_line(client_fd, "OK   scanlines <gap>                black scanline every N rows, 2..16, default 3");
             return;
         }
 

@@ -17,7 +17,8 @@
 #   ↑ / k        increase current filter's parameter
 #   ↓ / j        decrease current filter's parameter
 #   r            reset current filter to its default value
-#   x            remove current filter and exit
+#   x            remove current filter
+#   a            add a new filter (opens picker menu)
 #   q / Esc      quit (filter stays at its current value)
 #
 # Walk-mode-only keys:
@@ -67,12 +68,12 @@ read_filters() {
 default_step() {
     case "$1" in
         blur|pixelate|posterize|chromashift|wave|painterly|vangogh) echo 1 ;;
-        kaleidoscope|picasso|voronoi|sine|modulo) echo 1 ;;
+        kaleidoscope|picasso|voronoi|sine|modulo|scanlines) echo 1 ;;
         bitcrush) echo 1 ;;
         cartoon|solarize) echo 5 ;;
-        brightness|contrast|swirl|rainbow) echo 0.1 ;;
+        brightness|contrast|swirl|rainbow|saturate) echo 0.1 ;;
         vignette|glitch|dream|bloom|glow|pinch|bulge|modern|cyberpunk|romantic|xor|polar) echo 0.05 ;;
-        melt|popart|displace|ripple) echo 0.05 ;;
+        melt|popart|displace|ripple|crt|velvet|noir|julia|edges) echo 0.05 ;;
         *) echo 0.1 ;;
     esac
 }
@@ -103,8 +104,14 @@ default_param_for() {
         modulo) echo 64 ;;
         voronoi) echo 20 ;;
         bitcrush) echo 3 ;;
-        melt|displace|ripple) echo 0.5 ;;
+        melt|displace|ripple|julia) echo 0.5 ;;
         popart) echo 1 ;;
+        edges) echo 1.0 ;;
+        saturate) echo 1.5 ;;
+        crt) echo 0.7 ;;
+        velvet) echo 0.6 ;;
+        noir) echo 0.8 ;;
+        scanlines) echo 3 ;;
         *) echo 1 ;;
     esac
 }
@@ -122,6 +129,65 @@ set_param() {
         return 0
     fi
     return 1
+}
+
+# All available filters, grouped by category.
+# Updated when src/filter.c changes — keep in sync with the help table.
+FILTER_CATEGORIES=(
+    "Basic:grayscale sepia invert mirror flip pixelate blur vignette brightness contrast posterize edges saturate"
+    "Fancy:chromashift glitch kaleidoscope swirl thermal oldfilm wave cartoon solarize rainbow crt"
+    "Soft/Dreamy:dream bloom glow pinch bulge painterly velvet"
+    "Themed:modern cyberpunk romantic vangogh picasso noir"
+    "Math:sine xor modulo polar voronoi julia"
+    "Pixel-crazy:bitcrush melt popart displace ripple scanlines"
+)
+
+# Show an interactive picker, return chosen filter name on stdout
+# (returns nothing if cancelled). The caller is expected to have
+# restored cooked-mode TTY before invoking; we handle our own.
+pick_filter() {
+    local saved=$(stty -g)
+    stty echo icanon
+    echo "" >&2
+    echo "─── add a filter ─────────────────────────" >&2
+    local idx=0
+    local -a all_names
+    for entry in "${FILTER_CATEGORIES[@]}"; do
+        local cat="${entry%%:*}"
+        local list="${entry#*:}"
+        echo "" >&2
+        echo "  ${cat}:" >&2
+        local row=""
+        for name in $list; do
+            idx=$((idx + 1))
+            all_names+=("$name")
+            row+=$(printf "%3d) %-12s" "$idx" "$name")
+            # Wrap every 3 entries
+            if (( idx % 3 == 0 )); then
+                echo "    $row" >&2
+                row=""
+            fi
+        done
+        [[ -n "$row" ]] && echo "    $row" >&2
+    done
+    echo "" >&2
+    printf "Pick a filter (1-%d, or name, blank to cancel): " "$idx" >&2
+    local choice
+    read -r choice
+    stty "$saved"
+    [[ -z "$choice" ]] && return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        local sel="${all_names[$((choice - 1))]:-}"
+        [[ -z "$sel" ]] && return 1
+        echo "$sel"
+    else
+        # Verify it's actually a known filter
+        for name in "${all_names[@]}"; do
+            if [[ "$name" == "$choice" ]]; then echo "$choice"; return 0; fi
+        done
+        return 1
+    fi
+    return 0
 }
 
 # ── single-filter mode ───────────────────────────────────────
@@ -203,9 +269,14 @@ fi
 # ── walk mode ────────────────────────────────────────────────
 read_filters
 if [[ ${#NAMES[@]} -eq 0 ]]; then
-    echo "No filters active. Add some with 'vcam-ctl filter add <name>'." >&2
-    echo "Or pass a filter name to this tool: 'vcam-tune <name>'." >&2
-    exit 1
+    echo "No filters active — opening picker to add one."
+    SEL=$(pick_filter) || { echo "Cancelled."; exit 0; }
+    DEF=$(default_param_for "$SEL")
+    ipc "filter add $SEL $DEF" >/dev/null
+    read_filters
+    if [[ ${#NAMES[@]} -eq 0 ]]; then
+        echo "Failed to add filter '$SEL'." >&2; exit 1
+    fi
 fi
 
 CURRENT_IDX=0
@@ -216,12 +287,16 @@ trap 'stty "$stty_orig"; echo' EXIT
 stty -echo -icanon time 0 min 1
 
 echo "vcam-tune walk mode  —  $NUM_FILTERS active filter(s)"
-echo "  ↑/k=up  ↓/j=down  →/l/Tab=next  ←/h=prev  r=reset  x=remove  q=quit"
+echo "  ↑/k=up  ↓/j=down  →/l/Tab=next  ←/h=prev  r=reset  x=remove  a=add  q=quit"
 echo ""
 
 draw() {
     local idx=$CURRENT_IDX
     printf '\r\033[K'
+    if [[ $NUM_FILTERS -eq 0 ]]; then
+        printf '[empty]  press \033[1;33ma\033[0m to add a filter, \033[1;33mq\033[0m to quit'
+        return
+    fi
     printf '[%d/%d]  ' $((idx + 1)) "$NUM_FILTERS"
     for i in "${!NAMES[@]}"; do
         if [[ $i -eq $idx ]]; then
@@ -240,6 +315,8 @@ while :; do
         [[ -z "$c2" ]] && break  # plain Esc
         if [[ "$c2" == "[" ]]; then
             IFS= read -rsn1 c3
+            # All directional keys need at least one filter
+            if [[ $NUM_FILTERS -eq 0 ]]; then draw; continue; fi
             case "$c3" in
                 A) # up
                     name="${NAMES[CURRENT_IDX]}"
@@ -258,6 +335,17 @@ while :; do
             esac
         fi
     else
+        case "$c" in
+            a|A)
+                # 'a' must work even when the chain is empty — handled later
+                ;;
+            q|Q)
+                break ;;
+            *)
+                # Everything else needs a current filter
+                if [[ $NUM_FILTERS -eq 0 ]]; then draw; continue; fi
+                ;;
+        esac
         case "$c" in
             k|K)
                 name="${NAMES[CURRENT_IDX]}"
@@ -284,14 +372,31 @@ while :; do
                 NUM_FILTERS=${#NAMES[@]}
                 if [[ $NUM_FILTERS -eq 0 ]]; then
                     echo ""
-                    echo "All filters removed."
-                    exit 0
-                fi
-                if [[ $CURRENT_IDX -ge $NUM_FILTERS ]]; then
-                    CURRENT_IDX=$((NUM_FILTERS - 1))
+                    echo "All filters removed. Press 'a' to add one, or 'q' to quit."
+                    NUM_FILTERS=0
+                    CURRENT_IDX=0
+                else
+                    if [[ $CURRENT_IDX -ge $NUM_FILTERS ]]; then
+                        CURRENT_IDX=$((NUM_FILTERS - 1))
+                    fi
                 fi
                 ;;
-            q|Q) break ;;
+            a|A)
+                # Restore cooked TTY so the picker can read normally
+                stty "$stty_orig"
+                echo ""
+                SEL=$(pick_filter) || SEL=""
+                if [[ -n "$SEL" ]]; then
+                    DEF=$(default_param_for "$SEL")
+                    ipc "filter add $SEL $DEF" >/dev/null
+                    read_filters
+                    NUM_FILTERS=${#NAMES[@]}
+                    CURRENT_IDX=$((NUM_FILTERS - 1))   # focus the new one
+                fi
+                # Back to raw mode for the walk
+                stty -echo -icanon time 0 min 1
+                echo ""
+                ;;
         esac
     fi
     draw

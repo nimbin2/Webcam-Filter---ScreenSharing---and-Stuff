@@ -1,3 +1,4 @@
+#define _GNU_SOURCE  /* for F_SETPIPE_SZ */
 #include "vcam.h"
 
 #include <stdio.h>
@@ -423,6 +424,23 @@ Overlay *overlay_create_screen(const char *geometry,
     o->src_w = gw; o->src_h = gh;
     resolve_dims(gw, gh, dst_w, dst_h, &o->dst_w, &o->dst_h);
 
+    /* Clamp to output dimensions if known — otherwise overlay_blit would
+     * just clip and the user would only see a corner of their screen. */
+    if (g_output_w > 0 && g_output_h > 0 &&
+        (o->dst_w > g_output_w || o->dst_h > g_output_h)) {
+        /* Scale down preserving aspect so it fits the output */
+        double sx = (double)g_output_w / o->dst_w;
+        double sy = (double)g_output_h / o->dst_h;
+        double s  = sx < sy ? sx : sy;
+        int new_w = (int)(o->dst_w * s);
+        int new_h = (int)(o->dst_h * s);
+        /* Snap to multiples of 2 for stride safety */
+        new_w &= ~1; new_h &= ~1;
+        fprintf(stderr, "[screen] clamping %dx%d → %dx%d to fit %dx%d output\n",
+                o->dst_w, o->dst_h, new_w, new_h, g_output_w, g_output_h);
+        o->dst_w = new_w; o->dst_h = new_h;
+    }
+
     bool wayland = getenv("WAYLAND_DISPLAY") != NULL;
 
     if (wayland) {
@@ -444,6 +462,19 @@ Overlay *overlay_create_screen(const char *geometry,
         if (o->pipe_fd < 0) {
             perror("[screen] open fifo");
             unlink(o->fifo_path); free(o); return NULL;
+        }
+
+        /* Tune the kernel pipe buffer to ~one frame.
+         * Default is 64KB, way smaller than a raw frame (~3-8MB), which
+         * forces wf-recorder to issue many partial writes per frame.
+         * Larger than 1 frame would let wf-recorder build up a backlog
+         * → visible lag. Sizing to exactly one frame means wf-recorder
+         * can write a single frame in one shot, blocks on the next
+         * until we read — tight coupling, minimal latency. */
+        size_t one_frame = (size_t)gw * gh * 4;  /* worst case: BGR0 */
+        if (fcntl(o->pipe_fd, F_SETPIPE_SZ, (int)one_frame) < 0) {
+            /* F_SETPIPE_SZ may fail past /proc/sys/fs/pipe-max-size;
+             * non-fatal, just means we use the kernel's default. */
         }
 
         char wfr_geo[64];

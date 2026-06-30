@@ -390,12 +390,11 @@ if [[ "$1" == "webcam" ]]; then
 
     # Webcam is 16:9 (height computed from width)
     HEIGHT=$(( WIDTH * 9 / 16 ))
-    PAD=10
     case "$POS" in
-        tl)     X=$PAD;                       Y=$PAD ;;
-        tr)     X=$(( OUT_W - WIDTH - PAD )); Y=$PAD ;;
-        bl)     X=$PAD;                       Y=$(( OUT_H - HEIGHT - PAD )) ;;
-        br)     X=$(( OUT_W - WIDTH - PAD )); Y=$(( OUT_H - HEIGHT - PAD )) ;;
+        tl)     X=0;                    Y=0 ;;
+        tr)     X=$(( OUT_W - WIDTH )); Y=0 ;;
+        bl)     X=0;                    Y=$(( OUT_H - HEIGHT )) ;;
+        br)     X=$(( OUT_W - WIDTH )); Y=$(( OUT_H - HEIGHT )) ;;
         center) X=$(( (OUT_W - WIDTH) / 2 )); Y=$(( (OUT_H - HEIGHT) / 2 )) ;;
         full)   X=0; Y=0; WIDTH=$OUT_W; HEIGHT=$OUT_H ;;
         *) echo "Unknown position '$POS' (use tl|tr|bl|br|center|full|off)" >&2; exit 1 ;;

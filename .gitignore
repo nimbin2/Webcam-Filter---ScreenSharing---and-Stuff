@@ -1,0 +1,38 @@
+# Build artifacts
+*.o
+*.d
+*.a
+*.so
+*.so.*
+vcam
+test_screen
+
+# Distribution archives
+*.tar.gz
+*.tar.bz2
+*.zip
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local notes / scratch
+TODO.local
+NOTES.local
+scratch/
+
+# Coverage / profiling
+*.gcov
+*.gcda
+*.gcno
+gmon.out
+perf.data*
+
+# Core dumps
+core
+core.*
+vgcore.*

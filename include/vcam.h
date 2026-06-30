@@ -84,7 +84,8 @@ typedef enum {
     FX_BRIGHTNESS,  /* param = multiplier, default 1.2     */
     FX_CONTRAST,    /* param = multiplier, default 1.4     */
     FX_POSTERIZE,   /* param = levels per channel, def 4   */
-    FX_EDGES,       /* sobel edge detect                    */
+    FX_EDGES,       /* sobel edge detect, strength 0..2, default 1.0      */
+    FX_SATURATE,    /* saturation multiplier 0..3, default 1.5            */
 
     /* ── fancier effects ── */
     FX_CHROMASHIFT, /* param = offset px, default 5 (VHS-style RGB split) */
@@ -97,6 +98,7 @@ typedef enum {
     FX_CARTOON,     /* posterize + edge enhancement                       */
     FX_SOLARIZE,    /* param = threshold 0..255, default 128              */
     FX_RAINBOW,     /* animated hue rotation, param = speed (default 1.0) */
+    FX_CRT,         /* CRT scanlines + slight curvature, 0..1, def 0.7    */
 
     /* ── soft / dreamy / painterly ── */
     FX_DREAM,       /* blur + brightness boost (soft hazy glow)           */
@@ -105,6 +107,7 @@ typedef enum {
     FX_PINCH,       /* radial inward pull toward center                   */
     FX_BULGE,       /* radial outward push from center (fisheye-ish)      */
     FX_PAINTERLY,   /* oil-painting: dominant color in neighborhood       */
+    FX_VELVET,      /* desat + warm tint + soft blur, 0..1, def 0.6       */
 
     /* ── themed / styled looks ── */
     FX_MODERN,      /* clean teal-orange grade, default 0.7 strength      */
@@ -112,6 +115,7 @@ typedef enum {
     FX_ROMANTIC,    /* soft warm haze, default 0.7 strength               */
     FX_VANGOGH,     /* heavy painterly + saturation boost                 */
     FX_PICASSO,     /* kaleidoscope + posterize + cartoon edges           */
+    FX_NOIR,        /* high-contrast B&W with split-tone shadows, def 0.8 */
 
     /* ── mathematical patterns ── */
     FX_SINE,        /* sinusoidal x/y distortion, default 15px            */
@@ -119,6 +123,7 @@ typedef enum {
     FX_MODULO,      /* color modulo, default 64                           */
     FX_POLAR,       /* polar-coordinate warp, 0..1                        */
     FX_VORONOI,     /* voronoi cell mosaic, default 20 cells              */
+    FX_JULIA,       /* Julia fractal color overlay, 0..1, def 0.5         */
 
     /* ── pixel-crazy / animated ── */
     FX_BITCRUSH,    /* quantize bits per channel, 1..8, default 3         */
@@ -126,6 +131,7 @@ typedef enum {
     FX_POPART,      /* warhol-style 2x2 quadrants, strength 0..1          */
     FX_DISPLACE,    /* luma-based horizontal displacement, default 0.5    */
     FX_RIPPLE,      /* animated water ripple from center, default 0.5     */
+    FX_SCANLINES,   /* black scanlines every N rows, gap 2..8, def 3      */
 
     FX_UNKNOWN,
 } FilterType;
@@ -222,5 +228,10 @@ void         capture_close(V4L2Capture *cap);
 typedef struct V4L2Output V4L2Output;
 
 V4L2Output *output_open (const char *dev, int w, int h, int fps);
+
+/* Output frame dimensions — set by main.c after output_open succeeds.
+ * Screen / webcam overlays clamp against these to avoid being clipped. */
+extern int g_output_w;
+extern int g_output_h;
 bool        output_write(V4L2Output *out, const Frame *frame);
 void        output_close(V4L2Output *out);

@@ -1,9 +1,5 @@
 # vcam — virtual webcam pipeline
 
-100% vibe coded by ClaudeCode  
-
-Loopback your webcam so you can add filters, screensharing, images, super laggy videos nad such things
-
 Real-time virtual webcam written in C. Reads from a physical webcam, runs
 your frames through a chain of pixel effects, composites images / looping
 videos / live screen regions on top, and writes the result to a
@@ -90,8 +86,6 @@ mandatory for Firefox.
 ---
 
 ## vcam — main process
-
-Just run `./vcam` if you did everything above to run the video loopback modification software
 
 ```
 vcam [OPTIONS]
@@ -205,6 +199,17 @@ Multiple captures are first-class: calling `vcam-ctl screen` repeatedly
 without `-i` creates `screen`, `screen2`, `screen3`, … so they don't
 collide.
 
+If the captured region is larger than the vcam output (very common with
+`--full` on a 4K monitor while vcam runs at 720p), the overlay is
+automatically scaled down to fit while preserving aspect — no more
+top-left-quadrant clipping.
+
+For low capture latency, vcam sets the kernel pipe size to exactly one
+frame's worth of bytes (`F_SETPIPE_SZ`). This tightly couples
+wf-recorder's output rate to vcam's consumption rate so frames can't
+build up a backlog. On most systems on-screen lag drops to roughly one
+frame after the change.
+
 Examples:
 
 ```bash
@@ -305,7 +310,7 @@ shown above.
 
 ---
 
-## Filters (43 total, 6 categories)
+## Filters (49 total, 6 categories)
 
 Filters run in chain order on every frame from the webcam, *before*
 overlays are composited.
@@ -325,7 +330,8 @@ overlays are composited.
 | `brightness` | mult (1.2)    | clamped multiply |
 | `contrast`   | mult (1.4)    | contrast around mid-grey |
 | `posterize`  | levels (4)    | reduce colour levels per channel |
-| `edges`      | —             | Sobel edge detection |
+| `edges`      | 0–2 (1.0)     | Sobel edge detection, strength multiplier |
+| `saturate`   | 0–3 (1.5)     | chroma boost (0=gray, 1=normal, 2=vivid) |
 
 ### Fancy
 
@@ -341,6 +347,7 @@ overlays are composited.
 | `cartoon`      | edge thresh (50)    | posterize + dark edges |
 | `solarize`     | threshold (128)     | invert pixels above value |
 | `rainbow`      | speed (1.0)         | animated additive hue rotation |
+| `crt`          | 0–1 (0.7)           | CRT scanlines + barrel + R/B chromatic aberration |
 
 ### Soft & dreamy
 
@@ -352,6 +359,7 @@ overlays are composited.
 | `pinch`     | 0–1 (0.5) | radial inward pull |
 | `bulge`     | 0–1 (0.5) | fisheye-like outward push |
 | `painterly` | 1–5 (3)   | oil-painting effect |
+| `velvet`    | 0–1 (0.6) | soft desat + warm tint + blur — flattering portrait look |
 
 ### Themed looks
 
@@ -362,6 +370,7 @@ overlays are composited.
 | `romantic`  | 0–1 (0.7)         | soft warm haze + blur + vignette |
 | `vangogh`   | radius 1–5 (3)    | heavy painterly + saturation |
 | `picasso`   | segments 4–16 (8) | cubist: kaleidoscope + posterize + edges |
+| `noir`      | 0–1 (0.8)         | high-contrast B&W with split-tone shadows/highlights |
 
 ### Mathematical patterns
 
@@ -372,6 +381,7 @@ overlays are composited.
 | `modulo`  | divisor 2–128 (64)| colour mod N |
 | `polar`   | 0–1 (0.7)         | polar-coordinate warp |
 | `voronoi` | cells 4–64 (20)   | voronoi-cell mosaic |
+| `julia`   | 0–1 (0.5)         | animated Julia fractal coloured overlay |
 
 ### Pixel-crazy / animated
 
@@ -382,6 +392,7 @@ overlays are composited.
 | `popart`   | 0–1 (1.0)      | Warhol 2×2 quadrants with rotating colour tints |
 | `displace` | 0–1 (0.5)      | bright pixels shift right, dark pixels left |
 | `ripple`   | 0–1 (0.5)      | animated water ripple radiating from the center |
+| `scanlines`| gap 2–16 (3)   | hard black scanline every N rows — CRT/terminal look |
 
 ### Combinations to try
 
@@ -417,10 +428,14 @@ vcam-tune --help
 | `↑` / `k` | increase parameter |
 | `↓` / `j` | decrease parameter |
 | `r`       | reset to default |
-| `x`       | remove and quit |
+| `x`       | remove current filter (stays in walk mode) |
+| `a`       | open a categorised picker to add a new filter |
 | `q` / Esc | quit |
 | `→` / `l` / Tab | next filter (walk mode) |
 | `←` / `h`       | previous filter (walk mode) |
+
+If you launch `vcam-tune` with no filters active, it opens the picker
+automatically so you can start composing a chain from scratch.
 
 Examples:
 
