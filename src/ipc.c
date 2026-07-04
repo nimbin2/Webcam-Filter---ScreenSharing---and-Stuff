@@ -27,6 +27,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <pthread.h>
 
 /* ── helpers ─────────────────────────────────── */
 static void send_line(int fd, const char *msg)
@@ -49,6 +51,7 @@ static int read_line(int fd, char *buf, int maxlen)
     while (i < maxlen - 1) {
         char c;
         ssize_t n = read(fd, &c, 1);
+        if (n < 0 && errno == EINTR) continue;   /* signal — retry */
         if (n <= 0) return -1;
         if (c == '\n') break;
         if (c != '\r') buf[i++] = c;
@@ -116,6 +119,10 @@ static void parse_size_and_path(char **save_ptr,
 
 /* ── command handler ─────────────────────────── */
 extern FilterChain g_filters;  /* defined in main.c */
+extern Recorder   *g_recorder; /* defined in main.c, may be NULL pre-init */
+extern int         g_output_w;
+extern int         g_output_h;
+extern int         g_output_fps;
 
 static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
 {
@@ -137,12 +144,16 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
         char *sub = strtok_r(NULL, " \t", &save);
         if (!sub || strcmp(sub, "help") == 0) {
             send_line(client_fd, "OK filter commands:");
-            send_line(client_fd, "OK   filter list                    show active filters");
-            send_line(client_fd, "OK   filter add <name> [<param>]    append a filter");
-            send_line(client_fd, "OK   filter set <index> <param>     update a filter's parameter");
+            send_line(client_fd, "OK   filter list                    show active filters + all params");
+            send_line(client_fd, "OK   filter add <name> <p> [<p2> [<p3> [<p4>]]]");
+            send_line(client_fd, "OK                                    append a filter with up to 4 params");
+            send_line(client_fd, "OK   filter set <index> <param>       update the primary param");
+            send_line(client_fd, "OK   filter set <index> p2|p3|p4 <v>  update a specific extra param");
             send_line(client_fd, "OK   filter remove <index>          remove filter at index");
             send_line(client_fd, "OK   filter clear                   remove all filters");
             send_line(client_fd, "OK   filter help                    this message");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK filters marked (*) accept extra params — see the notes below each.");
             send_line(client_fd, "OK");
             send_line(client_fd, "OK basic filters:");
             send_line(client_fd, "OK   grayscale                      Rec.601 luma");
@@ -152,7 +163,7 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   flip                           vertical flip");
             send_line(client_fd, "OK   pixelate <block>               mosaic, default block=8");
             send_line(client_fd, "OK   blur <radius>                  box blur, radius 1..6, default 2");
-            send_line(client_fd, "OK   vignette <strength>            darken edges, 0..1, default 0.6");
+            send_line(client_fd, "OK   vignette <strength> [<r> <warmth>](*) darken edges 0..1 (def 0.6); r=inner radius; warmth 0..1 = brown tint");
             send_line(client_fd, "OK   brightness <mult>              multiply brightness, default 1.2");
             send_line(client_fd, "OK   contrast <mult>                contrast around 128, default 1.4");
             send_line(client_fd, "OK   posterize <levels>             reduce color levels, default 4");
@@ -160,14 +171,14 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   saturate <factor>              chroma boost, 0=gray, 1=normal, 0..3, default 1.5");
             send_line(client_fd, "OK");
             send_line(client_fd, "OK fancy filters:");
-            send_line(client_fd, "OK   chromashift <offset>           VHS-style RGB channel split, default 5");
-            send_line(client_fd, "OK   glitch <intensity>             animated random horizontal slices, 0..1, default 0.3");
-            send_line(client_fd, "OK   kaleidoscope <segments>        radial mirror, default 6");
-            send_line(client_fd, "OK   swirl <strength>               radial twist, default 1.0");
+            send_line(client_fd, "OK   chromashift <dx> [<dxb> <dy_r>](*) RGB split; dx=R shift (B=-dx unless dxb given); dy_r=R vertical shift");
+            send_line(client_fd, "OK   glitch <intensity> [<slice_h> <shift_pct>](*) animated slice shift; slice_h in px, shift_pct=max shift as %-of-width");
+            send_line(client_fd, "OK   kaleidoscope <segments> [<rot> <spin> <zoom>](*) radial mirror; spin deg/frame; zoom of the wedge");
+            send_line(client_fd, "OK   swirl <strength> [<radius> <spin>](*) radial twist; radius 0.2..1 of frame; spin animates it");
             send_line(client_fd, "OK   thermal                        heatmap palette (luma → fire colors)");
             send_line(client_fd, "OK   oldfilm                        sepia + grain + scratches + vignette");
-            send_line(client_fd, "OK   wave <amplitude>               animated sinusoidal x-shift, default 10");
-            send_line(client_fd, "OK   cartoon <edge_thresh>          posterize + dark edges, default 50");
+            send_line(client_fd, "OK   wave <amp> [<freq> <speed> <vert>](*) sinusoidal displacement; freq=waves/screen, speed=px/frame, vert=1 for vertical");
+            send_line(client_fd, "OK   cartoon <edge_thresh> [<levels>](*) posterize + dark edges; levels 2..12 (def 5)");
             send_line(client_fd, "OK   solarize <threshold>           invert pixels above value, default 128");
             send_line(client_fd, "OK   rainbow <speed>                animated hue rotation, default 1.0");
             send_line(client_fd, "OK   crt <strength>                 CRT scanlines + barrel + RGB fringe, 0..1, default 0.7");
@@ -176,8 +187,8 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   dream <strength>               hazy soft glow, 0..1, default 0.5");
             send_line(client_fd, "OK   bloom <strength>               highlight glow, 0..1, default 0.6");
             send_line(client_fd, "OK   glow <intensity>               gentle gaussian glow, 0..1, default 0.4");
-            send_line(client_fd, "OK   pinch <strength>               radial inward pull, 0..1, default 0.5");
-            send_line(client_fd, "OK   bulge <strength>               fisheye-like outward push, 0..1, default 0.5");
+            send_line(client_fd, "OK   pinch <strength> [<cx> <cy>](*) radial inward pull; cx/cy = center 0..1 (off-center = gravity well)");
+            send_line(client_fd, "OK   bulge <strength> [<cx> <cy>](*) fisheye push; cx/cy = center 0..1");
             send_line(client_fd, "OK   painterly <radius>             oil-painting effect, 1..5, default 3");
             send_line(client_fd, "OK   velvet <strength>              soft desat + warm tint + blur, 0..1, default 0.6");
             send_line(client_fd, "OK");
@@ -204,6 +215,52 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   displace <strength>            luma-driven horizontal shift, 0..1, default 0.5");
             send_line(client_fd, "OK   ripple <strength>              animated water ripple from center, 0..1, default 0.5");
             send_line(client_fd, "OK   scanlines <gap>                black scanline every N rows, 2..16, default 3");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK glitch art / generative:");
+            send_line(client_fd, "OK   shuffle <intensity> [<size> <phase_s>](*) shuffle/unshuffle blocks; size 16..96 px; phase seconds 0.3..5");
+            send_line(client_fd, "OK   pixelsort <density>            glitch-art row sort by luminance, 0..1, default 0.3");
+            send_line(client_fd, "OK   rgbdelay <strength>            chromatic lag — G & R from past frames, 0..1, default 0.7");
+            send_line(client_fd, "OK   drift <band_h> [<max_shift>](*) scanline drift; max shift 5..120 px");
+            send_line(client_fd, "OK   rain <density> [<speed> <trail>](*) Matrix rain; speed mult 0.3..3; trail length 8..80 px");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK temporal / time-bending:");
+            send_line(client_fd, "OK   echo <persistence>             motion trails (ghosting), 0..0.97, default 0.6");
+            send_line(client_fd, "OK   slitscan <depth> [<dir>](*)    rows sample older frames; dir 1 = time flows upward");
+            send_line(client_fd, "OK   mosh <sensitivity> [<keyint>](*) datamosh; keyint = frames between resyncs 30..600 (def 90)");
+            send_line(client_fd, "OK   stutter <period>               freeze each frame for N frames, 2..30, default 6");
+            send_line(client_fd, "OK   halftone <cell>                newspaper dot grid, cell 4..32 px, default 8");
+            send_line(client_fd, "OK   neon <strength> [<thresh> <huespd> <glow>](*) glowing rainbow edges + real bloom; thresh 10..120");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK retro & warp:");
+            send_line(client_fd, "OK   emboss <strength>              carved gray relief, 0.1..2, default 1");
+            send_line(client_fd, "OK   dither <levels>                ordered Bayer dither, levels/channel 2..8, default 2 (retro 8-color)");
+            send_line(client_fd, "OK   tiles <n>                      n x n mirror-tile wallpaper grid, 2..8, default 3");
+            send_line(client_fd, "OK   zoompulse <strength> [<rate>](*) breathing zoom; rate = oscillation speed");
+            send_line(client_fd, "OK   oilslick <strength> [<speed>](*) iridescent hue swirl; speed = drift rate");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK interactive & extravagant:");
+            send_line(client_fd, "OK   feedback <decay> [<zoom> <rot>](*) infinite video-feedback tunnel; zoom/frame (def 1.04), deg/frame (def 1.5)");
+            send_line(client_fd, "OK   ripples <sens> [<rain> <refract>](*) INTERACTIVE water sim; rain=drops/sec ambient, refract 0..8");
+            send_line(client_fd, "OK   lightpaint <fade> [<thresh> <huespd>](*) INTERACTIVE painting; thresh 10..120; hue cycle rate");
+            send_line(client_fd, "OK   hologram <strength> [<gap> <glitch>](*) sci-fi projection; scanline gap 2..8; glitch rate 0..1");
+            send_line(client_fd, "OK   life <density> [<color> <speed>](*) Conway's Life on your edges; color 1=age-rainbow; speed=frames/gen");
+            send_line(client_fd, "OK   mathwarp <amp>                 warp by YOUR math — set with: filter expr <dx> <dy>");
+            send_line(client_fd, "OK                                    vars x y w h t r a; fns sin cos abs sqrt floor");
+            send_line(client_fd, "OK                                    ops + - * / % ; cmp > < >= <= == != ; ternary c?a:b");
+            send_line(client_fd, "OK                                    e.g. filter expr (x-w/2)*(sin(t*5)>0?0.08:0) 0");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK demoscene & particles:");
+            send_line(client_fd, "OK   plasma <blend> [<speed> <scale>](*) classic demoscene plasma over the video, blend 0..0.9");
+            send_line(client_fd, "OK   contour <levels> [<dim>](*)    glowing topographic iso-lines of your luma, 3..24 bands");
+            send_line(client_fd, "OK   fireworks <sens> [<burst>](*)  INTERACTIVE: motion detonates particle bursts w/ gravity");
+            send_line(client_fd, "OK   infinity <scale> [<rot>](*)    recursive picture-in-picture (droste), scale 0.2..0.85");
+            send_line(client_fd, "OK   moire <spacing> [<speed>](*)   two orbiting ring systems interfere over the image");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK text, tone & tracking:");
+            send_line(client_fd, "OK   ascii <cell> [<mode>](*)       REAL ASCII-art from an 8x8 font; cell 8|16; mode 0=green 1=color 2=white");
+            send_line(client_fd, "OK   duotone <hueA> [<hueB> <mix>](*) two-color gradient map; hues in degrees (def 220/30 = teal-orange)");
+            send_line(client_fd, "OK   sketch <detail> [<darkness>](*) pencil sketch via dodge blend; detail 1..4");
+            send_line(client_fd, "OK   spotlight <radius> [<dark> <speed>](*) INTERACTIVE: the light FOLLOWS your motion");
             return;
         }
 
@@ -215,8 +272,10 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 char buf[128];
                 for (int i = 0; i < g_filters.count; i++) {
                     Filter *f = &g_filters.filters[i];
-                    snprintf(buf, sizeof buf, "OK %d: %s param=%.2f",
-                             i, filter_type_to_name(f->type), f->param);
+                    snprintf(buf, sizeof buf,
+                        "OK %d: %s param=%.2f p2=%.2f p3=%.2f p4=%.2f",
+                        i, filter_type_to_name(f->type),
+                        f->param, f->param2, f->param3, f->param4);
                     send_line(client_fd, buf);
                 }
             }
@@ -238,16 +297,33 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 char b[128]; snprintf(b, sizeof b, "ERR unknown filter '%s'", name);
                 send_line(client_fd, b); return;
             }
-            float param = filter_default_param(t);
-            char *pstr = strtok_r(NULL, " \t", &save);
-            if (pstr) {
+            /* Parse 0–4 numeric params. Missing ones default: primary
+             * → filter_default_param(t); the rest → 0. */
+            float params[FILTER_MAX_PARAMS] = {
+                filter_default_param(t), 0.0f, 0.0f, 0.0f
+            };
+            int n_parsed = 0;
+            for (int p = 0; p < FILTER_MAX_PARAMS; p++) {
+                char *pstr = strtok_r(NULL, " \t", &save);
+                if (!pstr) break;
                 char *ep; float v = strtof(pstr, &ep);
-                if (*ep == '\0') param = v;
+                if (*ep != '\0') {
+                    char b[128];
+                    snprintf(b, sizeof b, "ERR filter add: '%s' isn't a number", pstr);
+                    send_line(client_fd, b);
+                    return;
+                }
+                params[p] = v;
+                n_parsed++;
             }
-            if (filter_chain_add(&g_filters, t, param)) {
-                char b[128];
-                snprintf(b, sizeof b, "OK added filter '%s' param=%.2f",
-                         filter_type_to_name(t), param);
+            if (n_parsed == 0) n_parsed = 1;  /* use the default */
+
+            if (filter_chain_add_multi(&g_filters, t, params, n_parsed)) {
+                char b[192];
+                snprintf(b, sizeof b,
+                    "OK added filter '%s' param=%.2f p2=%.2f p3=%.2f p4=%.2f",
+                    filter_type_to_name(t),
+                    params[0], params[1], params[2], params[3]);
                 send_line(client_fd, b);
             } else {
                 send_line(client_fd, "ERR filter chain full");
@@ -255,14 +331,49 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             return;
         }
 
+        if (strcmp(sub, "expr") == 0) {
+            /* filter expr <dx-expression> <dy-expression>
+             * NO SPACES within an expression. Vars: x y w h t r a.
+             * Fns: sin cos abs sqrt. Applies to the mathwarp filter. */
+            char *dxs = strtok_r(NULL, " \t", &save);
+            char *dys = strtok_r(NULL, " \t", &save);
+            if (!dxs || !dys) {
+                send_line(client_fd, "ERR usage: filter expr <dx> <dy>   (no spaces inside expressions)");
+                send_line(client_fd, "ERR   vars: x y w h t r a   fns: sin cos abs sqrt floor");
+                send_line(client_fd, "ERR   ops: + - * / % ( )  comparisons > < >= <= == !=  ternary c?a:b");
+                send_line(client_fd, "ERR   example: filter expr (x-w/2)*(sin(t*5)>0?0.08:0) (y-h/2)*(sin(t*5)>0?0.08:0)");
+                return;
+            }
+            char err[128] = "";
+            if (!mathwarp_set_expr(dxs, dys, err, sizeof err)) {
+                char b[192];
+                snprintf(b, sizeof b, "ERR expression: %s", err);
+                send_line(client_fd, b);
+                return;
+            }
+            send_line(client_fd, "OK mathwarp expressions updated (add the 'mathwarp' filter to see them)");
+            return;
+        }
+
         if (strcmp(sub, "set") == 0) {
+            /* Usage:
+             *   filter set <index> <param>              → primary
+             *   filter set <index> p2|p3|p4 <param>     → specific extra
+             */
             char *istr = strtok_r(NULL, " \t", &save);
-            char *pstr = strtok_r(NULL, " \t", &save);
-            if (!istr || !pstr) {
-                send_line(client_fd, "ERR filter set: usage 'filter set <index> <param>'");
+            char *first = strtok_r(NULL, " \t", &save);
+            if (!istr || !first) {
+                send_line(client_fd, "ERR filter set: usage 'filter set <index> [p2|p3|p4] <param>'");
                 return;
             }
             int idx = atoi(istr);
+            int which = 1;
+            char *pstr = first;
+            if (!strcmp(first, "p2") || !strcmp(first, "p3") || !strcmp(first, "p4")) {
+                which = first[1] - '0';
+                pstr = strtok_r(NULL, " \t", &save);
+                if (!pstr) { send_line(client_fd, "ERR filter set: missing value"); return; }
+            }
             char *ep; float v = strtof(pstr, &ep);
             if (*ep != '\0') { send_line(client_fd, "ERR filter set: bad number"); return; }
             pthread_mutex_lock(&g_filters.lock);
@@ -271,7 +382,12 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 send_line(client_fd, "ERR filter set: index out of range");
                 return;
             }
-            g_filters.filters[idx].param = v;
+            switch (which) {
+            case 1: g_filters.filters[idx].param  = v; break;
+            case 2: g_filters.filters[idx].param2 = v; break;
+            case 3: g_filters.filters[idx].param3 = v; break;
+            case 4: g_filters.filters[idx].param4 = v; break;
+            }
             const char *name = filter_type_to_name(g_filters.filters[idx].type);
             pthread_mutex_unlock(&g_filters.lock);
             char b[128]; snprintf(b, sizeof b, "OK %d: %s param=%.2f", idx, name, v);
@@ -576,6 +692,110 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
         return;
     }
 
+    /* ── record start [file=<path>] [mic=<dev>] [crf=N] [preset=<p>] [vcodec=<v>]
+     *    record stop
+     *    record status
+     *    record info
+     *
+     * Spawns ffmpeg as a child of vcam and pipes our composed BGR24
+     * frames into it. This avoids all v4l2loopback contention because
+     * we don't read /dev/video0 at all on the recording side.
+     */
+    if (strcmp(cmd, "record") == 0) {
+        char *sub = strtok_r(NULL, " \t", &save);
+        if (!sub) { send_line(client_fd, "ERR usage: record start|stop|status|info"); return; }
+
+        if (strcmp(sub, "status") == 0) {
+            if (recorder_active(g_recorder))
+                send_line(client_fd, "OK recording");
+            else
+                send_line(client_fd, "OK stopped");
+            return;
+        }
+
+        if (strcmp(sub, "info") == 0) {
+            if (!recorder_active(g_recorder)) {
+                send_line(client_fd, "OK stopped");
+                return;
+            }
+            char buf[256];
+            snprintf(buf, sizeof buf,
+                     "OK recording pid=%d file=%s",
+                     (int)recorder_pid(g_recorder),
+                     recorder_file(g_recorder));
+            send_line(client_fd, buf);
+            return;
+        }
+
+        if (strcmp(sub, "stop") == 0) {
+            if (!recorder_active(g_recorder)) {
+                send_line(client_fd, "OK already stopped");
+                return;
+            }
+            recorder_stop(g_recorder);
+            send_line(client_fd, "OK stopped");
+            return;
+        }
+
+        if (strcmp(sub, "start") == 0) {
+            if (!g_recorder) {
+                send_line(client_fd, "ERR recorder not initialised");
+                return;
+            }
+            if (recorder_active(g_recorder)) {
+                send_line(client_fd, "ERR already recording");
+                return;
+            }
+
+            /* Parse key=value tokens for file=, mic=, crf=, preset=, vcodec=, aoffset= */
+            char file[512] = {0};
+            char mic[128]  = {0};
+            char vcodec[64] = "libx264";
+            char vpreset[32] = "ultrafast";
+            int  crf = 23;
+            float aoffset = 0.2f;   /* default: shift audio 0.2s later to
+                                     * match the video path's buffering
+                                     * latency; tune with aoffset= */
+            char *tok;
+            while ((tok = strtok_r(NULL, " \t", &save))) {
+                if      (strncmp(tok, "file=",   5) == 0)
+                    strncpy(file, tok + 5, sizeof file - 1);
+                else if (strncmp(tok, "mic=",    4) == 0)
+                    strncpy(mic, tok + 4, sizeof mic - 1);
+                else if (strncmp(tok, "crf=",    4) == 0)
+                    crf = atoi(tok + 4);
+                else if (strncmp(tok, "vcodec=", 7) == 0)
+                    strncpy(vcodec, tok + 7, sizeof vcodec - 1);
+                else if (strncmp(tok, "preset=", 7) == 0)
+                    strncpy(vpreset, tok + 7, sizeof vpreset - 1);
+                else if (strncmp(tok, "aoffset=", 8) == 0)
+                    aoffset = strtof(tok + 8, NULL);
+            }
+            if (!file[0]) {
+                send_line(client_fd, "ERR record start: file= argument required");
+                return;
+            }
+
+            if (!recorder_start(g_recorder, file,
+                                mic[0] ? mic : NULL,
+                                g_output_w, g_output_h, g_output_fps,
+                                crf, vcodec, vpreset, aoffset)) {
+                send_line(client_fd, "ERR ffmpeg failed to start (see /tmp/vcam-record.log)");
+                return;
+            }
+
+            char buf[256];
+            snprintf(buf, sizeof buf,
+                     "OK recording pid=%d file=%s",
+                     (int)recorder_pid(g_recorder), file);
+            send_line(client_fd, buf);
+            return;
+        }
+
+        send_line(client_fd, "ERR record: unknown subcommand (use start|stop|status|info)");
+        return;
+    }
+
     /* ── add <type> <id> <x> <y> [<w>] [<h>] <file|geometry> ── */
     if (strcmp(cmd, "add") == 0) {
         char *type = strtok_r(NULL, " \t", &save);
@@ -645,11 +865,27 @@ static void *ipc_thread(void *arg)
 {
     IPCServer *srv = arg;
 
+    /* Block SIGCHLD in this thread. When ffmpeg (the recorder child)
+     * exits, SIGCHLD fires on whichever thread the kernel picks; if
+     * that's the IPC thread mid-accept(), accept() returns EINTR.
+     * We now retry on EINTR (see below), but blocking the signal here
+     * means the main thread handles it and the IPC thread stays
+     * quietly in accept(). Belt and braces. */
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGCHLD);
+    sigaddset(&block, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &block, NULL);
+
     while (srv->running) {
         struct sockaddr_un peer;
         socklen_t peer_len = sizeof peer;
         int client = accept(srv->server_fd, (struct sockaddr *)&peer, &peer_len);
         if (client < 0) {
+            /* Signals (SIGCHLD when a child ffmpeg exits, etc.) can
+             * interrupt accept(). Don't kill the server thread just
+             * because a child died — retry. */
+            if (errno == EINTR) continue;
             if (srv->running) perror("[ipc] accept");
             break;
         }

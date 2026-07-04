@@ -18,7 +18,8 @@ PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 
 SRCS := src/main.c src/frame.c src/capture.c src/output.c \
-        src/overlay.c src/registry.c src/ipc.c src/filter.c
+        src/overlay.c src/registry.c src/ipc.c src/filter.c \
+        src/record.c
 OBJS := $(SRCS:.c=.o)
 BIN  := vcam
 TEST := test_screen

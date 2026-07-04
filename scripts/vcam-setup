@@ -127,8 +127,12 @@ if [[ "${1:-}" == "--install" ]]; then
 # video_nr=0       claim /dev/video0 so Chromium picks it by default
 # card_label       human-readable name in browser camera lists
 # exclusive_caps=1 advertise only V4L2_CAP_VIDEO_CAPTURE — required for Firefox/Chromium
-# max_buffers=2    real-camera-like buffer count
-options v4l2loopback video_nr=0 card_label="vcam" exclusive_caps=1 max_buffers=2
+# max_buffers=8    enough to support vcam-write + multiple simultaneous
+#                  readers (browser, ffmpeg recording, ffplay preview).
+#                  With max_buffers=2 the second reader gets EBUSY at
+#                  VIDIOC_REQBUFS — so e.g. 'vcam-ctl record start'
+#                  failed if the cam was already in use.
+options v4l2loopback video_nr=0 card_label="vcam" exclusive_caps=1 max_buffers=8
 MODPROBE
     echo "Wrote /etc/modprobe.d/vcam.conf"
 

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <sys/types.h>
 
 /* ──────────────────────────────────────────────
  * Frame  (internal BGR24)
@@ -133,15 +134,60 @@ typedef enum {
     FX_RIPPLE,      /* animated water ripple from center, default 0.5     */
     FX_SCANLINES,   /* black scanlines every N rows, gap 2..8, def 3      */
 
+    /* ── glitch art / generative animated ── */
+    FX_SHUFFLE,     /* roving pixel-shuffle blocks, intensity 0..1, def 0.4 */
+    FX_PIXELSORT,   /* glitch-art row pixel-sort, density 0..1, def 0.3     */
+    FX_RGB_DELAY,   /* chromatic lag (G+R from past frames), 0..1, def 0.7  */
+    FX_DRIFT,       /* horizontal scanline drift, band height px, def 8     */
+    FX_RAIN,        /* matrix-style digital rain trails, density 0..1, def 0.4 */
+
+    /* ── temporal / time-bending (rgbdelay's siblings) ── */
+    FX_ECHO,        /* motion trails: blend of past frames, 0..1, def 0.6   */
+    FX_SLITSCAN,    /* time gradient top→bottom rows from the past, 0..1    */
+    FX_MOSH,        /* fake datamosh: only update pixels that move, 0..1    */
+    FX_STUTTER,     /* freeze each frame for N frames (temporal pixelate)   */
+    FX_HALFTONE,    /* newspaper dot grid, cell size px, def 8              */
+    FX_NEON,        /* glowing colored edges on darkened scene, 0..1        */
+
+    /* ── batch 3: retro & warp ── */
+    FX_EMBOSS,      /* grayscale relief, strength 0..2, def 1               */
+    FX_DITHER,      /* ordered Bayer dither, levels/channel 2..8, def 2     */
+    FX_TILES,       /* mirror-tile grid, tiles per row 2..8, def 3          */
+    FX_ZOOMPULSE,   /* breathing zoom oscillation, 0..1, def 0.5            */
+    FX_OILSLICK,    /* iridescent luma-keyed hue warp, 0..1, def 0.6        */
+
+    /* ── batch 4: interactive & extravagant ── */
+    FX_FEEDBACK,    /* video-feedback tunnel; decay 0..1 (+zoom,rot), def 0.85 */
+    FX_RIPPLES,     /* INTERACTIVE: motion spawns water ripples, 0..1       */
+    FX_LIGHTPAINT,  /* INTERACTIVE: motion paints glowing trails, fade 0..1 */
+    FX_HOLOGRAM,    /* sci-fi hologram: cyan, scanlines, flicker, 0..1      */
+    FX_LIFE,        /* Conway's Life seeded by image edges, density 0..1    */
+    FX_MATHWARP,    /* expression-driven warp — see 'filter expr', amp mult */
+
+    /* ── batch 5: demoscene & particles ── */
+    FX_PLASMA,      /* classic demoscene plasma blend, 0..1 (+speed,scale)  */
+    FX_CONTOUR,     /* glowing topographic iso-lines, levels (+dim)         */
+    FX_FIREWORKS,   /* INTERACTIVE: motion sparks particle bursts, 0..1     */
+    FX_INFINITY,    /* recursive picture-in-picture droste, scale (+rot)    */
+    FX_MOIRE,       /* rotating interference rings, spacing px (+speed)     */
+
+    /* ── batch 6: text, tone & tracking ── */
+    FX_ASCII,       /* real ASCII-art rendering, cell px (+colormode)       */
+    FX_DUOTONE,     /* two-color gradient map, hueA deg (+hueB, mix)        */
+    FX_SKETCH,      /* pencil sketch (dodge blend), detail (+darkness)      */
+    FX_SPOTLIGHT,   /* INTERACTIVE: spotlight follows your motion, radius   */
+
     FX_UNKNOWN,
 } FilterType;
 
 typedef struct {
     FilterType type;
-    float      param;
+    float      param;         /* primary — kept for backwards compat */
+    float      param2, param3, param4;  /* optional additional knobs */
 } Filter;
 
 #define MAX_FILTERS 16
+#define FILTER_MAX_PARAMS 4
 
 typedef struct {
     Filter          filters[MAX_FILTERS];
@@ -151,10 +197,23 @@ typedef struct {
 
 void        filter_chain_init   (FilterChain *fc);
 void        filter_chain_destroy(FilterChain *fc);
+/* Add a filter with just the primary param. */
 bool        filter_chain_add    (FilterChain *fc, FilterType t, float param);
+/* Add a filter with up to FILTER_MAX_PARAMS params (unused → 0.0). */
+bool        filter_chain_add_multi(FilterChain *fc, FilterType t,
+                                   const float *params, int n_params);
 bool        filter_chain_remove (FilterChain *fc, int index);
 void        filter_chain_clear  (FilterChain *fc);
 void        filter_chain_apply  (FilterChain *fc, Frame *f); /* takes lock */
+
+/* mathwarp: compile displacement expressions used by FX_MATHWARP.
+ * Variables: x y (pixel coords), w h (frame size), t (seconds),
+ * r (distance from center), a (angle from center).
+ * Functions: sin cos abs sqrt. Operators: + - * / ( ) unary -.
+ * NO SPACES inside an expression. Returns false + err message on
+ * parse failure. */
+bool mathwarp_set_expr(const char *dx_expr, const char *dy_expr,
+                       char *err, size_t errlen);
 
 FilterType  filter_type_from_name(const char *name);
 const char *filter_type_to_name  (FilterType t);
@@ -235,3 +294,46 @@ extern int g_output_w;
 extern int g_output_h;
 bool        output_write(V4L2Output *out, const Frame *frame);
 void        output_close(V4L2Output *out);
+
+/* ──────────────────────────────────────────────
+ * Recorder — spawns ffmpeg as a child process and feeds it our raw
+ * BGR24 frames via a pipe. Bypasses /dev/video0 entirely, so it never
+ * contends with browser / ffplay / OBS consumers of the v4l2loopback.
+ * ────────────────────────────────────────────── */
+typedef struct Recorder Recorder;
+
+Recorder *recorder_new(void);
+void      recorder_free(Recorder *r);
+
+/* Start recording. file is the output path; mic may be NULL or an
+ * ALSA device string ("default", "plughw:1,0", etc.). w/h/fps are
+ * the dimensions of the BGR24 frames you'll pass to
+ * recorder_write_frame. Returns false if ffmpeg failed to start.
+ *
+ * crf:     x264 quality (0..51, lower = better)
+ * preset, vcodec: x264 preset / codec name
+ * aoffset: audio delay in seconds (positive shifts audio LATER).
+ *          Compensates for the video path's buffering latency
+ *          (webcam driver + decode + pipe), which otherwise makes
+ *          audio lead video by a constant ~0.3-0.5s. */
+bool recorder_start(Recorder *r,
+                    const char *file, const char *mic,
+                    int w, int h, int fps,
+                    int crf, const char *vcodec, const char *vpreset,
+                    float aoffset);
+
+/* Stop recording. Sends EOF to ffmpeg via closing the pipe so it
+ * finalises the container, then reaps the child. Safe to call when
+ * not recording (no-op). */
+void recorder_stop(Recorder *r);
+
+bool        recorder_active(const Recorder *r);
+pid_t       recorder_pid   (const Recorder *r);
+const char *recorder_file  (const Recorder *r);
+
+/* Send one frame to ffmpeg's stdin. Frame must be BGR24, width*height*3
+ * bytes. Non-blocking — if ffmpeg's pipe is full (typically because the
+ * encoder briefly stalled) the frame is silently dropped rather than
+ * blocking the main loop. Returns true if frame was sent (or recording
+ * is inactive), false if ffmpeg died unexpectedly. */
+bool recorder_write_frame(Recorder *r, const uint8_t *bgr24, size_t bytes);

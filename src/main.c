@@ -44,6 +44,8 @@ static IPCServer        g_ipc;
 FilterChain             g_filters; /* extern'd by ipc.c */
 int                     g_output_w = 0; /* extern'd by overlay.c */
 int                     g_output_h = 0;
+int                     g_output_fps = 30; /* extern'd by ipc.c (record) */
+Recorder               *g_recorder = NULL; /* extern'd by ipc.c */
 
 static void on_signal(int sig)
 {
@@ -241,6 +243,10 @@ int main(int argc, char *argv[])
     }
     g_output_w = width;
     g_output_h = height;
+    g_output_fps = fps;
+
+    /* Recorder: idle until 'record start' IPC fires it up. */
+    g_recorder = recorder_new();
 
     /* ── start IPC server ── */
     if (!ipc_start(&g_ipc, &g_registry)) {
@@ -314,6 +320,14 @@ int main(int argc, char *argv[])
 
         output_write(out, frame);
 
+        /* Mirror the composed frame to the recorder, if active.
+         * This is BGR24 — same format we asked ffmpeg to expect
+         * via -f rawvideo -pixel_format bgr24. */
+        if (recorder_active(g_recorder)) {
+            recorder_write_frame(g_recorder, frame->data,
+                                 (size_t)frame->stride * frame->height);
+        }
+
         /* Frame pacing */
         struct timespec t1;
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -329,6 +343,8 @@ int main(int argc, char *argv[])
     fprintf(stderr, "\n[main] Shutting down.\n");
 
     ipc_stop(&g_ipc);
+    recorder_free(g_recorder);   /* stops + finalises any active recording */
+    g_recorder = NULL;
     frame_free(frame);
     frame_free(cam_buf);
     output_close(out);

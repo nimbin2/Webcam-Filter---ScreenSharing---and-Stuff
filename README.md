@@ -449,8 +449,60 @@ vcam-ctl record mics                                 # list available ALSA devic
 Audio policy: ALSA only by design (no Pulse/PipeWire daemon dependency).
 On systems running PipeWire, the pipewire-alsa compatibility plugin
 generally exposes `default` as a working capture device, which `record
-start` will pick automatically. If you have multiple capture cards or a
-preferred one, list them with `record mics` and pass `-m hw:N,M`.
+start` will pick automatically.
+
+Mic identifiers accepted by `--mic`:
+
+| Form | Behaviour |
+|---|---|
+| *(omitted)*    | auto-pick: `default` if present, else first `plughw:N,M` from `arecord -l` |
+| `N,M`          | expanded to `plughw:N,M` for you |
+| `plughw:N,M`   | ALSA auto-converts sample format/channels (recommended) |
+| `hw:N,M`       | raw access — only if you know the device's native format |
+| `default`      | system default |
+
+Run `vcam-ctl record mics` for a ready-to-paste table of what's
+available on your machine.
+
+### Recording while vcam is already streaming
+
+This now works without contention. Two things had to be right:
+
+1. **v4l2loopback needs enough buffers.** Older `vcam-setup` defaulted
+   to `max_buffers=2`; the current default is `8`. If you set this up
+   previously and `record start` fails with `Device or resource busy`,
+   re-apply and reload:
+
+   ```bash
+   sudo vcam-setup --install      # rewrites /etc/modprobe.d/vcam.conf
+   sudo modprobe -r v4l2loopback
+   sudo modprobe v4l2loopback
+   ```
+
+2. **The ffmpeg command must not call `VIDIOC_S_PARM`.** v4l2loopback
+   rejects framerate changes from any consumer while a producer is
+   active, returning EBUSY. `vcam-ctl record start` deliberately
+   omits the `-framerate` flag for this reason — it lets the loopback
+   keep whatever framerate vcam set. (This is why `ffplay` worked but
+   a hand-rolled `ffmpeg -framerate 30 -f v4l2 -i /dev/video0` would
+   not.) If you ever invoke ffmpeg by hand against vcam, leave out
+   `-framerate`.
+
+With both in place: vcam writing + a browser reading + a recording
+capturing all run simultaneously without any contention.
+
+### If audio crackles
+
+The most common cause is ffmpeg's default `thread_queue_size` of 8
+packets being too small for live capture; `record start` passes
+`-thread_queue_size 1024` plus `aresample=async=1000` to mitigate
+this. If you're still hearing crackles:
+
+* Try a different mic with `record mics` + `--mic plughw:N,M`. Laptop
+  DMICs (AMD acp etc.) are often the culprit.
+* If your system runs PipeWire, the `pipewire-alsa` shim sometimes
+  introduces extra resampling latency. Routing through `default` may
+  be smoother than `plughw:N,M` in that case.
 
 The recording lives in a separate process from vcam, so it survives a
 vcam restart. State is published in three plain files under `/tmp` so any
