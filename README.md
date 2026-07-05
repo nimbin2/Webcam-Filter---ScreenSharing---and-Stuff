@@ -322,105 +322,162 @@ shown above.
 
 ---
 
-## Filters (49 total, 6 categories)
+## Filters (100 total, 11 categories)
 
 Filters run in chain order on every frame from the webcam, *before*
-overlays are composited.
-
-### Basic
-
-| Name | Param | Description |
-|---|---|---|
-| `grayscale`  | —             | Rec.601 luma |
-| `sepia`      | —             | warm brown tone |
-| `invert`     | —             | negative colours |
-| `mirror`     | —             | horizontal flip |
-| `flip`       | —             | vertical flip |
-| `pixelate`   | block px (8)  | average colour per block |
-| `blur`       | radius 1–6 (2)| two-pass box blur |
-| `vignette`   | 0–1 (0.6)     | darken edges radially |
-| `brightness` | mult (1.2)    | clamped multiply |
-| `contrast`   | mult (1.4)    | contrast around mid-grey |
-| `posterize`  | levels (4)    | reduce colour levels per channel |
-| `edges`      | 0–2 (1.0)     | Sobel edge detection, strength multiplier |
-| `saturate`   | 0–3 (1.5)     | chroma boost (0=gray, 1=normal, 2=vivid) |
-
-### Fancy
-
-| Name | Param | Description |
-|---|---|---|
-| `chromashift`  | offset px (5)       | VHS-style RGB channel separation |
-| `glitch`       | intensity 0–1 (0.3) | animated slice displacement |
-| `kaleidoscope` | segments (6)        | radial mirror |
-| `swirl`        | strength (1.0)      | radial twist |
-| `thermal`      | —                   | luma → heatmap palette |
-| `oldfilm`      | —                   | sepia + grain + scratches + vignette |
-| `wave`         | amplitude px (10)   | animated sin-wave x-shift per row |
-| `cartoon`      | edge thresh (50)    | posterize + dark edges |
-| `solarize`     | threshold (128)     | invert pixels above value |
-| `rainbow`      | speed (1.0)         | animated additive hue rotation |
-| `crt`          | 0–1 (0.7)           | CRT scanlines + barrel + R/B chromatic aberration |
-
-### Soft & dreamy
-
-| Name | Param | Description |
-|---|---|---|
-| `dream`     | 0–1 (0.5) | hazy soft glow |
-| `bloom`     | 0–1 (0.6) | highlight bloom |
-| `glow`      | 0–1 (0.4) | gentle gaussian glow |
-| `pinch`     | 0–1 (0.5) | radial inward pull |
-| `bulge`     | 0–1 (0.5) | fisheye-like outward push |
-| `painterly` | 1–5 (3)   | oil-painting effect |
-| `velvet`    | 0–1 (0.6) | soft desat + warm tint + blur — flattering portrait look |
-
-### Themed looks
-
-| Name | Param | Description |
-|---|---|---|
-| `modern`    | 0–1 (0.7)         | teal-orange cinematic grade |
-| `cyberpunk` | 0–1 (0.7)         | neon contrast + chromashift |
-| `romantic`  | 0–1 (0.7)         | soft warm haze + blur + vignette |
-| `vangogh`   | radius 1–5 (3)    | heavy painterly + saturation |
-| `picasso`   | segments 4–16 (8) | cubist: kaleidoscope + posterize + edges |
-| `noir`      | 0–1 (0.8)         | high-contrast B&W with split-tone shadows/highlights |
-
-### Mathematical patterns
-
-| Name | Param | Description |
-|---|---|---|
-| `sine`    | amplitude (15)    | animated sin-wave x/y distortion |
-| `xor`     | 0–1 (0.5)         | `(x ^ y)` bitwise overlay |
-| `modulo`  | divisor 2–128 (64)| colour mod N |
-| `polar`   | 0–1 (0.7)         | polar-coordinate warp |
-| `voronoi` | cells 4–64 (20)   | voronoi-cell mosaic |
-| `julia`   | 0–1 (0.5)         | animated Julia fractal coloured overlay |
-
-### Pixel-crazy / animated
-
-| Name | Param | Description |
-|---|---|---|
-| `bitcrush` | bits 1–8 (3)   | quantize each channel to N bits — chunky banding |
-| `melt`     | 0–1 (0.5)      | columns drip downward, animated over time |
-| `popart`   | 0–1 (1.0)      | Warhol 2×2 quadrants with rotating colour tints |
-| `displace` | 0–1 (0.5)      | bright pixels shift right, dark pixels left |
-| `ripple`   | 0–1 (0.5)      | animated water ripple radiating from the center |
-| `scanlines`| gap 2–16 (3)   | hard black scanline every N rows — CRT/terminal look |
-
-### Combinations to try
+overlays are composited. Every filter has a primary parameter; many
+have up to three extra tunable knobs (marked in `filter help` with
+`(*)`). All parameters can be set at add time, changed live over IPC,
+or dialed interactively with `vcam-tune`.
 
 ```bash
-vcam-ctl filter add modern 0.8                                  # cinema look
-vcam-ctl filter add cyberpunk 0.9                               # neon
-vcam-ctl filter add romantic 0.7                                # soft skin
-vcam-ctl filter add vangogh 3                                   # painting
-vcam-ctl filter add picasso 8                                   # cubism
-vcam-ctl filter add thermal                                     # heatvision
-vcam-ctl filter add cartoon                                     # animated
-vcam-ctl filter add glitch 0.4 && vcam-ctl filter add chromashift 6
-vcam-ctl filter add voronoi 30 && vcam-ctl filter add xor 0.4   # math art
+vcam-ctl filter help                        # authoritative list + all knobs
+vcam-ctl filter add <name> [p1 [p2 [p3 [p4]]]]
+vcam-ctl filter set <index> <value>         # primary param
+vcam-ctl filter set <index> p2|p3|p4 <v>    # extra knobs
+vcam-ctl filter list                        # active chain with all params
 ```
 
----
+### Basic
+`grayscale sepia invert mirror flip pixelate blur vignette brightness
+contrast posterize edges saturate` — the workhorses. `vignette` takes
+optional radius + warmth for a film look.
+
+### Fancy
+`chromashift glitch kaleidoscope swirl thermal oldfilm wave cartoon
+solarize rainbow crt` — kaleidoscope has rotation, per-frame spin and
+wedge zoom; wave does vertical/horizontal with frequency and speed;
+chromashift splits all three channels independently.
+
+### Soft & dreamy
+`dream bloom glow pinch bulge painterly velvet` — pinch/bulge accept
+an off-center point (gravity wells).
+
+### Themed
+`modern cyberpunk romantic vangogh picasso noir` — one-shot looks
+composed from the primitives.
+
+### Math
+`sine xor modulo polar voronoi julia` — pure math over your pixels.
+
+### Pixel-crazy
+`bitcrush melt popart displace ripple scanlines`
+
+### Glitch-art (animated, stateful)
+| Name | Knobs | Effect |
+|---|---|---|
+| `shuffle`   | intensity, block size, phase seconds | regions scramble over seconds, then UNSCRAMBLE pixel-perfectly |
+| `pixelsort` | density | luminance-sorted spans, the classic glitch smear |
+| `rgbdelay`  | strength | R and G channels lag frames behind B — chromatic ghosts |
+| `drift`     | band height, max shift | VHS-style horizontal band misalignment |
+| `rain`      | density, speed, trail | Matrix digital rain over the image |
+
+### Temporal (frame-history effects)
+| Name | Knobs | Effect |
+|---|---|---|
+| `echo`     | persistence | motion trails / light painting |
+| `slitscan` | depth, direction | each row samples an older frame — time taffy |
+| `mosh`     | sensitivity, keyframe interval | fake datamosh; static freezes, motion smears |
+| `stutter`  | period | hold each frame N frames — stop-motion |
+| `halftone` | cell | newspaper dot print |
+| `neon`     | strength, threshold, hue speed, glow | rainbow edges with real bloom |
+
+### Interactive — these respond to YOUR MOTION on camera
+| Name | Knobs | Effect |
+|---|---|---|
+| `ripples`    | sensitivity, rain, refraction | real water simulation — wave a hand, ripples flow away from it |
+| `lightpaint` | fade, threshold, hue speed | movement deposits glowing hue-cycling trails |
+| `fireworks`  | sensitivity, burst | motion detonates gravity-arcing particle bursts |
+| `spotlight`  | radius, darkness, follow speed | a theatrical spotlight CHASES you across the frame |
+| `feedback`   | decay, zoom, rotation | infinite video-feedback tunnel |
+| `hologram`   | strength, scanline gap, glitch rate | sci-fi projection |
+| `life`       | density, color mode, speed | Conway's Game of Life colonising your edges; color 1 = age rainbow |
+| `mathwarp`   | amplitude | **your own math** — see below |
+
+### Demoscene & artistic
+`plasma` (animated sine palette), `contour` (glowing topographic
+iso-lines), `infinity` (recursive droste picture-in-picture),
+`moire` (orbiting interference rings), `ascii` (REAL ASCII art from an
+embedded 8×8 font — cell 8/16, green/color/white modes), `duotone`
+(two-hue gradient map, hues in degrees), `sketch` (pencil via dodge
+blend), plus `emboss dither tiles zoompulse oilslick`.
+
+### The AI-craze set
+| Name | Knobs | Effect |
+|---|---|---|
+| `predator`    | visibility, shimmer, adapt | camouflage cloak: hold still and VANISH; motion shows a shimmering outline |
+| `shards`      | count, offset | broken mirror — voronoi shards with bright crack lines |
+| `portal`      | radius, separation | two ringed portals (orange/blue) that swap their contents |
+| `heattrail`   | gain, cooling | motion leaves a cooling thermal wake (fire palette) |
+| `wormhole`    | depth, speed | fly down a demoscene tunnel textured with your live image |
+| `magnet`      | strength, follow | the frame bends toward the brightest light — drag it with a flashlight |
+| `liquid`      | amplitude, scale, speed | the whole image flows like disturbed water |
+| `nightvision` | gain, noise | gen-3 intensifier: green amplification, sensor noise, hard vignette |
+| `badtv`       | amount, roll | dying CRT: vertical roll, tearing, static bursts, chroma wobble |
+| `ghosts`      | delay, gain | motion extraction — static scenery goes gray, movement appears as vivid spectres |
+
+### The AI-craze set, volume 2
+| Name | Knobs | Effect |
+|---|---|---|
+| `clones`     | count, interval, alpha | freeze-frames of you captured every few seconds populate the room — *Multiplicity* |
+| `meltdown`   | speed, chaos | Doom's screen-melt, live: the frozen frame's columns slide off, revealing the feed underneath; loops |
+| `rotozoom`   | speed, zoom | demoscene rotozoomer — an infinite mirror-tiled plane of you, rotating and breathing |
+| `starfield`  | density, speed | hyperspace: stars fly out of center with speed streaks over the video |
+| `lightning`  | rate, branches | jagged bolts STRIKE wherever you move, with branch forks and a full-frame flash |
+| `scatter`    | power, heal | motion shatters pixels outward with an impulse; they spring back — explode and heal |
+| `vhs`        | wear, timecode | the full tape look: chroma bleed, luma noise, head-switch bar, live counting timecode |
+| `outline`    | thickness, hue speed | animated marching-ants lasso traces whatever is moving |
+| `symmetry`   | mode | face-symmetry mirrors — 0 left→right, 1 right→left, 2 quad kaleidoscope |
+| `timebubble` | delay, radius | a glowing bubble drifts around; inside it you see seconds into the past |
+
+### mathwarp — warp the image with your own formulas
+
+```bash
+vcam-ctl filter add mathwarp 1.0
+# toom in out stepped
+vcam-ctl filter expr '(x-w/2)*(sin(t*5)>0?0.08:0)' '(y-h/2)*(sin(t*5)>0?0.08:0)'
+# squares mash animated
+vcam-ctl filter expr '(floor(x/40)%2==floor(y/40)%2?1:-1)*sin(t*3)*25' '(floor(x/40)%2==floor(y/40)%2?-1:1)*cos(t*2.5)*25'
+vcam-ctl filter expr '(x-w/2)*((floor(x/40)+floor(y/40))%2==0?(1+sin(t*0.3)*0.3):(1-sin(t*0.3)*0.3))-x+w/2' '(y-h/2)*((floor(x/40)+floor(y/40))%2==0?(1+sin(t*0.3)*0.3):(1-sin(t*0.3)*0.3))-y+h/2'
+
+# waves circle
+vcam-ctl filter expr '(x-w/2)*(sin(r*0.2-t*5)*0.08)' '(y-h/2)*(sin(r*0.2-t*5)*0.08)'
+# bubble
+vcam-ctl filter expr '(sqrt((x-(w/2+sin(t*0.7)*w*0.35))*(x-(w/2+sin(t*0.7)*w*0.35))+(y-(h/2+cos(t*0.9)*h*0.35))*(y-(h/2+cos(t*0.9)*h*0.35)))<50)?(x-(w/2+sin(t*0.7)*w*0.35))*0.4:0' '(sqrt((x-(w/2+sin(t*0.7)*w*0.35))*(x-(w/2+sin(t*0.7)*w*0.35))+(y-(h/2+cos(t*0.9)*h*0.35))*(y-(h/2+cos(t*0.9)*h*0.35)))<50)?(y-(h/2+cos(t*0.9)*h*0.35))*0.4:0'
+vcam-ctl filter expr '(x-w/2)*(1/(r*0.03+1)) - (y-h/2)*(1/(r*0.01+0.5))*2*sin(t)' '(y-h/2)*(1/(r*0.03+1)) + (x-w/2)*(1/(r*0.01+0.5))*2*cos(t)'
+
+# gltichbar
+vcam-ctl filter expr '(floor(y/5)%2==0?sin(t*20)*5:0)+(abs(y-h/2-sin(t*1.2)*h*0.4)<10?80:0)' '(floor(x/5)%2==0?cos(t*20)*5:0)+(abs(x-w/2-cos(t*1.2)*w*0.4)<10?80:0)'
+# pulsate
+vcam-ctl filter expr '(x-w/2)*(abs(sin(t*3))*0.15)' '(y-h/2)*(abs(sin(t*3))*0.15)'
+# slight drunk
+vcam-ctl filter expr 'sin(sqrt((x-w/2)*(x-w/2)+(y-h/2)*(y-h/2))*0.05-t*3)*2+sin(sqrt((x-(w/2+sin(t)*200))*(x-(w/2+sin(t)*200))+(y-(h/2+cos(t)*200))*(y-(h/2+cos(t)*200)))*0.05+t*3)*2' 'cos(sqrt((x-w/2)*(x-w/2)+(y-h/2)*(y-h/2))*0.05-t*3)*2+cos(sqrt((x-(w/2+sin(t)*200))*(x-(w/2+sin(t)*200))+(y-(h/2+cos(t)*200))*(y-(h/2+cos(t)*200)))*0.05+t*3)*2'
+vcam-ctl filter expr '(sin(a+t*2)*cos(a*2+t*1.7)+cos(a*3-t))*r*0.02' '(cos(a+t*2)*sin(a*2+t*1.7)+sin(a*3-t))*r*0.02'
+vcam-ctl filter expr 'abs((x-w/2)*cos(t*0.5)-(y-h/2)*sin(t*0.5))*0.3' 'abs((x-w/2)*sin(t*0.5)+(y-h/2)*cos(t*0.5))*0.3'
+# good for kalaidoscope
+vcam-ctl filter expr '(sin(t)>0.1 ? (x-w/2)*abs(sin(t))*0.2 : (x-w/2)*(-abs(sin(t))*0.5) ) + (sin(t)<-0.1? (w-x) : 0)' '(sin(t)>0.1 ? (y-h/2)*abs(sin(t))*0.2 : (y-h/2)*(-abs(sin(t))*0.5) ) + (sin(t)<-0.1? (h-y) : 0)'
+```
+
+Each pixel is displaced by `(dx, dy)` computed from your two
+expressions (no spaces inside an expression). Compiled on the fly by
+a built-in parser, evaluated on a coarse grid + bilinear upsampling —
+comfortably 720p30.
+
+* Variables: `x y` (pixel), `w h` (frame size), `t` (seconds),
+  `r a` (radius / angle from center)
+* Functions: `sin cos abs sqrt floor`
+* Operators: `+ - * / %`, comparisons `> < >= <= == !=`,
+  ternary `cond ? a : b`, parentheses, unary minus
+
+```bash
+# brick-shatter: alternating 40px bands slide opposite ways
+vcam-ctl filter expr '(floor(y/40)%2==0?1:-1)*sin(t*3)*15' '0'
+# radial shockwaves
+vcam-ctl filter expr 'sin(r/15-t*4)*10' 'cos(r/15-t*4)*10'
+```
+
+The `mathwarp` primary parameter is a global amplitude multiplier, so
+you can fade your formula in and out live from `vcam-tune`.
 
 ## Recording the vcam output
 

@@ -261,6 +261,30 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   duotone <hueA> [<hueB> <mix>](*) two-color gradient map; hues in degrees (def 220/30 = teal-orange)");
             send_line(client_fd, "OK   sketch <detail> [<darkness>](*) pencil sketch via dodge blend; detail 1..4");
             send_line(client_fd, "OK   spotlight <radius> [<dark> <speed>](*) INTERACTIVE: the light FOLLOWS your motion");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK the AI-craze set:");
+            send_line(client_fd, "OK   predator <vis> [<shimmer> <adapt>](*) camouflage cloak — hold still and VANISH; motion shimmers");
+            send_line(client_fd, "OK   shards <count> [<offset>](*)  broken mirror: voronoi shards with crack lines, 6..64");
+            send_line(client_fd, "OK   portal <radius> [<sep>](*)    two ringed portals that swap their contents (orange/blue)");
+            send_line(client_fd, "OK   heattrail <gain> [<cool>](*)  motion leaves cooling thermal glow (fire palette)");
+            send_line(client_fd, "OK   wormhole <depth> [<speed>](*) fly down a tunnel textured with your own live image");
+            send_line(client_fd, "OK   magnet <strength> [<follow>](*) the frame is pulled toward the brightest light");
+            send_line(client_fd, "OK   liquid <amp> [<scale> <speed>](*) the whole image flows like disturbed water");
+            send_line(client_fd, "OK   nightvision <gain> [<noise>](*) gen-3 intensifier: green amp + noise + vignette");
+            send_line(client_fd, "OK   badtv <amount> [<roll>](*)   dying CRT: roll, tearing, static bursts, chroma wobble");
+            send_line(client_fd, "OK   ghosts <delay> [<gain>](*)   motion extraction: static = gray, movement = vivid spectres");
+            send_line(client_fd, "OK");
+            send_line(client_fd, "OK AI-craze volume 2:");
+            send_line(client_fd, "OK   clones <count> [<interval> <alpha>](*) freeze-frames of you populate the room (multiplicity)");
+            send_line(client_fd, "OK   meltdown <speed> [<chaos>](*) Doom screen-melt: the frozen frame slides off, revealing live");
+            send_line(client_fd, "OK   rotozoom <speed> [<zoomamp>](*) demoscene rotozoomer: infinite rotating tiled plane of you");
+            send_line(client_fd, "OK   starfield <density> [<speed>](*) hyperspace stars streak over the video");
+            send_line(client_fd, "OK   lightning <rate> [<branches>](*) bolts STRIKE WHERE YOU MOVE, with flash");
+            send_line(client_fd, "OK   scatter <power> [<heal>](*)   motion shatters pixels outward; the frame heals itself");
+            send_line(client_fd, "OK   vhs <wear> [<timecode>](*)    chroma bleed + head-switch bar + live counting timecode");
+            send_line(client_fd, "OK   outline <thick> [<huespd>](*) marching-ants lasso traces whatever MOVES");
+            send_line(client_fd, "OK   symmetry <mode>               face symmetry: 0=left mirrored, 1=right, 2=quad");
+            send_line(client_fd, "OK   timebubble <delay_s> [<radius>](*) a drifting bubble shows THE PAST inside it");
             return;
         }
 

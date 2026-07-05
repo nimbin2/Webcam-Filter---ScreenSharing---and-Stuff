@@ -177,6 +177,30 @@ typedef enum {
     FX_SKETCH,      /* pencil sketch (dodge blend), detail (+darkness)      */
     FX_SPOTLIGHT,   /* INTERACTIVE: spotlight follows your motion, radius   */
 
+    /* ── batch 7: the AI-craze set ── */
+    FX_PREDATOR,    /* motion-camouflage cloak: hold still → vanish         */
+    FX_SHARDS,      /* broken-mirror voronoi shards w/ crack lines          */
+    FX_PORTAL,      /* two ringed portals that swap their contents          */
+    FX_HEATTRAIL,   /* motion leaves cooling thermal glow                   */
+    FX_WORMHOLE,    /* classic demo tunnel textured with your own image     */
+    FX_MAGNET,      /* image warps toward the brightest region              */
+    FX_LIQUID,      /* whole frame becomes gently flowing liquid            */
+    FX_NIGHTVISION, /* amplified green + noise + scanlines + hard vignette  */
+    FX_BADTV,       /* vertical roll, tearing, static bursts, chroma wobble */
+    FX_GHOSTS,      /* motion extraction: only movement is visible          */
+
+    /* ── batch 8: AI-craze volume 2 ── */
+    FX_CLONES,      /* periodic freezes of you populate the frame           */
+    FX_MELTDOWN,    /* Doom-style: a snapshot melts off, revealing live     */
+    FX_ROTOZOOM,    /* demoscene rotozoomer: rotating tiled plane of you    */
+    FX_STARFIELD,   /* hyperspace starfield streaking over the video        */
+    FX_LIGHTNING,   /* bolts strike wherever you move                       */
+    FX_SCATTER,     /* motion shatters pixels outward; frame heals itself   */
+    FX_VHS,         /* full VHS: chroma bleed, head-switch bar, timecode    */
+    FX_OUTLINE,     /* marching-ants animated outline around moving subject */
+    FX_SYMMETRY,    /* face symmetry mirrors (left/right/quad)              */
+    FX_TIMEBUBBLE,  /* drifting bubble showing N seconds into the past      */
+
     FX_UNKNOWN,
 } FilterType;
 

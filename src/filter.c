@@ -124,6 +124,39 @@ static const struct { const char *name; FilterType t; } NAMES[] = {
     {"pencil",      FX_SKETCH},
     {"spotlight",   FX_SPOTLIGHT},
     {"followme",    FX_SPOTLIGHT},
+    /* the AI-craze set */
+    {"predator",    FX_PREDATOR},
+    {"cloak",       FX_PREDATOR},
+    {"shards",      FX_SHARDS},
+    {"glasswall",   FX_SHARDS},
+    {"portal",      FX_PORTAL},
+    {"heattrail",   FX_HEATTRAIL},
+    {"heat",        FX_HEATTRAIL},
+    {"wormhole",    FX_WORMHOLE},
+    {"magnet",      FX_MAGNET},
+    {"liquid",      FX_LIQUID},
+    {"nightvision", FX_NIGHTVISION},
+    {"nv",          FX_NIGHTVISION},
+    {"badtv",       FX_BADTV},
+    {"ghosts",      FX_GHOSTS},
+    {"motionx",     FX_GHOSTS},
+    /* AI-craze volume 2 */
+    {"clones",      FX_CLONES},
+    {"multiplicity",FX_CLONES},
+    {"meltdown",    FX_MELTDOWN},
+    {"doommelt",    FX_MELTDOWN},
+    {"rotozoom",    FX_ROTOZOOM},
+    {"starfield",   FX_STARFIELD},
+    {"hyperspace",  FX_STARFIELD},
+    {"lightning",   FX_LIGHTNING},
+    {"tesla",       FX_LIGHTNING},
+    {"scatter",     FX_SCATTER},
+    {"shatterheal", FX_SCATTER},
+    {"vhs",         FX_VHS},
+    {"outline",     FX_OUTLINE},
+    {"symmetry",    FX_SYMMETRY},
+    {"timebubble",  FX_TIMEBUBBLE},
+    {"pastbubble",  FX_TIMEBUBBLE},
     /* new effect additions */
     {"saturate",    FX_SATURATE},
     {"crt",         FX_CRT},
@@ -225,6 +258,26 @@ float filter_default_param(FilterType t)
     case FX_DUOTONE:     return 220.0f;
     case FX_SKETCH:      return 2.0f;
     case FX_SPOTLIGHT:   return 180.0f;
+    case FX_PREDATOR:    return 0.15f;
+    case FX_SHARDS:      return 24.0f;
+    case FX_PORTAL:      return 130.0f;
+    case FX_HEATTRAIL:   return 0.7f;
+    case FX_WORMHOLE:    return 60.0f;
+    case FX_MAGNET:      return 0.5f;
+    case FX_LIQUID:      return 12.0f;
+    case FX_NIGHTVISION: return 2.0f;
+    case FX_BADTV:       return 0.5f;
+    case FX_GHOSTS:      return 6.0f;
+    case FX_CLONES:      return 3.0f;
+    case FX_MELTDOWN:    return 3.0f;
+    case FX_ROTOZOOM:    return 1.0f;
+    case FX_STARFIELD:   return 0.5f;
+    case FX_LIGHTNING:   return 0.3f;
+    case FX_SCATTER:     return 0.6f;
+    case FX_VHS:         return 0.5f;
+    case FX_OUTLINE:     return 2.0f;
+    case FX_SYMMETRY:    return 0.0f;
+    case FX_TIMEBUBBLE:  return 1.5f;
     default:             return 0.0f;
     }
 }
@@ -4167,6 +4220,1444 @@ static void fx_spotlight(Frame *f, float radius, float dark, float speed)
     }
 }
 
+/* ──────────────────────────────────────────────────────────────
+ * Batch 7: the AI-craze set
+ * ────────────────────────────────────────────────────────────── */
+
+/* ─── fx_predator — motion camouflage cloak ──
+ * Learns the background wherever nothing moves, then shows you the
+ * BACKGROUND instead of the subject. Hold still → you fade out of
+ * existence. Move → a shimmering refraction betrays your outline,
+ * exactly like the movie cloak.
+ *   visibility (p1): 0 = fully cloaked, 1 = normal, def 0.15
+ *   shimmer    (p2): refraction amplitude on motion px (0 → 8)
+ *   adapt      (p3): background learn rate 0.005..0.2 (0 → 0.02)
+ */
+static void fx_predator(Frame *f, float visibility, float shimmer,
+                        float adapt)
+{
+    static uint8_t *bg = NULL;
+    static uint8_t *motion = NULL;   /* per-quarter-cell motion energy */
+    static uint8_t *pl = NULL;       /* prev luma quarter res */
+    static int bw = 0, bh = 0, bs = 0, gw = 0, gh = 0;
+
+    if (visibility < 0.0f) visibility = 0.0f;
+    if (visibility > 1.0f) visibility = 1.0f;
+    if (shimmer <= 0.0f) shimmer = 8.0f;
+    if (shimmer > 30.0f) shimmer = 30.0f;
+    if (adapt < 0.005f || adapt > 0.2f) adapt = 0.02f;
+
+    int w = f->width, h = f->height;
+    int GW = w / 4, GH = h / 4;
+    int size = f->stride * h;
+
+    if (bw != w || bh != h || bs != f->stride) {
+        free(bg); free(motion); free(pl);
+        bg     = malloc((size_t)size);
+        motion = calloc((size_t)GW * GH, 1);
+        pl     = calloc((size_t)GW * GH, 1);
+        if (!bg || !motion || !pl) {
+            free(bg); free(motion); free(pl);
+            bg = motion = pl = NULL;
+            bw = bh = bs = 0;
+            return;
+        }
+        memcpy(bg, f->data, (size_t)size);
+        bw = w; bh = h; bs = f->stride;
+        gw = GW; gh = GH;
+    }
+
+    /* Motion energy per cell (decaying), background learning where calm */
+    unsigned long t = anim_tick();
+    for (int gy = 0; gy < gh; gy++) {
+        for (int gx = 0; gx < gw; gx++) {
+            const uint8_t *p = f->data + (gy*4) * f->stride + (gx*4) * 3;
+            uint8_t l = (uint8_t)((p[0]*114 + p[1]*587 + p[2]*299) / 1000);
+            int gi = gy * gw + gx;
+            int d = abs((int)l - (int)pl[gi]);
+            pl[gi] = l;
+            int m = motion[gi];
+            m = (m * 7) / 8 + (d > 14 ? 90 : 0);   /* rise fast, decay slow */
+            motion[gi] = (uint8_t)(m > 255 ? 255 : m);
+        }
+    }
+
+    float ph = (float)t * 0.25f;
+    for (int y = 0; y < h; y++) {
+        uint8_t *cur = f->data + y * f->stride;
+        uint8_t *bgr = bg      + y * f->stride;
+        int gy = y / 4;
+        if (gy >= gh) gy = gh - 1;
+        for (int x = 0; x < w; x++) {
+            int gx = x / 4;
+            if (gx >= gw) gx = gw - 1;
+            int m = motion[gy * gw + gx];
+            int o = x * 3;
+
+            if (m < 20) {
+                /* calm: learn the background here + show it (cloak) */
+                bgr[o]   = (uint8_t)(bgr[o]   * (1-adapt) + cur[o]   * adapt);
+                bgr[o+1] = (uint8_t)(bgr[o+1] * (1-adapt) + cur[o+1] * adapt);
+                bgr[o+2] = (uint8_t)(bgr[o+2] * (1-adapt) + cur[o+2] * adapt);
+                cur[o]   = (uint8_t)(bgr[o]   * (1-visibility) + cur[o]   * visibility);
+                cur[o+1] = (uint8_t)(bgr[o+1] * (1-visibility) + cur[o+1] * visibility);
+                cur[o+2] = (uint8_t)(bgr[o+2] * (1-visibility) + cur[o+2] * visibility);
+            } else {
+                /* motion: shimmering refracted background */
+                float amp = shimmer * (float)m / 255.0f;
+                int sx = x + (int)(sinf(y * 0.11f + ph) * amp);
+                int sy = y + (int)(cosf(x * 0.09f - ph) * amp * 0.6f);
+                if (sx < 0) sx = 0;
+                if (sx >= w) sx = w - 1;
+                if (sy < 0) sy = 0;
+                if (sy >= h) sy = h - 1;
+                const uint8_t *bp = bg + sy * f->stride + sx * 3;
+                float vis = visibility + 0.10f;   /* faint self on motion */
+                if (vis > 1.0f) vis = 1.0f;
+                cur[o]   = (uint8_t)(bp[0] * (1-vis) + cur[o]   * vis);
+                cur[o+1] = (uint8_t)(bp[1] * (1-vis) + cur[o+1] * vis);
+                cur[o+2] = (uint8_t)(bp[2] * (1-vis) + cur[o+2] * vis);
+            }
+        }
+    }
+}
+
+/* ─── fx_shards — broken mirror ──
+ * The frame shatters into voronoi shards, each displaced by its own
+ * fixed random offset, with bright crack lines along the fractures.
+ *   count  (p1): number of shards 6..64 (def 24)
+ *   offset (p2): max per-shard displacement px (0 → 12)
+ * The shard map is computed once per resolution/count at 1/2 res.
+ */
+#define SHARDS_MAX 64
+static void fx_shards(Frame *f, float count_f, float offset_f)
+{
+    static uint8_t *map = NULL;             /* half-res cell ids */
+    static int8_t   offx[SHARDS_MAX], offy[SHARDS_MAX];
+    static int mw = 0, mh = 0, mcount = 0;
+
+    int count = (int)count_f;
+    if (count < 6)  count = 6;
+    if (count > SHARDS_MAX) count = SHARDS_MAX;
+    int maxoff = (offset_f >= 1.0f && offset_f <= 60.0f) ? (int)offset_f : 12;
+
+    int w = f->width, h = f->height;
+    int MW = w / 2, MH = h / 2;
+
+    if (mw != MW || mh != MH || mcount != count) {
+        free(map);
+        map = malloc((size_t)MW * MH);
+        if (!map) { mw = mh = 0; return; }
+        /* fixed seeds → stable shards until params change */
+        int sx[SHARDS_MAX], sy[SHARDS_MAX];
+        srand(1234567u + (unsigned)count);
+        for (int i = 0; i < count; i++) {
+            sx[i] = rand() % MW;
+            sy[i] = rand() % MH;
+            offx[i] = (int8_t)((rand() % (2*maxoff+1)) - maxoff);
+            offy[i] = (int8_t)((rand() % (2*maxoff+1)) - maxoff);
+        }
+        for (int y = 0; y < MH; y++) {
+            for (int x = 0; x < MW; x++) {
+                int best = 0; long bd = LONG_MAX;
+                for (int i = 0; i < count; i++) {
+                    long dx = x - sx[i], dy = y - sy[i];
+                    long d = dx*dx + dy*dy;
+                    if (d < bd) { bd = d; best = i; }
+                }
+                map[y * MW + x] = (uint8_t)best;
+            }
+        }
+        mw = MW; mh = MH; mcount = count;
+    }
+
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        int my = y / 2;
+        if (my >= mh) my = mh - 1;
+        for (int x = 0; x < w; x++) {
+            int mx = x / 2;
+            if (mx >= mw) mx = mw - 1;
+            uint8_t cell = map[my * mw + mx];
+            /* crack line: neighbouring map cells differ */
+            uint8_t right = map[my * mw + (mx + 1 < mw ? mx + 1 : mx)];
+            uint8_t down  = map[(my + 1 < mh ? my + 1 : my) * mw + mx];
+            int o = x * 3;
+            if (cell != right || cell != down) {
+                dst[o] = dst[o+1] = dst[o+2] = 235;   /* crack */
+                continue;
+            }
+            int sx2 = x + offx[cell];
+            int sy2 = y + offy[cell];
+            if (sx2 < 0) sx2 = 0;
+            if (sx2 >= w) sx2 = w - 1;
+            if (sy2 < 0) sy2 = 0;
+            if (sy2 >= h) sy2 = h - 1;
+            const uint8_t *sp = tmp + sy2 * w * 3 + sx2 * 3;
+            dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+        }
+    }
+    free(tmp);
+}
+
+/* ─── fx_portal ──
+ * Two glowing ringed portals; each circle shows what the OTHER
+ * portal sees. Orange ring left, blue ring right — yes, that game.
+ *   radius (p1): portal radius px (def 130)
+ *   sep    (p2): separation as fraction of width 0.2..0.45 (0 → 0.28)
+ */
+static void fx_portal(Frame *f, float radius, float sep_frac)
+{
+    if (radius < 40.0f) radius = 130.0f;
+    if (sep_frac < 0.2f || sep_frac > 0.45f) sep_frac = 0.28f;
+
+    int w = f->width, h = f->height;
+    float cxA = w * (0.5f - sep_frac), cxB = w * (0.5f + sep_frac);
+    float cy = h * 0.5f;
+    float dxAB = cxB - cxA;
+
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+
+    float r2 = radius * radius;
+    float ring = radius * 0.06f + 3.0f;
+    unsigned long t = anim_tick();
+    float pulse = 0.75f + 0.25f * sinf((float)t * 0.2f);
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        float dy = y - cy;
+        float dy2 = dy * dy;
+        for (int x = 0; x < w; x++) {
+            float dA = (x - cxA) * (x - cxA) + dy2;
+            float dB = (x - cxB) * (x - cxB) + dy2;
+            int o = x * 3;
+
+            if (dA < r2) {
+                /* inside A: show B's view */
+                int sx = x + (int)dxAB;
+                if (sx >= w) sx = w - 1;
+                const uint8_t *sp = tmp + y * w * 3 + sx * 3;
+                dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+            } else if (dB < r2) {
+                int sx = x - (int)dxAB;
+                if (sx < 0) sx = 0;
+                const uint8_t *sp = tmp + y * w * 3 + sx * 3;
+                dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+            }
+            /* rings */
+            float rA = sqrtf(dA), rB = sqrtf(dB);
+            if (fabsf(rA - radius) < ring) {
+                float e = (1.0f - fabsf(rA - radius) / ring) * pulse;
+                dst[o]   = clamp_u8(dst[o]   + (int)(30  * e));
+                dst[o+1] = clamp_u8(dst[o+1] + (int)(120 * e));
+                dst[o+2] = clamp_u8(dst[o+2] + (int)(255 * e));   /* orange */
+            }
+            if (fabsf(rB - radius) < ring) {
+                float e = (1.0f - fabsf(rB - radius) / ring) * pulse;
+                dst[o]   = clamp_u8(dst[o]   + (int)(255 * e));   /* blue */
+                dst[o+1] = clamp_u8(dst[o+1] + (int)(140 * e));
+                dst[o+2] = clamp_u8(dst[o+2] + (int)(30  * e));
+            }
+        }
+    }
+    free(tmp);
+}
+
+/* ─── fx_heattrail — motion leaves cooling thermal glow ──
+ * A per-pixel heat field: motion pumps heat in, everything cools
+ * exponentially, heat renders as an additive fire palette. Wave an
+ * arm and watch the thermal wake fade from white → orange → red.
+ *   gain (p1): heat per unit motion 0..1 (def 0.7)
+ *   cool (p2): retention per frame 0.85..0.99 (0 → 0.94)
+ */
+static void fx_heattrail(Frame *f, float gain, float cool)
+{
+    static float  *heat = NULL;
+    static uint8_t *pl = NULL;
+    static int gw = 0, gh = 0, fw4 = 0, fh4 = 0;
+
+    if (gain < 0.05f) gain = 0.05f;
+    if (gain > 1.0f)  gain = 1.0f;
+    if (cool < 0.85f || cool > 0.99f) cool = 0.94f;
+
+    int w = f->width, h = f->height;
+    int GW = w / 4, GH = h / 4;
+    if (GW < 8 || GH < 8) return;
+
+    if (fw4 != w || fh4 != h) {
+        free(heat); free(pl);
+        heat = calloc((size_t)GW * GH, sizeof(float));
+        pl   = calloc((size_t)GW * GH, 1);
+        if (!heat || !pl) {
+            free(heat); free(pl); heat = NULL; pl = NULL;
+            fw4 = fh4 = 0; return;
+        }
+        gw = GW; gh = GH; fw4 = w; fh4 = h;
+    }
+
+    for (int gy = 0; gy < gh; gy++) {
+        for (int gx = 0; gx < gw; gx++) {
+            const uint8_t *p = f->data + (gy*4) * f->stride + (gx*4) * 3;
+            uint8_t l = (uint8_t)((p[0]*114 + p[1]*587 + p[2]*299) / 1000);
+            int gi = gy * gw + gx;
+            int d = abs((int)l - (int)pl[gi]);
+            pl[gi] = l;
+            float hv = heat[gi] * cool;
+            if (d > 12) hv += gain * (float)d / 40.0f;
+            heat[gi] = hv > 3.0f ? 3.0f : hv;
+        }
+    }
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        int gy = y / 4;
+        if (gy >= gh) gy = gh - 1;
+        for (int x = 0; x < w; x++) {
+            int gx = x / 4;
+            if (gx >= gw) gx = gw - 1;
+            float hv = heat[gy * gw + gx];
+            if (hv < 0.02f) continue;
+            /* fire palette: red → orange → yellow → white */
+            float v = hv > 1.0f ? 1.0f : hv;
+            int r = (int)(v * 255.0f);
+            int g = (int)(v * v * 210.0f);
+            int b = (int)(v * v * v * 160.0f);
+            int o = x * 3;
+            dst[o]   = clamp_u8(dst[o]   + b);
+            dst[o+1] = clamp_u8(dst[o+1] + g);
+            dst[o+2] = clamp_u8(dst[o+2] + r);
+        }
+    }
+}
+
+/* ─── fx_wormhole ──
+ * The immortal demoscene tunnel — using YOUR LIVE IMAGE as the
+ * tunnel texture. Screen coords map to (angle, 1/r): you fly down a
+ * tube whose walls are made of you.
+ *   depth (p1): tube depth scale (def 60)
+ *   speed (p2): flight speed (0 → 1)
+ */
+static void fx_wormhole(Frame *f, float depth, float speed)
+{
+    if (depth < 10.0f) depth = 60.0f;
+    if (speed <= 0.0f) speed = 1.0f;
+
+    int w = f->width, h = f->height;
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+
+    float cx = w / 2.0f, cy = h / 2.0f;
+    float t = (float)anim_tick() / 30.0f * speed;
+    float fly = t * 60.0f;
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        float dy = y - cy;
+        for (int x = 0; x < w; x++) {
+            float dx = x - cx;
+            float r = sqrtf(dx*dx + dy*dy) + 1.0f;
+            float a = atan2f(dy, dx);
+            int sx = (int)(((a + 3.14159265f) / 6.2831853f) * (float)w
+                           + t * 30.0f) % w;
+            if (sx < 0) sx += w;
+            int sy = (int)(depth * 300.0f / r + fly) % h;
+            if (sy < 0) sy += h;
+            const uint8_t *sp = tmp + sy * w * 3 + sx * 3;
+            /* darken toward the far center for depth */
+            float dim = r / (r + 60.0f);
+            int o = x * 3;
+            dst[o]   = (uint8_t)(sp[0] * dim);
+            dst[o+1] = (uint8_t)(sp[1] * dim);
+            dst[o+2] = (uint8_t)(sp[2] * dim);
+        }
+    }
+    free(tmp);
+}
+
+/* ─── fx_magnet ──
+ * The image is drawn toward the brightest region — light literally
+ * bends space. The attractor point smooth-follows the brightest
+ * coarse cell, so moving a phone flashlight around drags the whole
+ * frame after it.
+ *   strength (p1): pull amount 0..1 (def 0.5)
+ *   follow   (p2): attractor smoothing 0.02..0.5 (0 → 0.1)
+ */
+static void fx_magnet(Frame *f, float strength, float follow)
+{
+    static float ax = -1.0f, ay = -1.0f;
+    static int fw5 = 0, fh5 = 0;
+
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (follow < 0.02f || follow > 0.5f) follow = 0.1f;
+
+    int w = f->width, h = f->height;
+    if (fw5 != w || fh5 != h) {
+        ax = w / 2.0f; ay = h / 2.0f;
+        fw5 = w; fh5 = h;
+    }
+
+    /* brightest 16px cell */
+    int best = -1, bx = w/2, by = h/2;
+    for (int gy = 8; gy < h - 8; gy += 16) {
+        const uint8_t *row = f->data + gy * f->stride;
+        for (int gx = 8; gx < w - 8; gx += 16) {
+            const uint8_t *p = row + gx * 3;
+            int l = p[0] + 2*p[1] + p[2];
+            if (l > best) { best = l; bx = gx; by = gy; }
+        }
+    }
+    ax += (bx - ax) * follow;
+    ay += (by - ay) * follow;
+
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+
+    float maxr = sqrtf((float)(w*w + h*h)) * 0.5f;
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        float dy = y - ay;
+        for (int x = 0; x < w; x++) {
+            float dx = x - ax;
+            float r = sqrtf(dx*dx + dy*dy);
+            /* pull falls off with distance */
+            float pull = strength * 0.55f * (1.0f - r / maxr);
+            if (pull < 0) pull = 0;
+            int sx = (int)(x + dx * pull);
+            int sy = (int)(y + dy * pull);
+            if (sx < 0) sx = 0;
+            if (sx >= w) sx = w - 1;
+            if (sy < 0) sy = 0;
+            if (sy >= h) sy = h - 1;
+            const uint8_t *sp = tmp + sy * w * 3 + sx * 3;
+            int o = x * 3;
+            dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+        }
+    }
+    free(tmp);
+}
+
+/* ─── fx_liquid ──
+ * The whole frame flows like disturbed water — layered animated
+ * sine displacement evaluated on a coarse grid (cheap), bilinearly
+ * upsampled (smooth).
+ *   amp   (p1): displacement px (def 12)
+ *   scale (p2): wave size px (0 → 90)
+ *   speed (p3): flow rate (0 → 1)
+ */
+static void fx_liquid(Frame *f, float amp, float scale, float speed)
+{
+    if (amp < 1.0f) amp = 12.0f;
+    if (amp > 60.0f) amp = 60.0f;
+    if (scale < 10.0f) scale = 90.0f;
+    if (speed <= 0.0f) speed = 1.0f;
+
+    int w = f->width, h = f->height;
+    int GW = w / 4 + 2, GH = h / 4 + 2;
+    float *grid = malloc((size_t)GW * GH * 2 * sizeof(float));
+    uint8_t *src = malloc((size_t)w * h * 3);
+    if (!grid || !src) { free(grid); free(src); return; }
+    memcpy(src, f->data, (size_t)w * h * 3);
+
+    float t = (float)anim_tick() / 30.0f * speed;
+    float k = 1.0f / scale;
+
+    for (int gy = 0; gy < GH; gy++) {
+        float y = (float)(gy * 4);
+        for (int gx = 0; gx < GW; gx++) {
+            float x = (float)(gx * 4);
+            int gi = (gy * GW + gx) * 2;
+            grid[gi]   = amp * (sinf(y * k * 6.28f + t * 1.3f)
+                              + 0.5f * sinf((x + y) * k * 4.1f - t * 0.9f));
+            grid[gi+1] = amp * (cosf(x * k * 5.7f - t * 1.1f)
+                              + 0.5f * cosf((x - y) * k * 3.7f + t * 0.7f));
+        }
+    }
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        int gy = y / 4;
+        float fy = (float)(y & 3) / 4.0f;
+        for (int x = 0; x < w; x++) {
+            int gx = x / 4;
+            float fx = (float)(x & 3) / 4.0f;
+            int g00 = (gy * GW + gx) * 2;
+            int g10 = g00 + 2, g01 = g00 + GW * 2, g11 = g01 + 2;
+            float ddx = grid[g00]*(1-fx)*(1-fy) + grid[g10]*fx*(1-fy)
+                      + grid[g01]*(1-fx)*fy     + grid[g11]*fx*fy;
+            float ddy = grid[g00+1]*(1-fx)*(1-fy) + grid[g10+1]*fx*(1-fy)
+                      + grid[g01+1]*(1-fx)*fy     + grid[g11+1]*fx*fy;
+            int sx = x + (int)(ddx * 0.5f);
+            int sy = y + (int)(ddy * 0.5f);
+            if (sx < 0) sx = 0;
+            if (sx >= w) sx = w - 1;
+            if (sy < 0) sy = 0;
+            if (sy >= h) sy = h - 1;
+            const uint8_t *sp = src + sy * w * 3 + sx * 3;
+            int o = x * 3;
+            dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+        }
+    }
+    free(grid);
+    free(src);
+}
+
+/* ─── fx_nightvision ──
+ * Gen-3 image intensifier look: luma amplified into green, live
+ * sensor noise, subtle scanlines, hard circular vignette.
+ *   gain  (p1): amplification 1..4 (def 2)
+ *   noise (p2): noise amplitude 0..60 (0 → 25)
+ */
+static void fx_nightvision(Frame *f, float gain, float noise_f)
+{
+    if (gain < 1.0f) gain = 2.0f;
+    if (gain > 4.0f) gain = 4.0f;
+    int noise = (noise_f >= 1.0f && noise_f <= 60.0f) ? (int)noise_f : 25;
+
+    int w = f->width, h = f->height;
+    float cx = w / 2.0f, cy = h / 2.0f;
+    float vr = (float)(w < h ? w : h) * 0.52f;
+    float vr2 = vr * vr;
+    unsigned seed = (unsigned)anim_tick() * 2654435761u;
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *p = f->data + y * f->stride;
+        float dy = y - cy;
+        float scan = (y & 1) ? 0.92f : 1.0f;
+        for (int x = 0; x < w; x++, p += 3) {
+            float dx = x - cx;
+            float d2 = dx*dx + dy*dy;
+            int l = (p[0]*114 + p[1]*587 + p[2]*299) / 1000;
+            float v = (float)l * gain;
+            /* soft knee so highlights don't clip flat */
+            if (v > 200.0f) v = 200.0f + (v - 200.0f) * 0.3f;
+            /* sensor noise */
+            seed = seed * 1664525u + 1013904223u;
+            int n = (int)((seed >> 24) % (unsigned)(2*noise+1)) - noise;
+            v = (v + n) * scan;
+            /* hard circular vignette */
+            if (d2 > vr2) {
+                float fall = 1.0f - (sqrtf(d2) - vr) / (vr * 0.25f);
+                if (fall < 0) fall = 0;
+                v *= fall;
+            }
+            int g = clamp_u8((int)v);
+            p[0] = (uint8_t)(g / 5);
+            p[1] = (uint8_t)g;
+            p[2] = (uint8_t)(g / 6);
+        }
+    }
+}
+
+/* ─── fx_badtv ──
+ * Dying CRT: continuous vertical roll, per-row horizontal tearing,
+ * chroma wobble, and random static bursts.
+ *   amount (p1): overall degradation 0..1 (def 0.5)
+ *   roll   (p2): vertical roll speed rows/frame (0 → amount*3)
+ */
+static void fx_badtv(Frame *f, float amount, float roll_f)
+{
+    static float roll_pos = 0.0f;
+
+    if (amount < 0.0f) amount = 0.0f;
+    if (amount > 1.0f) amount = 1.0f;
+    float roll = (roll_f > 0.0f) ? roll_f : amount * 3.0f;
+
+    int w = f->width, h = f->height;
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+
+    unsigned long t = anim_tick();
+    roll_pos += roll;
+    while (roll_pos >= (float)h) roll_pos -= (float)h;
+    int roll_i = (int)roll_pos;
+
+    /* occasional violent roll jump */
+    if ((hash_u((unsigned)t * 31u) & 127) < (unsigned)(amount * 8))
+        roll_pos += (float)(hash_u((unsigned)t) % (unsigned)h);
+
+    /* static burst band this frame? */
+    int burst_y0 = -1, burst_h = 0;
+    if ((hash_u((unsigned)t * 17u) & 63) < (unsigned)(amount * 6)) {
+        burst_y0 = (int)(hash_u((unsigned)t * 5u) % (unsigned)h);
+        burst_h  = 6 + (int)(hash_u((unsigned)t * 9u) % 30u);
+    }
+
+    unsigned seed = (unsigned)t * 2654435761u;
+    int chroma = 1 + (int)(amount * 4.0f);
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        int sy = (y + roll_i) % h;
+
+        /* static burst rows: pure noise */
+        if (burst_y0 >= 0 && y >= burst_y0 && y < burst_y0 + burst_h) {
+            for (int x = 0; x < w; x++) {
+                seed = seed * 1664525u + 1013904223u;
+                uint8_t n = (uint8_t)(seed >> 24);
+                dst[x*3+0] = n; dst[x*3+1] = n; dst[x*3+2] = n;
+            }
+            continue;
+        }
+
+        /* per-row tear */
+        unsigned rh = hash_u((unsigned)(t * 131u) + (unsigned)y);
+        int tear = 0;
+        if ((rh & 31) < (unsigned)(amount * 6))
+            tear = (int)(rh >> 8 & 31u) - 16;
+
+        int cshift = (int)(sinf((float)sy * 0.05f + (float)t * 0.3f) * chroma);
+
+        const uint8_t *srow = tmp + sy * w * 3;
+        for (int x = 0; x < w; x++) {
+            int sx = x + tear;
+            if (sx < 0) sx += w;
+            if (sx >= w) sx -= w;
+            int xr = sx + cshift;
+            if (xr < 0) xr = 0;
+            if (xr >= w) xr = w - 1;
+            dst[x*3+0] = srow[sx*3+0];
+            dst[x*3+1] = srow[sx*3+1];
+            dst[x*3+2] = srow[xr*3+2];   /* chroma wobble on R */
+        }
+    }
+    free(tmp);
+}
+
+/* ─── fx_ghosts — motion extraction ──
+ * Shows the DIFFERENCE between now and a moment ago, centered on
+ * gray: static scenery collapses to flat gray, anything that moves
+ * appears as a vivid embossed spectre with a leading and trailing
+ * edge. The internet calls this "motion extraction" — it makes
+ * invisible motion (breathing, heartbeat-ish sway) visible.
+ *   delay (p1): frames back to compare against 1..15 (def 6)
+ *   gain  (p2): difference amplification 1..6 (0 → 2)
+ */
+#define GHOSTS_RING 16
+static void fx_ghosts(Frame *f, float delay_f, float gain)
+{
+    static uint8_t *ring[GHOSTS_RING] = {0};
+    static int rw = 0, rh = 0, rs = 0, widx = 0;
+
+    int delay = (int)delay_f;
+    if (delay < 1) delay = 6;
+    if (delay > GHOSTS_RING - 1) delay = GHOSTS_RING - 1;
+    if (gain < 1.0f) gain = 2.0f;
+    if (gain > 6.0f) gain = 6.0f;
+
+    int size = f->stride * f->height;
+    if (rw != f->width || rh != f->height || rs != f->stride) {
+        for (int i = 0; i < GHOSTS_RING; i++) {
+            free(ring[i]);
+            ring[i] = malloc((size_t)size);
+            if (!ring[i]) {
+                for (int j = 0; j <= i; j++) { free(ring[j]); ring[j] = NULL; }
+                rw = rh = rs = 0;
+                return;
+            }
+            memcpy(ring[i], f->data, (size_t)size);
+        }
+        rw = f->width; rh = f->height; rs = f->stride;
+        widx = 0;
+    }
+
+    memcpy(ring[widx], f->data, (size_t)size);
+    int idx = (widx - delay + GHOSTS_RING) % GHOSTS_RING;
+    const uint8_t *past = ring[idx];
+
+    int n = f->stride * f->height;
+    uint8_t *cur = f->data;
+    for (int i = 0; i < n; i++) {
+        int d = (int)cur[i] - (int)past[i];
+        cur[i] = clamp_u8(128 + (int)(d * gain));
+    }
+    widx = (widx + 1) % GHOSTS_RING;
+}
+
+/* ──────────────────────────────────────────────────────────────
+ * Batch 8: AI-craze volume 2
+ * ────────────────────────────────────────────────────────────── */
+
+/* ─── fx_clones ──
+ * Multiplicity: every `interval` seconds a freeze-frame of the scene
+ * is captured into a rotating set; all captures composite under the
+ * live image with lighten-blend. Strike a pose, wait, move, strike
+ * another — the room fills with copies of you.
+ *   count    (p1): number of simultaneous clones 1..4 (def 3)
+ *   interval (p2): seconds between captures 0.5..10 (0 → 2)
+ *   alpha    (p3): clone opacity 0.2..1 (0 → 0.55)
+ */
+static void fx_clones(Frame *f, float count_f, float interval_s, float alpha)
+{
+    static uint8_t *snap[4] = {0};
+    static int have[4] = {0};
+    static int sw = 0, sh = 0, ss = 0, next_slot = 0;
+    static unsigned long last_cap = 0;
+
+    int count = (int)count_f;
+    if (count < 1) count = 1;
+    if (count > 4) count = 4;
+    if (interval_s < 0.5f || interval_s > 10.0f) interval_s = 2.0f;
+    if (alpha < 0.2f || alpha > 1.0f) alpha = 0.55f;
+
+    int size = f->stride * f->height;
+    if (sw != f->width || sh != f->height || ss != f->stride) {
+        for (int i = 0; i < 4; i++) {
+            free(snap[i]);
+            snap[i] = malloc((size_t)size);
+            have[i] = 0;
+            if (!snap[i]) {
+                for (int j = 0; j <= i; j++) { free(snap[j]); snap[j] = NULL; }
+                sw = sh = ss = 0;
+                return;
+            }
+        }
+        sw = f->width; sh = f->height; ss = f->stride;
+        next_slot = 0;
+        last_cap = 0;
+    }
+
+    unsigned long t = anim_tick();
+    unsigned long iv = (unsigned long)(interval_s * 30.0f);
+    if (t - last_cap >= iv) {
+        memcpy(snap[next_slot], f->data, (size_t)size);
+        have[next_slot] = 1;
+        next_slot = (next_slot + 1) % count;
+        last_cap = t;
+    }
+
+    /* lighten-blend each clone under the live image */
+    int a256 = (int)(alpha * 256.0f);
+    for (int s = 0; s < count; s++) {
+        if (!have[s]) continue;
+        const uint8_t *sp = snap[s];
+        uint8_t *cur = f->data;
+        for (int i = 0; i < size; i++) {
+            int v = (sp[i] * a256) >> 8;
+            if (v > cur[i]) cur[i] = (uint8_t)v;
+        }
+    }
+}
+
+/* ─── fx_meltdown ──
+ * The Doom screen-melt, live: every few seconds the current frame is
+ * frozen, then its columns slide down and off the screen at slightly
+ * different speeds, revealing the LIVE feed underneath. Loops forever.
+ *   speed (p1): base fall px/frame 1..12 (def 3)
+ *   chaos (p2): per-column speed variance 0..1 (0 → 0.5)
+ */
+static void fx_meltdown(Frame *f, float speed_f, float chaos)
+{
+    static uint8_t *snap = NULL;
+    static float   *coff = NULL;    /* per-column fall offset */
+    static float   *cspd = NULL;    /* per-column speed factor */
+    static int mw2 = 0, mh2 = 0, ms2 = 0;
+    static int phase = 0;           /* 0 = waiting to snapshot, 1 = melting */
+    static unsigned long hold_until = 0;
+
+    float speed = speed_f;
+    if (speed < 1.0f)  speed = 3.0f;
+    if (speed > 12.0f) speed = 12.0f;
+    if (chaos < 0.0f || chaos > 1.0f) chaos = 0.5f;
+
+    int w = f->width, h = f->height;
+    int size = f->stride * h;
+
+    if (mw2 != w || mh2 != h || ms2 != f->stride) {
+        free(snap); free(coff); free(cspd);
+        snap = malloc((size_t)size);
+        coff = calloc((size_t)w, sizeof(float));
+        cspd = malloc((size_t)w * sizeof(float));
+        if (!snap || !coff || !cspd) {
+            free(snap); free(coff); free(cspd);
+            snap = NULL; coff = NULL; cspd = NULL;
+            mw2 = mh2 = ms2 = 0;
+            return;
+        }
+        mw2 = w; mh2 = h; ms2 = f->stride;
+        phase = 0;
+        hold_until = anim_tick() + 45;   /* 1.5s before first melt */
+    }
+
+    unsigned long t = anim_tick();
+
+    if (phase == 0) {
+        if (t >= hold_until) {
+            /* freeze this frame and start melting it */
+            memcpy(snap, f->data, (size_t)size);
+            for (int c = 0; c < w; c++) {
+                coff[c] = -(float)(rand() % (int)(h * 0.15f + 1));  /* staggered start */
+                cspd[c] = 1.0f + chaos * ((float)(rand() % 200) / 100.0f - 1.0f);
+                if (cspd[c] < 0.3f) cspd[c] = 0.3f;
+            }
+            phase = 1;
+        }
+        return;   /* live feed passes through untouched */
+    }
+
+    /* melting: draw snapshot columns at their offsets over live feed */
+    int done = 1;
+    for (int c = 0; c < w; c++) {
+        coff[c] += speed * cspd[c];
+        if (coff[c] < (float)h) done = 0;
+    }
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        for (int c = 0; c < w; c++) {
+            float off = coff[c];
+            if (off < 0) off = 0;
+            int sy = y - (int)off;
+            if (sy < 0) continue;          /* above the snapshot: live shows */
+            const uint8_t *sp = snap + sy * f->stride + c * 3;
+            dst[c*3+0] = sp[0];
+            dst[c*3+1] = sp[1];
+            dst[c*3+2] = sp[2];
+        }
+    }
+    if (done) {
+        phase = 0;
+        hold_until = t + 60 + (unsigned)(rand() % 90);   /* 2-5s of live */
+    }
+}
+
+/* ─── fx_rotozoom ──
+ * The demoscene rotozoomer: the frame becomes an infinite tiled plane
+ * that rotates and breathes. Mirror-tiled so seams are invisible.
+ *   speed   (p1): rotation rate (def 1)
+ *   zoomamp (p2): zoom oscillation amount 0..1 (0 → 0.4)
+ */
+static void fx_rotozoom(Frame *f, float speed, float zoomamp)
+{
+    if (speed <= 0.0f) speed = 1.0f;
+    if (zoomamp < 0.0f || zoomamp > 1.0f) zoomamp = 0.4f;
+
+    int w = f->width, h = f->height;
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+
+    float t = (float)anim_tick() / 30.0f * speed;
+    float ang = t * 0.5f;
+    float zoom = 1.0f + zoomamp * 0.6f * sinf(t * 0.8f);
+    float ca = cosf(ang) / zoom, sa = sinf(ang) / zoom;
+    float cx = w / 2.0f, cy = h / 2.0f;
+    int w2 = w * 2, h2 = h * 2;
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        float dy = y - cy;
+        for (int x = 0; x < w; x++) {
+            float dx = x - cx;
+            int sx = (int)(cx + dx * ca - dy * sa);
+            int sy = (int)(cy + dx * sa + dy * ca);
+            /* mirror-wrap for seamless infinite tiling */
+            sx = ((sx % w2) + w2) % w2;
+            sy = ((sy % h2) + h2) % h2;
+            if (sx >= w) sx = w2 - 1 - sx;
+            if (sy >= h) sy = h2 - 1 - sy;
+            const uint8_t *sp = tmp + sy * w * 3 + sx * 3;
+            int o = x * 3;
+            dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+        }
+    }
+    free(tmp);
+}
+
+/* ─── fx_starfield ──
+ * Hyperspace: stars fly out of the center with speed streaks,
+ * additively over the (slightly dimmed) video.
+ *   density (p1): star count fraction 0..1 (def 0.5 → ~200 stars)
+ *   speed   (p2): flight speed (0 → 1)
+ */
+#define SF_MAX 400
+static void fx_starfield(Frame *f, float density, float speed)
+{
+    static float sx[SF_MAX], sy[SF_MAX], sz[SF_MAX];
+    static int inited = 0;
+
+    if (density < 0.05f) density = 0.05f;
+    if (density > 1.0f)  density = 1.0f;
+    if (speed <= 0.0f) speed = 1.0f;
+    int nstars = (int)(density * SF_MAX);
+
+    int w = f->width, h = f->height;
+    float cx = w / 2.0f, cy = h / 2.0f;
+
+    if (!inited) {
+        for (int i = 0; i < SF_MAX; i++) {
+            sx[i] = ((float)(rand() % 2000) / 1000.0f - 1.0f);
+            sy[i] = ((float)(rand() % 2000) / 1000.0f - 1.0f);
+            sz[i] = 0.1f + (float)(rand() % 900) / 1000.0f;
+        }
+        inited = 1;
+    }
+
+    /* slight dim so stars pop */
+    for (int y = 0; y < h; y++) {
+        uint8_t *p = f->data + y * f->stride;
+        for (int x = 0; x < w * 3; x++)
+            p[x] = (uint8_t)((p[x] * 3) / 4);
+    }
+
+    float zstep = 0.012f * speed;
+    float fl = (float)(w < h ? w : h) * 0.9f;
+
+    for (int i = 0; i < nstars; i++) {
+        float z0 = sz[i], z1 = sz[i] - zstep;
+        if (z1 <= 0.02f) {
+            sx[i] = ((float)(rand() % 2000) / 1000.0f - 1.0f);
+            sy[i] = ((float)(rand() % 2000) / 1000.0f - 1.0f);
+            sz[i] = 1.0f;
+            continue;
+        }
+        sz[i] = z1;
+        int px0 = (int)(cx + sx[i] / z0 * fl * 0.5f);
+        int py0 = (int)(cy + sy[i] / z0 * fl * 0.5f);
+        int px1 = (int)(cx + sx[i] / z1 * fl * 0.5f);
+        int py1 = (int)(cy + sy[i] / z1 * fl * 0.5f);
+        if (px1 < 1 || px1 >= w - 1 || py1 < 1 || py1 >= h - 1) {
+            sz[i] = 0.01f;   /* respawn next frame */
+            continue;
+        }
+        int bright = (int)((1.0f - z1) * 255.0f);
+        /* streak: a few steps between old and new position */
+        for (int s = 0; s <= 4; s++) {
+            int px = px0 + (px1 - px0) * s / 4;
+            int py = py0 + (py1 - py0) * s / 4;
+            if (px < 0 || px >= w || py < 0 || py >= h) continue;
+            uint8_t *d = f->data + py * f->stride + px * 3;
+            int b2 = bright * (s + 2) / 6;
+            d[0] = clamp_u8(d[0] + b2);
+            d[1] = clamp_u8(d[1] + b2);
+            d[2] = clamp_u8(d[2] + (b2 * 9) / 10);   /* faint blue tint */
+        }
+    }
+}
+
+/* ─── fx_lightning — INTERACTIVE ──
+ * Bolts strike from the top of the frame to WHEREVER YOU MOVE —
+ * jagged branched paths with blue-white glow and a full-frame flash
+ * that fades over a few frames. Snap your hand out and get struck.
+ *   rate     (p1): strike probability 0..1 (def 0.3)
+ *   branches (p2): forks per bolt 0..6 (0 → 3)
+ */
+static void draw_bolt_seg(Frame *f, int x0, int y0, int x1, int y1)
+{
+    int steps = abs(y1 - y0) + abs(x1 - x0);
+    if (steps < 1) steps = 1;
+    for (int s = 0; s <= steps; s++) {
+        int x = x0 + (x1 - x0) * s / steps;
+        int y = y0 + (y1 - y0) * s / steps;
+        for (int dx = -1; dx <= 1; dx++) {
+            int xx = x + dx;
+            if (xx < 0 || xx >= f->width || y < 0 || y >= f->height) continue;
+            uint8_t *d = f->data + y * f->stride + xx * 3;
+            int core = (dx == 0) ? 255 : 130;
+            d[0] = clamp_u8(d[0] + core);
+            d[1] = clamp_u8(d[1] + (core * 4) / 5);
+            d[2] = clamp_u8(d[2] + (core * 3) / 5);
+        }
+    }
+}
+
+static void fx_lightning(Frame *f, float rate, float branches_f)
+{
+    static uint8_t *pl = NULL;
+    static int gw6 = 0, gh6 = 0, fw6 = 0, fh6 = 0;
+    static float flash = 0.0f;
+
+    if (rate < 0.0f) rate = 0.0f;
+    if (rate > 1.0f) rate = 1.0f;
+    int branches = (int)branches_f;
+    if (branches_f <= 0.0f) branches = 3;
+    if (branches > 6) branches = 6;
+
+    int w = f->width, h = f->height;
+    int GW = w / 8, GH = h / 8;
+    if (GW < 8 || GH < 8) return;
+
+    if (fw6 != w || fh6 != h) {
+        free(pl);
+        pl = calloc((size_t)GW * GH, 1);
+        if (!pl) { fw6 = fh6 = 0; return; }
+        gw6 = GW; gh6 = GH; fw6 = w; fh6 = h;
+    }
+
+    /* motion centroid (strike target) */
+    long mx = 0, my = 0, mtot = 0;
+    for (int gy = 1; gy < gh6 - 1; gy++) {
+        for (int gx = 1; gx < gw6 - 1; gx++) {
+            const uint8_t *p = f->data + (gy*8) * f->stride + (gx*8) * 3;
+            uint8_t l = (uint8_t)((p[0]*114 + p[1]*587 + p[2]*299) / 1000);
+            int gi = gy * gw6 + gx;
+            int d = abs((int)l - (int)pl[gi]);
+            pl[gi] = l;
+            if (d > 20) { mx += (long)gx*8*d; my += (long)gy*8*d; mtot += d; }
+        }
+    }
+
+    /* fading flash from previous strikes */
+    if (flash > 0.01f) {
+        int add = (int)(flash * 70.0f);
+        for (int y = 0; y < h; y++) {
+            uint8_t *p = f->data + y * f->stride;
+            for (int x = 0; x < w * 3; x++)
+                p[x] = clamp_u8(p[x] + add);
+        }
+        flash *= 0.6f;
+    }
+
+    /* strike? needs motion (or small ambient chance) */
+    int want = 0;
+    int tx = w / 2, ty = h - h / 5;
+    if (mtot > 400 && (rand() % 100) < (int)(rate * 35.0f)) {
+        want = 1;
+        tx = (int)(mx / mtot);
+        ty = (int)(my / mtot);
+    } else if ((rand() % 1000) < (int)(rate * 8.0f)) {
+        want = 1;
+        tx = rand() % w;
+        ty = h / 3 + rand() % (h / 2);
+    }
+    if (!want) return;
+
+    /* jagged main bolt from random top point to target */
+    int x = rand() % w, y = 0;
+    int seg_h = h / 12 + 1;
+    while (y < ty) {
+        int ny = y + seg_h / 2 + rand() % seg_h;
+        if (ny > ty) ny = ty;
+        /* drift toward target with jitter */
+        int nx = x + (tx - x) * (ny - y) / (ty - y + 1)
+               + (rand() % (w / 6 + 1)) - w / 12;
+        if (nx < 0) nx = 0;
+        if (nx >= w) nx = w - 1;
+        draw_bolt_seg(f, x, y, nx, ny);
+        /* occasional branch shooting off */
+        if (branches > 0 && (rand() % 6) < 2) {
+            int bx = nx + (rand() % (w / 4 + 1)) - w / 8;
+            int by = ny + h / 10 + rand() % (h / 8 + 1);
+            if (bx < 0) bx = 0;
+            if (bx >= w) bx = w - 1;
+            if (by >= h) by = h - 1;
+            draw_bolt_seg(f, nx, ny, bx, by);
+            branches--;
+        }
+        x = nx; y = ny;
+    }
+    flash = 1.0f;
+}
+
+/* ─── fx_scatter — INTERACTIVE ──
+ * Motion shatters the image: cells you disturb get a random outward
+ * displacement impulse, then spring back — the frame explodes where
+ * you touch it and heals itself.
+ *   power (p1): impulse strength 0..1 (def 0.6)
+ *   heal  (p2): spring return per frame 0.7..0.98 (0 → 0.88)
+ */
+static void fx_scatter(Frame *f, float power, float heal)
+{
+    static float *offx = NULL, *offy = NULL;
+    static uint8_t *pl = NULL;
+    static int gw7 = 0, gh7 = 0, fw7 = 0, fh7 = 0;
+
+    if (power < 0.05f) power = 0.05f;
+    if (power > 1.0f)  power = 1.0f;
+    if (heal < 0.7f || heal > 0.98f) heal = 0.88f;
+
+    int w = f->width, h = f->height;
+    int GW = w / 4, GH = h / 4;
+    if (GW < 8 || GH < 8) return;
+
+    if (fw7 != w || fh7 != h) {
+        free(offx); free(offy); free(pl);
+        offx = calloc((size_t)GW * GH, sizeof(float));
+        offy = calloc((size_t)GW * GH, sizeof(float));
+        pl   = calloc((size_t)GW * GH, 1);
+        if (!offx || !offy || !pl) {
+            free(offx); free(offy); free(pl);
+            offx = offy = NULL; pl = NULL;
+            fw7 = fh7 = 0;
+            return;
+        }
+        gw7 = GW; gh7 = GH; fw7 = w; fh7 = h;
+    }
+
+    for (int gy = 0; gy < gh7; gy++) {
+        for (int gx = 0; gx < gw7; gx++) {
+            const uint8_t *p = f->data + (gy*4) * f->stride + (gx*4) * 3;
+            uint8_t l = (uint8_t)((p[0]*114 + p[1]*587 + p[2]*299) / 1000);
+            int gi = gy * gw7 + gx;
+            int d = abs((int)l - (int)pl[gi]);
+            pl[gi] = l;
+            if (d > 16) {
+                float ang = (float)(hash_u((unsigned)(gi * 2654435761u
+                              + (unsigned)anim_tick())) % 628u) * 0.01f;
+                float imp = power * (float)d * 0.35f;
+                if (imp > 40.0f) imp = 40.0f;
+                offx[gi] += cosf(ang) * imp;
+                offy[gi] += sinf(ang) * imp;
+            }
+            offx[gi] *= heal;
+            offy[gi] *= heal;
+        }
+    }
+
+    uint8_t *src = malloc((size_t)w * h * 3);
+    if (!src) return;
+    memcpy(src, f->data, (size_t)w * h * 3);
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        int gy = y / 4;
+        if (gy >= gh7) gy = gh7 - 1;
+        for (int x = 0; x < w; x++) {
+            int gx = x / 4;
+            if (gx >= gw7) gx = gw7 - 1;
+            int gi = gy * gw7 + gx;
+            float ox = offx[gi], oy = offy[gi];
+            if (ox > -0.5f && ox < 0.5f && oy > -0.5f && oy < 0.5f) continue;
+            int sx = x + (int)ox;
+            int sy = y + (int)oy;
+            if (sx < 0) sx = 0;
+            if (sx >= w) sx = w - 1;
+            if (sy < 0) sy = 0;
+            if (sy >= h) sy = h - 1;
+            const uint8_t *sp = src + sy * w * 3 + sx * 3;
+            int o = x * 3;
+            dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+        }
+    }
+    free(src);
+}
+
+/* ─── fx_vhs ──
+ * The complete VHS experience: horizontal chroma bleed, luma noise,
+ * a jittering head-switching noise bar at the bottom, and a live
+ * counting timecode rendered from an embedded digit font.
+ *   wear     (p1): degradation 0..1 (def 0.5)
+ *   timecode (p2): 1 = show counter (default), 0 = hide
+ */
+static const uint8_t vhs_digits[11][8] = {
+    {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0}, /* 0 */
+    {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0}, /* 1 */
+    {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E,0}, /* 2 */
+    {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0}, /* 3 */
+    {0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0}, /* 4 */
+    {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0}, /* 5 */
+    {0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0}, /* 6 */
+    {0x7E,0x06,0x0C,0x18,0x30,0x30,0x30,0}, /* 7 */
+    {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0}, /* 8 */
+    {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0}, /* 9 */
+    {0x00,0x18,0x18,0x00,0x18,0x18,0x00,0}, /* : */
+};
+
+static void vhs_draw_glyph(Frame *f, int gi, int x0, int y0)
+{
+    for (int y = 0; y < 16; y++) {
+        int yy = y0 + y;
+        if (yy < 0 || yy >= f->height) continue;
+        uint8_t bits = vhs_digits[gi][y / 2];
+        uint8_t *row = f->data + yy * f->stride;
+        for (int x = 0; x < 16; x++) {
+            if (!(bits & (0x80 >> (x / 2)))) continue;
+            int xx = x0 + x;
+            if (xx < 0 || xx >= f->width) continue;
+            uint8_t *p = row + xx * 3;
+            p[0] = 240; p[1] = 240; p[2] = 240;
+        }
+    }
+}
+
+static void fx_vhs(Frame *f, float wear, float timecode)
+{
+    if (wear < 0.0f) wear = 0.0f;
+    if (wear > 1.0f) wear = 1.0f;
+    int show_tc = (timecode >= 0.5f) || (timecode == 0.0f);   /* default on */
+
+    int w = f->width, h = f->height;
+    unsigned long t = anim_tick();
+    unsigned seed = (unsigned)t * 2654435761u;
+
+    /* chroma bleed: R and B smeared horizontally, G stays sharp */
+    int bleed = 2 + (int)(wear * 5.0f);
+    uint8_t *tmp = malloc((size_t)w * h * 3);
+    if (!tmp) return;
+    memcpy(tmp, f->data, (size_t)w * h * 3);
+    for (int y = 0; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        const uint8_t *src = tmp + y * w * 3;
+        for (int x = 0; x < w; x++) {
+            int sb = 0, sr = 0, cnt = 0;
+            for (int dx = -bleed; dx <= bleed; dx += 2) {
+                int xx = x + dx;
+                if (xx < 0 || xx >= w) continue;
+                sb += src[xx*3+0];
+                sr += src[xx*3+2];
+                cnt++;
+            }
+            int o = x * 3;
+            dst[o]   = (uint8_t)(sb / cnt);
+            dst[o+2] = (uint8_t)(sr / cnt);
+            /* luma noise on G-ish overall */
+            seed = seed * 1664525u + 1013904223u;
+            int n = (int)((seed >> 26) & 15u) - 8;
+            dst[o+1] = clamp_u8(src[o+1] + (n * (int)(wear * 10.0f)) / 8);
+        }
+    }
+    free(tmp);
+
+    /* head-switching noise bar at the bottom */
+    int bar_h = 6 + (int)(wear * 10.0f);
+    int jitter = (int)((hash_u((unsigned)t * 7u) % 9u)) - 4;
+    for (int y = h - bar_h; y < h; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        for (int x = 0; x < w; x++) {
+            seed = seed * 1664525u + 1013904223u;
+            uint8_t n = (uint8_t)(seed >> 24);
+            int sx = x + jitter;
+            if (sx < 0) sx = 0;
+            if (sx >= w) sx = w - 1;
+            uint8_t *sp2 = f->data + (h - bar_h - 2) * f->stride + sx * 3;
+            dst[x*3+0] = (uint8_t)((sp2[0] + n) / 2);
+            dst[x*3+1] = (uint8_t)((sp2[1] + n) / 2);
+            dst[x*3+2] = (uint8_t)((sp2[2] + n) / 2);
+        }
+    }
+
+    /* timecode 0:00:00 bottom-left, counting real playtime */
+    if (show_tc) {
+        unsigned secs = (unsigned)(t / 30);
+        unsigned hh2 = secs / 3600, mm = (secs / 60) % 60, ss2 = secs % 60;
+        int gl[8] = { (int)(hh2 % 10), 10,
+                      (int)(mm / 10), (int)(mm % 10), 10,
+                      (int)(ss2 / 10), (int)(ss2 % 10), -1 };
+        int x0 = 20, y0 = h - bar_h - 30;
+        for (int i = 0; gl[i] >= 0; i++) {
+            vhs_draw_glyph(f, gl[i], x0, y0);
+            x0 += 18;
+        }
+    }
+}
+
+/* ─── fx_outline — INTERACTIVE ──
+ * A marching-ants animated outline around whatever is MOVING —
+ * comic-book selection lasso around you. Static scenery gets no
+ * outline; wave and your silhouette gets traced in cycling color
+ * with animated dashes.
+ *   thick  (p1): outline thickness in 4px cells, 1..4 (def 2)
+ *   huespd (p2): color cycle rate (0 → 1)
+ */
+static void fx_outline(Frame *f, float thick_f, float huespd)
+{
+    static uint8_t *mask = NULL;   /* decaying motion mask */
+    static uint8_t *pl = NULL;
+    static int gw8 = 0, gh8 = 0, fw8 = 0, fh8 = 0;
+
+    int thick = (int)thick_f;
+    if (thick < 1) thick = 2;
+    if (thick > 4) thick = 4;
+    if (huespd <= 0.0f) huespd = 1.0f;
+
+    int w = f->width, h = f->height;
+    int GW = w / 4, GH = h / 4;
+    if (GW < 8 || GH < 8) return;
+
+    if (fw8 != w || fh8 != h) {
+        free(mask); free(pl);
+        mask = calloc((size_t)GW * GH, 1);
+        pl   = calloc((size_t)GW * GH, 1);
+        if (!mask || !pl) {
+            free(mask); free(pl); mask = NULL; pl = NULL;
+            fw8 = fh8 = 0;
+            return;
+        }
+        gw8 = GW; gh8 = GH; fw8 = w; fh8 = h;
+    }
+
+    for (int gy = 0; gy < gh8; gy++) {
+        for (int gx = 0; gx < gw8; gx++) {
+            const uint8_t *p = f->data + (gy*4) * f->stride + (gx*4) * 3;
+            uint8_t l = (uint8_t)((p[0]*114 + p[1]*587 + p[2]*299) / 1000);
+            int gi = gy * gw8 + gx;
+            int d = abs((int)l - (int)pl[gi]);
+            pl[gi] = l;
+            int m = (mask[gi] * 6) / 8;
+            if (d > 15) m = 255;
+            mask[gi] = (uint8_t)m;
+        }
+    }
+
+    unsigned long t = anim_tick();
+    float hue = (float)(t % 300) / 300.0f * 6.28318f * huespd;
+    int cb = (int)((sinf(hue + 4.189f) * 0.5f + 0.5f) * 255.0f);
+    int cg = (int)((sinf(hue + 2.094f) * 0.5f + 0.5f) * 255.0f);
+    int cr = (int)((sinf(hue)          * 0.5f + 0.5f) * 255.0f);
+
+    /* border cell: masked, with an unmasked cell within `thick` */
+    for (int gy = thick; gy < gh8 - thick; gy++) {
+        for (int gx = thick; gx < gw8 - thick; gx++) {
+            int gi = gy * gw8 + gx;
+            if (mask[gi] < 60) continue;
+            int edge = 0;
+            for (int dy = -thick; dy <= thick && !edge; dy++)
+                for (int dx = -thick; dx <= thick && !edge; dx++)
+                    if (mask[(gy+dy) * gw8 + gx+dx] < 60) edge = 1;
+            if (!edge) continue;
+            /* marching ants: dashed by diagonal phase */
+            if (((gx + gy + (int)(t / 3)) & 3) >= 2) continue;
+            for (int py = 0; py < 4; py++) {
+                uint8_t *dst = f->data + (gy*4 + py) * f->stride + gx*4*3;
+                for (int px = 0; px < 4; px++) {
+                    dst[px*3+0] = (uint8_t)cb;
+                    dst[px*3+1] = (uint8_t)cg;
+                    dst[px*3+2] = (uint8_t)cr;
+                }
+            }
+        }
+    }
+}
+
+/* ─── fx_symmetry ──
+ * Face symmetry mirrors — the party classic.
+ *   mode (p1): 0 = left half mirrored right (def)
+ *              1 = right half mirrored left
+ *              2 = quad symmetry (top-left kaleido-mirrored 4 ways)
+ */
+static void fx_symmetry(Frame *f, float mode_f)
+{
+    int mode = (int)mode_f;
+    if (mode < 0) mode = 0;
+    if (mode > 2) mode = 2;
+
+    int w = f->width, h = f->height;
+
+    if (mode == 0) {
+        for (int y = 0; y < h; y++) {
+            uint8_t *row = f->data + y * f->stride;
+            for (int x = w / 2; x < w; x++) {
+                const uint8_t *src = row + (w - 1 - x) * 3;
+                row[x*3+0] = src[0]; row[x*3+1] = src[1]; row[x*3+2] = src[2];
+            }
+        }
+    } else if (mode == 1) {
+        for (int y = 0; y < h; y++) {
+            uint8_t *row = f->data + y * f->stride;
+            for (int x = 0; x < w / 2; x++) {
+                const uint8_t *src = row + (w - 1 - x) * 3;
+                row[x*3+0] = src[0]; row[x*3+1] = src[1]; row[x*3+2] = src[2];
+            }
+        }
+    } else {
+        for (int y = 0; y < h; y++) {
+            uint8_t *row = f->data + y * f->stride;
+            int sy = (y < h / 2) ? y : (h - 1 - y);
+            const uint8_t *srow = f->data + sy * f->stride;
+            for (int x = 0; x < w; x++) {
+                int sx = (x < w / 2) ? x : (w - 1 - x);
+                if (sy == y && sx == x) continue;
+                const uint8_t *src = srow + sx * 3;
+                row[x*3+0] = src[0]; row[x*3+1] = src[1]; row[x*3+2] = src[2];
+            }
+        }
+    }
+}
+
+/* ─── fx_timebubble ──
+ * A glowing bubble drifts around the frame — INSIDE it, you see the
+ * PAST. History is kept at quarter resolution (up to ~3 seconds),
+ * shown pixel-doubled inside the lens with a cyan rim.
+ *   delay  (p1): seconds into the past 0.3..3 (def 1.5)
+ *   radius (p2): bubble radius px (0 → 160)
+ */
+#define TB_RING 90
+static void fx_timebubble(Frame *f, float delay_s, float radius)
+{
+    static uint8_t *ring[TB_RING] = {0};
+    static int qw = 0, qh = 0, widx2 = 0, fw9 = 0, fh9 = 0;
+
+    if (delay_s < 0.3f || delay_s > 3.0f) delay_s = 1.5f;
+    if (radius < 50.0f) radius = 160.0f;
+
+    int w = f->width, h = f->height;
+    int QW = w / 4, QH = h / 4;
+    size_t qsize = (size_t)QW * QH * 3;
+
+    if (fw9 != w || fh9 != h) {
+        for (int i = 0; i < TB_RING; i++) {
+            free(ring[i]);
+            ring[i] = malloc(qsize);
+            if (!ring[i]) {
+                for (int j = 0; j <= i; j++) { free(ring[j]); ring[j] = NULL; }
+                fw9 = fh9 = 0;
+                return;
+            }
+        }
+        qw = QW; qh = QH; fw9 = w; fh9 = h;
+        widx2 = 0;
+    }
+
+    /* store quarter-res copy of the current frame */
+    for (int qy = 0; qy < qh; qy++) {
+        uint8_t *drow = ring[widx2] + qy * qw * 3;
+        const uint8_t *srow = f->data + (qy*4) * f->stride;
+        for (int qx = 0; qx < qw; qx++) {
+            const uint8_t *sp = srow + (qx*4) * 3;
+            drow[qx*3+0] = sp[0];
+            drow[qx*3+1] = sp[1];
+            drow[qx*3+2] = sp[2];
+        }
+    }
+
+    int back = (int)(delay_s * 30.0f);
+    if (back > TB_RING - 1) back = TB_RING - 1;
+    const uint8_t *past = ring[(widx2 - back + TB_RING) % TB_RING];
+    widx2 = (widx2 + 1) % TB_RING;
+
+    /* drifting bubble center */
+    float t = (float)anim_tick() / 30.0f;
+    float cx = w * 0.5f + sinf(t * 0.31f) * w * 0.24f;
+    float cy = h * 0.5f + cosf(t * 0.23f) * h * 0.22f;
+    float r2 = radius * radius;
+    float rim = radius * 0.05f + 3.0f;
+
+    int y0 = (int)(cy - radius - rim), y1 = (int)(cy + radius + rim);
+    if (y0 < 0) y0 = 0;
+    if (y1 > h) y1 = h;
+    for (int y = y0; y < y1; y++) {
+        uint8_t *dst = f->data + y * f->stride;
+        float dy = y - cy;
+        for (int x = (int)(cx - radius - rim > 0 ? cx - radius - rim : 0);
+             x < w && x < (int)(cx + radius + rim); x++) {
+            float dx = x - cx;
+            float d2 = dx*dx + dy*dy;
+            if (d2 < r2) {
+                int qx = x / 4, qy = y / 4;
+                if (qx >= qw) qx = qw - 1;
+                if (qy >= qh) qy = qh - 1;
+                const uint8_t *sp = past + (qy * qw + qx) * 3;
+                int o = x * 3;
+                dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+            } else if (fabsf(sqrtf(d2) - radius) < rim) {
+                float e = 1.0f - fabsf(sqrtf(d2) - radius) / rim;
+                int o = x * 3;
+                dst[o]   = clamp_u8(dst[o]   + (int)(200 * e));
+                dst[o+1] = clamp_u8(dst[o+1] + (int)(160 * e));
+                dst[o+2] = clamp_u8(dst[o+2] + (int)(40  * e));
+            }
+        }
+    }
+}
+
 void filter_chain_apply(FilterChain *fc, Frame *frame)
 {
     pthread_mutex_lock(&fc->lock);
@@ -4271,6 +5762,28 @@ void filter_chain_apply(FilterChain *fc, Frame *frame)
         case FX_DUOTONE:      fx_duotone(frame, f->param, f->param2, f->param3); break;
         case FX_SKETCH:       fx_sketch(frame, f->param, f->param2); break;
         case FX_SPOTLIGHT:    fx_spotlight(frame, f->param, f->param2, f->param3); break;
+        /* the AI-craze set */
+        case FX_PREDATOR:     fx_predator(frame, f->param, f->param2, f->param3); break;
+        case FX_SHARDS:       fx_shards(frame, f->param, f->param2); break;
+        case FX_PORTAL:       fx_portal(frame, f->param, f->param2); break;
+        case FX_HEATTRAIL:    fx_heattrail(frame, f->param, f->param2); break;
+        case FX_WORMHOLE:     fx_wormhole(frame, f->param, f->param2); break;
+        case FX_MAGNET:       fx_magnet(frame, f->param, f->param2); break;
+        case FX_LIQUID:       fx_liquid(frame, f->param, f->param2, f->param3); break;
+        case FX_NIGHTVISION:  fx_nightvision(frame, f->param, f->param2); break;
+        case FX_BADTV:        fx_badtv(frame, f->param, f->param2); break;
+        case FX_GHOSTS:       fx_ghosts(frame, f->param, f->param2); break;
+        /* AI-craze volume 2 */
+        case FX_CLONES:       fx_clones(frame, f->param, f->param2, f->param3); break;
+        case FX_MELTDOWN:     fx_meltdown(frame, f->param, f->param2); break;
+        case FX_ROTOZOOM:     fx_rotozoom(frame, f->param, f->param2); break;
+        case FX_STARFIELD:    fx_starfield(frame, f->param, f->param2); break;
+        case FX_LIGHTNING:    fx_lightning(frame, f->param, f->param2); break;
+        case FX_SCATTER:      fx_scatter(frame, f->param, f->param2); break;
+        case FX_VHS:          fx_vhs(frame, f->param, f->param2); break;
+        case FX_OUTLINE:      fx_outline(frame, f->param, f->param2); break;
+        case FX_SYMMETRY:     fx_symmetry(frame, f->param); break;
+        case FX_TIMEBUBBLE:   fx_timebubble(frame, f->param, f->param2); break;
         default: break;
         }
     }

@@ -80,8 +80,11 @@ n_params_for() {
         neon|kaleidoscope|wave) echo 4 ;;
         chromashift|glitch|vignette|feedback|ripples|life|plasma) echo 3 ;;
         swirl|pinch|bulge|shuffle|rain|lightpaint|hologram|duotone|spotlight) echo 3 ;;
+        predator|liquid|clones) echo 3 ;;
         contour|fireworks|infinity|moire) echo 2 ;;
         cartoon|drift|slitscan|mosh|zoompulse|oilslick|ascii|sketch) echo 2 ;;
+        shards|portal|heattrail|wormhole|magnet|nightvision|badtv|ghosts) echo 2 ;;
+        meltdown|rotozoom|starfield|lightning|scatter|vhs|outline|timebubble) echo 2 ;;
         *) echo 1 ;;
     esac
 }
@@ -159,6 +162,47 @@ param_label() {
         spotlight:1) echo "radius" ;;
         spotlight:2) echo "dark" ;;
         spotlight:3) echo "speed" ;;
+        predator:1) echo "vis" ;;
+        predator:2) echo "shimmer" ;;
+        predator:3) echo "adapt" ;;
+        shards:1) echo "count" ;;
+        shards:2) echo "offset" ;;
+        portal:1) echo "radius" ;;
+        portal:2) echo "sep" ;;
+        heattrail:1) echo "gain" ;;
+        heattrail:2) echo "cool" ;;
+        wormhole:1) echo "depth" ;;
+        wormhole:2) echo "speed" ;;
+        magnet:1) echo "strength" ;;
+        magnet:2) echo "follow" ;;
+        liquid:1) echo "amp" ;;
+        liquid:2) echo "scale" ;;
+        liquid:3) echo "speed" ;;
+        nightvision:1) echo "gain" ;;
+        nightvision:2) echo "noise" ;;
+        badtv:1) echo "amount" ;;
+        badtv:2) echo "roll" ;;
+        ghosts:1) echo "delay" ;;
+        ghosts:2) echo "gain" ;;
+        clones:1) echo "count" ;;
+        clones:2) echo "interval" ;;
+        clones:3) echo "alpha" ;;
+        meltdown:1) echo "speed" ;;
+        meltdown:2) echo "chaos" ;;
+        rotozoom:1) echo "speed" ;;
+        rotozoom:2) echo "zoom" ;;
+        starfield:1) echo "density" ;;
+        starfield:2) echo "speed" ;;
+        lightning:1) echo "rate" ;;
+        lightning:2) echo "branches" ;;
+        scatter:1) echo "power" ;;
+        scatter:2) echo "heal" ;;
+        vhs:1) echo "wear" ;;
+        vhs:2) echo "tc" ;;
+        outline:1) echo "thick" ;;
+        outline:2) echo "huespd" ;;
+        timebubble:1) echo "delay" ;;
+        timebubble:2) echo "radius" ;;
         *:1) echo "param" ;;
         *) echo "p$slot" ;;
     esac
@@ -215,6 +259,28 @@ param_step() {
         sketch:2)       echo 0.05 ;;
         spotlight:2)    echo 0.05 ;;
         spotlight:3)    echo 0.02 ;;
+        predator:2)     echo 1 ;;
+        predator:3)     echo 0.01 ;;
+        shards:2)       echo 2 ;;
+        portal:2)       echo 0.02 ;;
+        heattrail:2)    echo 0.01 ;;
+        wormhole:2)     echo 0.1 ;;
+        magnet:2)       echo 0.02 ;;
+        liquid:2)       echo 10 ;;
+        liquid:3)       echo 0.1 ;;
+        nightvision:2)  echo 5 ;;
+        badtv:2)        echo 0.5 ;;
+        ghosts:2)       echo 0.5 ;;
+        clones:2)       echo 0.5 ;;
+        clones:3)       echo 0.05 ;;
+        meltdown:2)     echo 0.05 ;;
+        rotozoom:2)     echo 0.05 ;;
+        starfield:2)    echo 0.1 ;;
+        lightning:2)    echo 1 ;;
+        scatter:2)      echo 0.02 ;;
+        vhs:2)          echo 1 ;;
+        outline:2)      echo 0.2 ;;
+        timebubble:2)   echo 20 ;;
         chromashift:2)  echo 1 ;;
         chromashift:3)  echo 1 ;;
         *) default_step "$name" ;;
@@ -246,6 +312,20 @@ default_step() {
         duotone) echo 10 ;;
         sketch) echo 1 ;;
         spotlight) echo 20 ;;
+        predator|heattrail|magnet|badtv) echo 0.05 ;;
+        shards) echo 4 ;;
+        portal) echo 10 ;;
+        wormhole) echo 5 ;;
+        liquid) echo 2 ;;
+        nightvision) echo 0.25 ;;
+        ghosts) echo 1 ;;
+        clones|lightning) echo 1 ;;
+        meltdown) echo 1 ;;
+        rotozoom) echo 0.1 ;;
+        starfield) echo 0.05 ;;
+        scatter|vhs) echo 0.05 ;;
+        outline|symmetry) echo 1 ;;
+        timebubble) echo 0.25 ;;
         *) echo 0.1 ;;
     esac
 }
@@ -315,6 +395,26 @@ default_param_for() {
         duotone) echo 220 ;;
         sketch) echo 2 ;;
         spotlight) echo 180 ;;
+        predator) echo 0.15 ;;
+        shards) echo 24 ;;
+        portal) echo 130 ;;
+        heattrail) echo 0.7 ;;
+        wormhole) echo 60 ;;
+        magnet) echo 0.5 ;;
+        liquid) echo 12 ;;
+        nightvision) echo 2 ;;
+        badtv) echo 0.5 ;;
+        ghosts) echo 6 ;;
+        clones) echo 3 ;;
+        meltdown) echo 3 ;;
+        rotozoom) echo 1 ;;
+        starfield) echo 0.5 ;;
+        lightning) echo 0.3 ;;
+        scatter) echo 0.6 ;;
+        vhs) echo 0.5 ;;
+        outline) echo 2 ;;
+        symmetry) echo 0 ;;
+        timebubble) echo 1.5 ;;
         *) echo 1 ;;
     esac
 }
@@ -370,6 +470,8 @@ FILTER_CATEGORIES=(
     "Interactive:ripples lightpaint fireworks spotlight feedback hologram life mathwarp"
     "Demoscene:plasma contour infinity moire"
     "Artistic:ascii duotone sketch"
+    "AI-Craze:predator shards portal heattrail wormhole magnet liquid nightvision badtv ghosts"
+    "Craze-2:clones meltdown rotozoom starfield lightning scatter vhs outline symmetry timebubble"
 )
 
 # Show an interactive picker, return chosen filter name on stdout
