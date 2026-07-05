@@ -1,3 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * vcam — Linux virtual webcam pipeline
+ * Copyright (C) 2026 the vcam authors
+ *
+ * This program is free software under the terms of the GNU General
+ * Public License version 2. See the LICENSE file for the full text.
+ */
+
 /*
  * filter.c – per-pixel effects applied to a BGR24 frame in place.
  *
@@ -3303,6 +3311,7 @@ static void fx_life(Frame *f, float density, float colormode, float speed)
 
 enum {
     EN_CONST, EN_X, EN_Y, EN_W, EN_H, EN_T, EN_R, EN_A,
+    EN_CR, EN_CG, EN_CB,   /* input pixel color channels 0..255 */
     EN_ADD, EN_SUB, EN_MUL, EN_DIV, EN_MOD, EN_NEG,
     EN_SIN, EN_COS, EN_ABS, EN_SQRT, EN_FLOOR,
     EN_GT, EN_LT, EN_GE, EN_LE, EN_EQ, EN_NE,
@@ -3395,6 +3404,13 @@ static int expr_parse_factor(ExprParser *p)
         p->s++;
         return expr_node(p, op, 0, c, -1);
     }
+    /* two-char color-input variables: cr cg cb (must test before the
+     * single-char switch, since 'c' alone is not a variable) */
+    if (s[0] == 'c') {
+        if (s[1] == 'r') { p->s = s + 2; return expr_node(p, EN_CR, 0, -1, -1); }
+        if (s[1] == 'g') { p->s = s + 2; return expr_node(p, EN_CG, 0, -1, -1); }
+        if (s[1] == 'b') { p->s = s + 2; return expr_node(p, EN_CB, 0, -1, -1); }
+    }
     switch (*s) {
     case 'x': p->s = s + 1; return expr_node(p, EN_X, 0, -1, -1);
     case 'y': p->s = s + 1; return expr_node(p, EN_Y, 0, -1, -1);
@@ -3465,7 +3481,7 @@ static int expr_parse_ternary(ExprParser *p)
     return expr_node3(p, EN_TERN, cond, then_e, else_e);
 }
 
-typedef struct { float x, y, w, h, t, r, a; } ExprVars;
+typedef struct { float x, y, w, h, t, r, a, cr, cg, cb; } ExprVars;
 
 static float expr_eval(const ExprProg *pr, int node, const ExprVars *v)
 {
@@ -3479,6 +3495,9 @@ static float expr_eval(const ExprProg *pr, int node, const ExprVars *v)
     case EN_T: return v->t;
     case EN_R: return v->r;
     case EN_A: return v->a;
+    case EN_CR: return v->cr;
+    case EN_CG: return v->cg;
+    case EN_CB: return v->cb;
     case EN_ADD: return expr_eval(pr, n->a, v) + expr_eval(pr, n->b, v);
     case EN_SUB: return expr_eval(pr, n->a, v) - expr_eval(pr, n->b, v);
     case EN_MUL: return expr_eval(pr, n->a, v) * expr_eval(pr, n->b, v);
@@ -3527,9 +3546,14 @@ static bool expr_compile(ExprProg *prog, const char *src,
     return true;
 }
 
-/* Global mathwarp program (one instance; protected by its own lock
- * because IPC compiles while the render thread evaluates). */
+/* Global mathwarp programs (one instance each; protected by one lock
+ * because IPC compiles while the render thread evaluates).
+ *   dx, dy       — pixel displacement (warp)
+ *   cr, cg, cb   — output color per channel (recolor); when unset the
+ *                  warped source color passes through unchanged. */
 static ExprProg g_mw_dx, g_mw_dy;
+static ExprProg g_mw_cr, g_mw_cg, g_mw_cb;
+static bool     g_mw_color_on = false;
 static pthread_mutex_t g_mw_lock = PTHREAD_MUTEX_INITIALIZER;
 
 bool mathwarp_set_expr(const char *dx_expr, const char *dy_expr,
@@ -3545,11 +3569,38 @@ bool mathwarp_set_expr(const char *dx_expr, const char *dy_expr,
     return true;
 }
 
+bool mathwarp_set_color(const char *r_expr, const char *g_expr,
+                        const char *b_expr, char *err, size_t errlen)
+{
+    ExprProg cr, cg, cb;
+    if (!expr_compile(&cr, r_expr, err, errlen)) return false;
+    if (!expr_compile(&cg, g_expr, err, errlen)) return false;
+    if (!expr_compile(&cb, b_expr, err, errlen)) return false;
+    pthread_mutex_lock(&g_mw_lock);
+    g_mw_cr = cr;
+    g_mw_cg = cg;
+    g_mw_cb = cb;
+    g_mw_color_on = true;
+    pthread_mutex_unlock(&g_mw_lock);
+    return true;
+}
+
+void mathwarp_clear_color(void)
+{
+    pthread_mutex_lock(&g_mw_lock);
+    g_mw_color_on = false;
+    pthread_mutex_unlock(&g_mw_lock);
+}
+
 /* ─── fx_mathwarp ──
- * Displaces each pixel by (dx, dy) computed from the user's
- * expressions. Evaluated every 4th pixel, bilinearly upsampled.
+ * Displaces each pixel by (dx, dy) from the user's warp expressions
+ * (evaluated on a 1/4 grid + bilinearly upsampled), then optionally
+ * recolors each pixel with the color expressions (evaluated per-pixel
+ * so they can read that pixel's own cr/cg/cb).
  *   amp (param): global multiplier on the displacement.
- * Set expressions live:  vcam-ctl filter expr <dx> <dy>
+ * Set expressions live:
+ *   vcam-ctl filter expr  <dx> <dy>        (warp)
+ *   vcam-ctl filter color <r> <g> <b>      (recolor; 0..255 each)
  */
 static void fx_mathwarp(Frame *f, float amp)
 {
@@ -3562,8 +3613,12 @@ static void fx_mathwarp(Frame *f, float amp)
     }
     ExprProg dx_prog = g_mw_dx;
     ExprProg dy_prog = g_mw_dy;
+    bool color_on = g_mw_color_on;
+    ExprProg cr_prog = g_mw_cr, cg_prog = g_mw_cg, cb_prog = g_mw_cb;
     pthread_mutex_unlock(&g_mw_lock);
     if (!dx_prog.valid || !dy_prog.valid) return;
+    if (color_on && (!cr_prog.valid || !cg_prog.valid || !cb_prog.valid))
+        color_on = false;
 
     int w = f->width, h = f->height;
     int GW = w / 4 + 2, GH = h / 4 + 2;
@@ -3577,6 +3632,7 @@ static void fx_mathwarp(Frame *f, float amp)
     v.w = (float)w;
     v.h = (float)h;
     v.t = (float)anim_tick() / 30.0f;
+    v.cr = v.cg = v.cb = 0.0f;   /* unused during warp-grid eval */
     float cx = w / 2.0f, cy = h / 2.0f;
 
     for (int gy = 0; gy < GH; gy++) {
@@ -3596,6 +3652,7 @@ static void fx_mathwarp(Frame *f, float amp)
         uint8_t *dst = f->data + y * f->stride;
         int gy = y / 4;
         float fy = (float)(y & 3) / 4.0f;
+        v.y = (float)y;
         for (int x = 0; x < w; x++) {
             int gx = x / 4;
             float fx = (float)(x & 3) / 4.0f;
@@ -3615,7 +3672,26 @@ static void fx_mathwarp(Frame *f, float amp)
             if (sy >= h) sy = h - 1;
             const uint8_t *sp = src + sy * w * 3 + sx * 3;
             int o = x * 3;
-            dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+
+            if (!color_on) {
+                dst[o] = sp[0]; dst[o+1] = sp[1]; dst[o+2] = sp[2];
+            } else {
+                /* per-pixel recolor: expose the warped source color as
+                 * cr/cg/cb (and this pixel's x/y/r/a) to the exprs */
+                v.x = (float)x;
+                float pdx = x - cx, pdy = y - cy;
+                v.r = sqrtf(pdx*pdx + pdy*pdy);
+                v.a = atan2f(pdy, pdx);
+                v.cb = (float)sp[0];   /* BGR order in buffer */
+                v.cg = (float)sp[1];
+                v.cr = (float)sp[2];
+                int rr = (int)expr_eval(&cr_prog, cr_prog.root, &v);
+                int gg = (int)expr_eval(&cg_prog, cg_prog.root, &v);
+                int bb = (int)expr_eval(&cb_prog, cb_prog.root, &v);
+                dst[o]   = clamp_u8(bb);
+                dst[o+1] = clamp_u8(gg);
+                dst[o+2] = clamp_u8(rr);
+            }
         }
     }
     free(grid);

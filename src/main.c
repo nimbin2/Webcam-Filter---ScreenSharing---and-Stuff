@@ -1,3 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * vcam — Linux virtual webcam pipeline
+ * Copyright (C) 2026 the vcam authors
+ *
+ * This program is free software under the terms of the GNU General
+ * Public License version 2. See the LICENSE file for the full text.
+ */
+
 /*
  * vcam – virtual webcam pipeline with runtime control
  *
@@ -6,8 +14,8 @@
  * Pipeline options:
  *   -i <device>   Input webcam device   (default: /dev/video1)
  *   -o <device>   Output v4l2loopback   (default: /dev/video0)
- *   -W <px>       Output width          (default: camera native)
- *   -H <px>       Output height         (default: camera native)
+ *   --res WxH     Output resolution     (default: camera native)
+ *   --list-formats  List supported input resolutions, then exit
  *   -f <fps>      Output frame rate     (default: camera native)
  *
  * Startup overlays (same syntax as IPC 'add' command):
@@ -87,6 +95,21 @@ static int try_wh(char *argv[], int i, int argc, int *w, int *h)
     return 0;
 }
 
+/* Parse a "WxH" string (e.g. "1280x720") into w/h. Returns true on
+ * success. Accepts 'x' or 'X' as the separator. */
+static bool parse_wxh(const char *s, int *w, int *h)
+{
+    char *ep;
+    long ww = strtol(s, &ep, 10);
+    if (ep == s || (*ep != 'x' && *ep != 'X')) return false;
+    const char *hs = ep + 1;
+    long hh = strtol(hs, &ep, 10);
+    if (ep == hs || *ep != '\0') return false;
+    if (ww <= 0 || hh <= 0 || ww > 16384 || hh > 16384) return false;
+    *w = (int)ww; *h = (int)hh;
+    return true;
+}
+
 /* ── main ──────────────────────────────────────── */
 int main(int argc, char *argv[])
 {
@@ -94,6 +117,23 @@ int main(int argc, char *argv[])
     const char *output_dev = "/dev/video0";
     int  width = 0, height = 0, fps = 0;
     bool no_input = false;     /* --no-input: skip webcam capture entirely */
+
+    /* Pre-scan for --list-formats (and the -i that feeds it). This is a
+     * query-and-exit mode, so we handle it before the main parse and
+     * before touching any pipeline state. */
+    {
+        const char *dev = input_dev;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "-i") == 0 && i+1 < argc)
+                dev = argv[i+1];
+        }
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--list-formats") == 0 ||
+                strcmp(argv[i], "--list") == 0) {
+                return capture_list_formats(dev) ? 0 : 1;
+            }
+        }
+    }
 
     registry_init(&g_registry);
     filter_chain_init(&g_filters);
@@ -106,11 +146,21 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) {
             output_dev = argv[++i];
 
+        } else if ((strcmp(argv[i], "--res") == 0 ||
+                    strcmp(argv[i], "-r") == 0) && i+1 < argc) {
+            /* --res WxH : the preferred way to choose resolution.
+             * See 'vcam --list-formats' for what the device supports. */
+            if (!parse_wxh(argv[++i], &width, &height)) {
+                fprintf(stderr, "vcam: bad --res '%s' (expected WxH, "
+                        "e.g. 1280x720)\n", argv[i]);
+                return 1;
+            }
+
         } else if (strcmp(argv[i], "-W") == 0 && i+1 < argc) {
-            width  = atoi(argv[++i]);
+            width  = atoi(argv[++i]);   /* legacy; --res is preferred */
 
         } else if (strcmp(argv[i], "-H") == 0 && i+1 < argc) {
-            height = atoi(argv[++i]);
+            height = atoi(argv[++i]);   /* legacy; --res is preferred */
 
         } else if (strcmp(argv[i], "-f") == 0 && i+1 < argc) {
             fps    = atoi(argv[++i]);
@@ -175,13 +225,13 @@ int main(int argc, char *argv[])
 "vcam – virtual webcam pipeline\n\n"
 "Usage: vcam [OPTIONS]\n\n"
 "Pipeline:\n"
-"  -i <dev>       Input webcam       (default /dev/video1)\n"
-"  -o <dev>       Output loopback    (default /dev/video0)\n"
-"  -W <px>        Width\n"
-"  -H <px>        Height\n"
-"  -f <fps>       Frame rate\n"
-"  --no-input     Don't open a webcam (use screen overlays as source).\n"
-"                 Combine with -W -H and a fullscreen --screen overlay.\n\n"
+"  -i <dev>          Input webcam       (default /dev/video1)\n"
+"  -o <dev>          Output loopback    (default /dev/video0)\n"
+"  --res WxH         Output resolution  (e.g. --res 1280x720)\n"
+"  -f <fps>          Frame rate\n"
+"  --list-formats    List the resolutions the input device supports, then exit\n"
+"  --no-input        Don't open a webcam (use screen overlays as source).\n"
+"                    Combine with --res and a fullscreen --screen overlay.\n\n"
 "Startup overlays:\n"
 "  --img    <id> <x> <y> [<w> [<h>]] <file>\n"
 "  --vid    <id> <x> <y> [<w> [<h>]] <file>\n"

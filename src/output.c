@@ -1,3 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * vcam — Linux virtual webcam pipeline
+ * Copyright (C) 2026 the vcam authors
+ *
+ * This program is free software under the terms of the GNU General
+ * Public License version 2. See the LICENSE file for the full text.
+ */
+
 /*
  * V4L2 output to v4l2loopback using streaming I/O (MMAP buffers).
  *

@@ -1,3 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * vcam — Linux virtual webcam pipeline
+ * Copyright (C) 2026 the vcam authors
+ *
+ * This program is free software under the terms of the GNU General
+ * Public License version 2. See the LICENSE file for the full text.
+ */
+
 /*
  * IPC server – Unix domain socket at /tmp/vcam.sock
  *
@@ -244,10 +252,12 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   lightpaint <fade> [<thresh> <huespd>](*) INTERACTIVE painting; thresh 10..120; hue cycle rate");
             send_line(client_fd, "OK   hologram <strength> [<gap> <glitch>](*) sci-fi projection; scanline gap 2..8; glitch rate 0..1");
             send_line(client_fd, "OK   life <density> [<color> <speed>](*) Conway's Life on your edges; color 1=age-rainbow; speed=frames/gen");
-            send_line(client_fd, "OK   mathwarp <amp>                 warp by YOUR math — set with: filter expr <dx> <dy>");
-            send_line(client_fd, "OK                                    vars x y w h t r a; fns sin cos abs sqrt floor");
-            send_line(client_fd, "OK                                    ops + - * / % ; cmp > < >= <= == != ; ternary c?a:b");
+            send_line(client_fd, "OK   mathwarp <amp>                 warp AND recolor by YOUR math");
+            send_line(client_fd, "OK                                    warp:  filter expr <dx> <dy>   (vars x y w h t r a)");
+            send_line(client_fd, "OK                                    color: filter color <r> <g> <b> (adds cr cg cb = src color)");
+            send_line(client_fd, "OK                                    fns sin cos abs sqrt floor; ops + - * / % ; cmp; ternary c?a:b");
             send_line(client_fd, "OK                                    e.g. filter expr (x-w/2)*(sin(t*5)>0?0.08:0) 0");
+            send_line(client_fd, "OK                                         filter color cg cb cr   (swap RGB channels)");
             send_line(client_fd, "OK");
             send_line(client_fd, "OK demoscene & particles:");
             send_line(client_fd, "OK   plasma <blend> [<speed> <scale>](*) classic demoscene plasma over the video, blend 0..0.9");
@@ -376,6 +386,38 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 return;
             }
             send_line(client_fd, "OK mathwarp expressions updated (add the 'mathwarp' filter to see them)");
+            return;
+        }
+
+        if (strcmp(sub, "color") == 0) {
+            /* filter color <r-expr> <g-expr> <b-expr>   → recolor pixels
+             * filter color off                          → disable recolor
+             * Each expr returns a channel value 0..255 and may read the
+             * source pixel color as cr cg cb (plus x y w h t r a). */
+            char *rs = strtok_r(NULL, " \t", &save);
+            char *gs = strtok_r(NULL, " \t", &save);
+            char *bs = strtok_r(NULL, " \t", &save);
+            if (rs && !gs && (!strcmp(rs, "off") || !strcmp(rs, "none"))) {
+                mathwarp_clear_color();
+                send_line(client_fd, "OK mathwarp recolor disabled");
+                return;
+            }
+            if (!rs || !gs || !bs) {
+                send_line(client_fd, "ERR usage: filter color <r> <g> <b>   (each 0..255, no spaces in exprs)");
+                send_line(client_fd, "ERR   extra vars: cr cg cb = this pixel's source R/G/B (0..255)");
+                send_line(client_fd, "ERR   plus the usual x y w h t r a; fns sin cos abs sqrt floor; ops + - * / % ?:");
+                send_line(client_fd, "ERR   'filter color off' disables recolor");
+                send_line(client_fd, "ERR   example: filter color cg cb cr   (rotate channels)");
+                return;
+            }
+            char err[128] = "";
+            if (!mathwarp_set_color(rs, gs, bs, err, sizeof err)) {
+                char b[192];
+                snprintf(b, sizeof b, "ERR color expression: %s", err);
+                send_line(client_fd, b);
+                return;
+            }
+            send_line(client_fd, "OK mathwarp recolor updated (needs the 'mathwarp' filter active)");
             return;
         }
 

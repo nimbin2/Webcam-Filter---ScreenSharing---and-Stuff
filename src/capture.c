@@ -1,3 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * vcam — Linux virtual webcam pipeline
+ * Copyright (C) 2026 the vcam authors
+ *
+ * This program is free software under the terms of the GNU General
+ * Public License version 2. See the LICENSE file for the full text.
+ */
+
 #include "vcam.h"
 
 #include <stdio.h>
@@ -150,6 +158,87 @@ static bool pick_format(int fd, int req_w, int req_h, int target_fps,
 
     if (best_score < 0) return false;
     *out_fmt = best_fmt; *out_w = best_w; *out_h = best_h;
+    return true;
+}
+
+/* ── list supported formats ───────────────────────
+ * Opens the device, enumerates every (pixel format, resolution, fps)
+ * combination the driver reports, and prints a human-readable table
+ * to stdout. Used by `vcam --list-formats`. Returns true on success.
+ *
+ * Only the pixel formats vcam can actually consume are shown, since
+ * listing formats we can't decode would be misleading. For each
+ * discrete frame size the maximum discrete frame rate is reported. */
+bool capture_list_formats(const char *device)
+{
+    int fd = open(device, O_RDWR | O_NONBLOCK, 0);
+    if (fd < 0) {
+        fprintf(stderr, "vcam: cannot open %s: %s\n", device, strerror(errno));
+        return false;
+    }
+
+    struct v4l2_capability caps = {0};
+    if (xioctl(fd, VIDIOC_QUERYCAP, &caps) == 0)
+        printf("Capture device: %s (%s)\n", device, caps.card);
+    else
+        printf("Capture device: %s\n", device);
+
+    /* Formats vcam can consume, in the same preference order as pick_format */
+    const __u32 usable[] = {
+        V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_NV12,
+        V4L2_PIX_FMT_YUV420, V4L2_PIX_FMT_BGR24, V4L2_PIX_FMT_RGB24,
+    };
+    const size_t n_usable = sizeof usable / sizeof usable[0];
+
+    printf("\n  %-8s %-12s %s\n", "format", "resolution", "max fps");
+    printf("  %-8s %-12s %s\n", "------", "----------", "-------");
+
+    int shown = 0;
+    struct v4l2_fmtdesc fmt = {0};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    for (fmt.index = 0; xioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0; fmt.index++) {
+        bool ok = false;
+        for (size_t i = 0; i < n_usable; i++)
+            if (usable[i] == fmt.pixelformat) { ok = true; break; }
+        if (!ok) continue;   /* skip formats we can't decode */
+
+        struct v4l2_frmsizeenum fs = {0};
+        fs.pixel_format = fmt.pixelformat;
+        for (fs.index = 0;
+             xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs) == 0;
+             fs.index++) {
+            if (fs.type != V4L2_FRMSIZE_TYPE_DISCRETE) continue;
+            int w = fs.discrete.width, h = fs.discrete.height;
+
+            /* find the highest discrete fps for this size */
+            int max_fps = 0;
+            struct v4l2_frmivalenum fi = {0};
+            fi.pixel_format = fmt.pixelformat;
+            fi.width = w; fi.height = h;
+            for (fi.index = 0;
+                 xioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fi) == 0;
+                 fi.index++) {
+                if (fi.type != V4L2_FRMIVAL_TYPE_DISCRETE) continue;
+                int fps = fi.discrete.denominator /
+                          (fi.discrete.numerator ? fi.discrete.numerator : 1);
+                if (fps > max_fps) max_fps = fps;
+            }
+
+            char res[16];
+            snprintf(res, sizeof res, "%dx%d", w, h);
+            if (max_fps > 0)
+                printf("  %-8s %-12s %d\n", fourcc(fmt.pixelformat), res, max_fps);
+            else
+                printf("  %-8s %-12s %s\n", fourcc(fmt.pixelformat), res, "?");
+            shown++;
+        }
+    }
+
+    if (shown == 0)
+        printf("  (no usable discrete formats reported)\n");
+
+    printf("\nPick one with:  vcam --res WxH [-f FPS]\n");
+    close(fd);
     return true;
 }
 
