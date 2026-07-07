@@ -1,4 +1,6 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
 # vcam-setup – diagnose and configure v4l2loopback for Chromium compatibility
 #
 # Chromium-based browsers pick the FIRST /dev/video* node by default.
@@ -17,7 +19,7 @@
 set -eu
 
 # ── help ─────────────────────────────────────────────────────
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     sed -n '/^# vcam-setup/,/^$/p' "$0" | sed 's/^# \?//'
     echo "Usage:"
     echo "  vcam-setup              show current state and diagnosis"
@@ -28,13 +30,13 @@ fi
 
 INIT_SYSTEM=""
 detect_init() {
-    if [[ -d /run/systemd/system ]]; then
+    if [ -d /run/systemd/system ]; then
         INIT_SYSTEM="systemd"
-    elif command -v rc-status &>/dev/null && rc-status &>/dev/null; then
+    elif command -v rc-status >/dev/null 2>&1 && rc-status >/dev/null 2>&1; then
         INIT_SYSTEM="openrc"
-    elif command -v sv &>/dev/null && [[ -d /etc/service || -d /var/service ]]; then
+    elif command -v sv >/dev/null 2>&1 && [ -d /etc/service ] || [ -d /var/service ]; then
         INIT_SYSTEM="runit"
-    elif [[ -d /etc/rc.d || -d /etc/init.d ]]; then
+    elif [ -d /etc/rc.d ] || [ -d /etc/init.d ]; then
         INIT_SYSTEM="sysv-or-bsd"
     else
         INIT_SYSTEM="unknown"
@@ -44,9 +46,9 @@ detect_init() {
 list_devices() {
     echo "── Current /dev/video* devices ─────────────────────────"
     for dev in /dev/video*; do
-        [[ -e $dev ]] || continue
+        [ -e $dev ] || continue
         local name="" driver=""
-        if command -v v4l2-ctl &>/dev/null; then
+        if command -v v4l2-ctl >/dev/null 2>&1; then
             name=$(v4l2-ctl -d "$dev" --info 2>/dev/null | \
                    awk -F': ' '/Card type/ {print $2; exit}')
             driver=$(v4l2-ctl -d "$dev" --info 2>/dev/null | \
@@ -62,16 +64,16 @@ list_devices
 detect_init
 
 LOOPBACK_DEV=""
-REAL_CAMS=()
+REAL_CAMS=""
 for dev in /dev/video*; do
-    [[ -e $dev ]] || continue
-    if command -v v4l2-ctl &>/dev/null; then
+    [ -e $dev ] || continue
+    if command -v v4l2-ctl >/dev/null 2>&1; then
         driver=$(v4l2-ctl -d "$dev" --info 2>/dev/null | \
                  awk -F': ' '/Driver name/ {print $2; exit}')
-        if [[ "$driver" == "v4l2 loopback" ]]; then
+        if [ "$driver" = "v4l2 loopback" ]; then
             LOOPBACK_DEV="$dev"
-        elif [[ -n "$driver" ]]; then
-            REAL_CAMS+=("$dev")
+        elif [ -n "$driver" ]; then
+            REAL_CAMS="$REAL_CAMS $dev"
         fi
     fi
 done
@@ -79,28 +81,28 @@ done
 # ── analysis ─────────────────────────────────────────────────
 echo "── Analysis ────────────────────────────────────────────"
 echo "  Init system : $INIT_SYSTEM"
-if [[ -z "$LOOPBACK_DEV" ]]; then
+if [ -z "$LOOPBACK_DEV" ]; then
     echo "  Loopback    : NOT FOUND"
 else
     echo "  Loopback    : $LOOPBACK_DEV"
 fi
-if [[ ${#REAL_CAMS[@]} -eq 0 ]]; then
+if [ -z "$(echo $REAL_CAMS | tr -d " ")" ]; then
     echo "  Real cam    : NOT FOUND"
 else
-    echo "  Real cam(s) : ${REAL_CAMS[*]}"
+    echo "  Real cam(s) : $REAL_CAMS"
 fi
 echo ""
 
-if [[ -n "$LOOPBACK_DEV" && ${#REAL_CAMS[@]} -gt 0 ]]; then
+if [ -n "$LOOPBACK_DEV" ] && [ -n "$(echo $REAL_CAMS | tr -d " ")" ]; then
     loopback_nr=${LOOPBACK_DEV#/dev/video}
     # Find the lowest-numbered real cam
     lowest_real=999
-    for rc in "${REAL_CAMS[@]}"; do
+    for rc in $REAL_CAMS; do
         n=${rc#/dev/video}
-        (( n < lowest_real )) && lowest_real=$n
+        [ "$n" -lt "$lowest_real" ] && lowest_real=$n
     done
     echo "── Chromium compatibility ──────────────────────────────"
-    if (( loopback_nr < lowest_real )); then
+    if [ "$loopback_nr" -lt "$lowest_real" ]; then
         echo "  OK — loopback at $LOOPBACK_DEV comes before real cam at /dev/video$lowest_real"
         echo "  Chromium should pick the loopback by default."
     else
@@ -113,8 +115,8 @@ if [[ -n "$LOOPBACK_DEV" && ${#REAL_CAMS[@]} -gt 0 ]]; then
 fi
 
 # ── install ──────────────────────────────────────────────────
-if [[ "${1:-}" == "--install" ]]; then
-    if [[ $EUID -ne 0 ]]; then
+if [ "${1:-}" = "--install" ]; then
+    if [ $EUID -ne 0 ]; then
         echo "Error: --install requires root." >&2
         exit 1
     fi
@@ -138,7 +140,7 @@ MODPROBE
 
     # Also write systemd's modules-load.d if the directory exists, since
     # it's harmless on other systems and helpful where systemd is present.
-    if [[ -d /etc/modules-load.d ]]; then
+    if [ -d /etc/modules-load.d ]; then
         echo "v4l2loopback" > /etc/modules-load.d/vcam.conf
         echo "Wrote /etc/modules-load.d/vcam.conf (systemd-style autoload)"
     fi
@@ -207,8 +209,8 @@ MSG
     exit 0
 fi
 
-if [[ "${1:-}" == "--uninstall" ]]; then
-    if [[ $EUID -ne 0 ]]; then
+if [ "${1:-}" = "--uninstall" ]; then
+    if [ $EUID -ne 0 ]; then
         echo "Error: --uninstall requires root." >&2
         exit 1
     fi

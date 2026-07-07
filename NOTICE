@@ -1,0 +1,70 @@
+vcam — Linux virtual webcam pipeline
+Copyright (C) 2026 the vcam authors
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License, version 2, as published
+by the Free Software Foundation. See the LICENSE file for the full text.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+more details.
+
+
+Third-party components
+======================
+
+vcam links against and/or invokes the following components at runtime. Their
+licenses are compatible with GPL-2.0; none of them impose additional
+restrictions on vcam's own source.
+
+  FFmpeg (libavcodec, libavformat, libavutil, libswscale, libavdevice)
+      Licensed under the GNU LGPL-2.1-or-later, with some components under
+      GPL-2.0-or-later depending on the build configuration. FFmpeg is used
+      here for MJPEG decoding (linked libraries) and, for the optional
+      recording feature, by invoking the `ffmpeg` binary as a separate
+      process. https://ffmpeg.org/legal.html
+
+      NOTE ON DISTRIBUTION: if you distribute a build of vcam together with
+      an FFmpeg that was compiled with --enable-gpl and/or --enable-nonfree
+      (for example, one including libx264 or libfdk-aac), the combined work
+      must satisfy the terms of GPL-2.0 for the linked GPL parts, and
+      --enable-nonfree builds are not redistributable at all. vcam itself is
+      plain GPL-2.0 and links only the default LGPL FFmpeg libraries; the
+      recording feature shells out to whatever `ffmpeg` is found on PATH.
+
+  libpng
+      Licensed under the PNG Reference Library License (permissive,
+      GPL-compatible). Used for loading PNG image overlays.
+      http://www.libpng.org/pub/png/src/libpng-LICENSE.txt
+
+  arecord / ALSA (invoked as a separate process for audio capture)
+      ALSA utilities are licensed under GPL-2.0; libasound under LGPL-2.1.
+      vcam invokes the `arecord` binary as a child process during
+      recording. https://www.alsa-project.org
+
+  wf-recorder (invoked as a separate process for screen capture)
+      Licensed under the MIT license (permissive, GPL-compatible). vcam
+      spawns `wf-recorder` as a child process to capture a Wayland screen
+      region for the `--screen` overlay; frames are piped back to vcam.
+      https://github.com/ammen99/wf-recorder
+
+  Other runtime helpers (invoked as separate processes, not linked)
+      vcam and its scripts may also call these external programs when
+      present. None are linked into vcam; each is installed separately and
+      keeps its own license:
+        - grim, slurp   — MIT (Wayland screenshot / region select)
+        - swaymsg       — MIT (queries monitor layout in vcam-ctl)
+        - v4l2-ctl      — GPL-2.0 (device inspection in vcam-setup)
+        - ncat          — Nmap Public Source License (vcam-ctl's IPC client)
+        - xdg-open      — MIT (opens output files in the diagnostics path)
+
+  v4l2loopback (kernel module, used at runtime, not linked)
+      The output device is provided by the v4l2loopback kernel module,
+      licensed GPL-2.0. It is a runtime dependency installed separately and
+      is not part of vcam's source or binary.
+
+
+The fonts embedded in filter.c (the 8x8 ASCII-art glyph ramp and the VHS
+timecode digits) are original bitmap data created for this project and are
+covered by vcam's GPL-2.0 license along with the rest of the source.

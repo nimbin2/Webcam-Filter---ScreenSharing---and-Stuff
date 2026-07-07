@@ -28,9 +28,9 @@ Zoom — anything that consumes a V4L2 capture device.
 | Command | What it does |
 |---|---|
 | `vcam`        | Main process — runs the capture → filter → composite → output pipeline. |
-| `vcam-ctl`    | Send commands to a running vcam (overlays, filters, screen capture). |
-| `vcam-setup`  | One-time install of `/etc/modprobe.d/vcam.conf` for browser compatibility. |
-| `vcam-tune`   | Interactively dial filter parameters with arrow keys. |
+| `vcam-ctl`    | Send commands to a running vcam (overlays, filters, screen capture). POSIX `sh`. |
+| `vcam-setup`  | One-time install of `/etc/modprobe.d/vcam.conf` for browser compatibility. POSIX `sh`. |
+| `vcam-tune`   | Interactively dial filter parameters with arrow keys. Requires `bash` (single-keypress input). |
 
 Every tool has `--help`. Run any of them with no arguments or `-h` for full usage.
 
@@ -38,8 +38,11 @@ Every tool has `--help`. Run any of them with no arguments or `-h` for full usag
 
 ## Quick start
 
+Full details — dependencies, build options, the one-time device setup —
+are in **[INSTALL.md](INSTALL.md)**. The short version:
+
 ```bash
-# 1. Dependencies (Debian / Ubuntu — package names differ on other distros)
+# 1. Dependencies (Debian / Ubuntu)
 sudo apt install \
     libv4l-dev libavcodec-dev libavformat-dev libavutil-dev \
     libswscale-dev libavdevice-dev libpng-dev \
@@ -47,53 +50,20 @@ sudo apt install \
     wf-recorder slurp ncat
 
 # 2. Build & install
-git clone <repo-url> vcam && cd vcam
-make
-make
-sudo make install                          # default → /usr/local/bin
-# or pick your own destination:
-#   make install PREFIX=$HOME/.local        # ~/.local/bin (no sudo)
-#   make install PREFIX=/usr                # system-wide
-#   make install DESTDIR=/tmp/pkg PREFIX=/usr   # staged for packaging
-# Uninstall:
-#   sudo make uninstall                     # uses the same PREFIX/DESTDIR
+make && sudo make install
 
 # 3. ONE-TIME: make v4l2loopback land at /dev/video0 (Chromium needs this)
-sudo vcam-setup --install
+sudo vcam-setup --install     # then reboot, or reload modules as it prints
 
-# Then reboot, or do the manual module reload it prints:
-sudo modprobe -r uvcvideo
-sudo modprobe -r v4l2loopback
-sudo modprobe v4l2loopback
-sudo modprobe uvcvideo
-
-# 4. Verify
-vcam-setup
-# → "OK — loopback at /dev/video0 comes before real cam at /dev/video1"
-
-# 5. Start it (defaults: input /dev/video1, output /dev/video0)
+# 4. Run it, and test the output
 vcam
-
-# 6. Test the output
 ffplay /dev/video0
 ```
 
-In your video-call app, pick "vcam" as the camera.
-
----
-
-## Why two device numbers? (the Chromium fix)
-
-Chromium-family browsers pick the first `/dev/video*` they see. If that's
-your real webcam and vcam is already streaming from it, the browser gets
-`EBUSY` → `NotReadableError` and the page errors out before the user can
-even pick a different device. Firefox doesn't have this problem.
-
-`vcam-setup --install` writes `/etc/modprobe.d/vcam.conf` so the
-v4l2loopback module claims `/dev/video0` *before* USB cameras enumerate.
-Your real cam then sits at `/dev/video1+` and the loopback is what
-Chromium auto-picks. The `exclusive_caps=1` parameter it sets is also
-mandatory for Firefox.
+In your video-call app, pick **vcam** as the camera. If the browser can't
+see it, that's almost always the device-number issue —
+[INSTALL.md](INSTALL.md#one-time-device-setup-the-chromium-fix) explains
+why and how `vcam-setup` fixes it.
 
 ---
 
@@ -105,11 +75,11 @@ vcam [OPTIONS]
 Pipeline:
   -i <device>     Input webcam        (default /dev/video1)
   -o <device>     Output loopback     (default /dev/video0)
-  -W <px>         Output width        (default: camera native)
-  -H <px>         Output height       (default: camera native)
+  --res WxH       Output resolution   (e.g. --res 1280x720; default: camera native)
   -f <fps>        Frame rate
+  --list-formats  List the resolutions the input device supports, then exit
   --no-input      Skip the webcam (screen overlay becomes the source).
-                  Requires -W and -H.
+                  Combine with --res.
 
 Startup overlays:
   --img      <id> <x> <y> [<w> [<h>]] <file>       PNG or JPEG
@@ -121,18 +91,25 @@ Startup filters (chain order = listed order):
   --filter <name> [<param>]
 ```
 
-If you pass only `<w>`, height is computed from the source aspect ratio;
-same for `<h>` alone (use `0 <h>` to skip width).
+Not sure what your camera supports? Ask it:
+
+```bash
+vcam --list-formats           # prints every format / resolution / fps it offers
+```
+
+If you pass only `<w>` to an overlay, height is computed from the source
+aspect ratio; same for `<h>` alone (use `0 <h>` to skip width).
 
 ### Examples
 
 ```bash
 vcam                                                    # plain forward
-vcam -W 1280 -H 720 -f 30                               # force 720p30
+vcam --list-formats                                     # what can my camera do?
+vcam --res 1280x720 -f 30                               # force 720p30
 vcam --img logo 1100 10 160 /assets/logo.png            # top-right logo
 vcam --vid intro 50 50 320 180 /clips/intro.mp4
 vcam --filter modern 0.8 --filter vignette 0.6          # cinematic
-vcam --no-input -W 1920 -H 1080 \
+vcam --no-input --res 1920x1080 \
      --screen scr 0 0 1920 1080 1920x1080+0+0           # pure screencast
 ```
 
@@ -430,41 +407,29 @@ blend), plus `emboss dither tiles zoompulse oilslick`.
 | `symmetry`   | mode | face-symmetry mirrors — 0 left→right, 1 right→left, 2 quad kaleidoscope |
 | `timebubble` | delay, radius | a glowing bubble drifts around; inside it you see seconds into the past |
 
-### mathwarp — warp the image with your own formulas
+### mathwarp — warp *and recolor* the image with your own formulas
+
+`mathwarp` has two independent expression sets. **Warp** moves pixels;
+**color** repaints them. Use either or both.
 
 ```bash
 vcam-ctl filter add mathwarp 1.0
-# toom in out stepped
+
+# WARP: displace each pixel by (dx, dy)
 vcam-ctl filter expr '(x-w/2)*(sin(t*5)>0?0.08:0)' '(y-h/2)*(sin(t*5)>0?0.08:0)'
-# squares mash animated
-vcam-ctl filter expr '(floor(x/40)%2==floor(y/40)%2?1:-1)*sin(t*3)*25' '(floor(x/40)%2==floor(y/40)%2?-1:1)*cos(t*2.5)*25'
-vcam-ctl filter expr '(x-w/2)*((floor(x/40)+floor(y/40))%2==0?(1+sin(t*0.3)*0.3):(1-sin(t*0.3)*0.3))-x+w/2' '(y-h/2)*((floor(x/40)+floor(y/40))%2==0?(1+sin(t*0.3)*0.3):(1-sin(t*0.3)*0.3))-y+h/2'
 
-# waves circle
-vcam-ctl filter expr '(x-w/2)*(sin(r*0.2-t*5)*0.08)' '(y-h/2)*(sin(r*0.2-t*5)*0.08)'
-# bubble
-vcam-ctl filter expr '(sqrt((x-(w/2+sin(t*0.7)*w*0.35))*(x-(w/2+sin(t*0.7)*w*0.35))+(y-(h/2+cos(t*0.9)*h*0.35))*(y-(h/2+cos(t*0.9)*h*0.35)))<50)?(x-(w/2+sin(t*0.7)*w*0.35))*0.4:0' '(sqrt((x-(w/2+sin(t*0.7)*w*0.35))*(x-(w/2+sin(t*0.7)*w*0.35))+(y-(h/2+cos(t*0.9)*h*0.35))*(y-(h/2+cos(t*0.9)*h*0.35)))<50)?(y-(h/2+cos(t*0.9)*h*0.35))*0.4:0'
-vcam-ctl filter expr '(x-w/2)*(1/(r*0.03+1)) - (y-h/2)*(1/(r*0.01+0.5))*2*sin(t)' '(y-h/2)*(1/(r*0.03+1)) + (x-w/2)*(1/(r*0.01+0.5))*2*cos(t)'
-
-# gltichbar
-vcam-ctl filter expr '(floor(y/5)%2==0?sin(t*20)*5:0)+(abs(y-h/2-sin(t*1.2)*h*0.4)<10?80:0)' '(floor(x/5)%2==0?cos(t*20)*5:0)+(abs(x-w/2-cos(t*1.2)*w*0.4)<10?80:0)'
-# pulsate
-vcam-ctl filter expr '(x-w/2)*(abs(sin(t*3))*0.15)' '(y-h/2)*(abs(sin(t*3))*0.15)'
-# slight drunk
-vcam-ctl filter expr 'sin(sqrt((x-w/2)*(x-w/2)+(y-h/2)*(y-h/2))*0.05-t*3)*2+sin(sqrt((x-(w/2+sin(t)*200))*(x-(w/2+sin(t)*200))+(y-(h/2+cos(t)*200))*(y-(h/2+cos(t)*200)))*0.05+t*3)*2' 'cos(sqrt((x-w/2)*(x-w/2)+(y-h/2)*(y-h/2))*0.05-t*3)*2+cos(sqrt((x-(w/2+sin(t)*200))*(x-(w/2+sin(t)*200))+(y-(h/2+cos(t)*200))*(y-(h/2+cos(t)*200)))*0.05+t*3)*2'
-vcam-ctl filter expr '(sin(a+t*2)*cos(a*2+t*1.7)+cos(a*3-t))*r*0.02' '(cos(a+t*2)*sin(a*2+t*1.7)+sin(a*3-t))*r*0.02'
-vcam-ctl filter expr 'abs((x-w/2)*cos(t*0.5)-(y-h/2)*sin(t*0.5))*0.3' 'abs((x-w/2)*sin(t*0.5)+(y-h/2)*cos(t*0.5))*0.3'
-# good for kalaidoscope
-vcam-ctl filter expr '(sin(t)>0.1 ? (x-w/2)*abs(sin(t))*0.2 : (x-w/2)*(-abs(sin(t))*0.5) ) + (sin(t)<-0.1? (w-x) : 0)' '(sin(t)>0.1 ? (y-h/2)*abs(sin(t))*0.2 : (y-h/2)*(-abs(sin(t))*0.5) ) + (sin(t)<-0.1? (h-y) : 0)'
+# COLOR: repaint each pixel; r/g/b return 0..255
+vcam-ctl filter color 'cg' 'cb' 'cr'          # rotate the RGB channels
+vcam-ctl filter color off                     # back to normal colors
 ```
 
-Each pixel is displaced by `(dx, dy)` computed from your two
-expressions (no spaces inside an expression). Compiled on the fly by
-a built-in parser, evaluated on a coarse grid + bilinear upsampling —
-comfortably 720p30.
+Both are compiled on the fly by a built-in parser. Warp is evaluated on
+a coarse grid + bilinear upsampling; color is evaluated per pixel — both
+comfortably hold 720p30.
 
-* Variables: `x y` (pixel), `w h` (frame size), `t` (seconds),
+* Variables (everywhere): `x y` (pixel), `w h` (frame size), `t` (seconds),
   `r a` (radius / angle from center)
+* Color expressions also get `cr cg cb` — this pixel's source R/G/B (0–255)
 * Functions: `sin cos abs sqrt floor`
 * Operators: `+ - * / %`, comparisons `> < >= <= == !=`,
   ternary `cond ? a : b`, parentheses, unary minus
@@ -472,9 +437,15 @@ comfortably 720p30.
 ```bash
 # brick-shatter: alternating 40px bands slide opposite ways
 vcam-ctl filter expr '(floor(y/40)%2==0?1:-1)*sin(t*3)*15' '0'
-# radial shockwaves
-vcam-ctl filter expr 'sin(r/15-t*4)*10' 'cos(r/15-t*4)*10'
+# photographic negative
+vcam-ctl filter color '255-cr' '255-cg' '255-cb'
+# a spectrum that scrolls across the frame forever
+vcam-ctl filter color 'sin(x/40+t)*127+128' 'sin(x/40+t+2)*127+128' 'sin(x/40+t+4)*127+128'
 ```
+
+**→ See [EXPRESSIONS.md](EXPRESSIONS.md) for a full cookbook** — black
+holes, tornados, thermal maps, psychedelic wormholes, and dozens more
+verified recipes for warp, color, and the two combined.
 
 The `mathwarp` primary parameter is a global amplitude multiplier, so
 you can fade your formula in and out live from `vcam-tune`.
@@ -726,16 +697,32 @@ times out, your compositor probably doesn't support `wlr-screencopy`
 
 ## Troubleshooting
 
+Installation and device-setup problems (loopback not found, browser can't
+see the camera, missing build tools) are covered in
+**[INSTALL.md](INSTALL.md#install-time-troubleshooting)**. Runtime issues:
+
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Cannot open /dev/video0` | v4l2loopback not loaded | `sudo vcam-setup --install`, then reboot or manual reload |
-| `NotReadableError` in Chromium | Loopback isn't at /dev/video0 | `sudo vcam-setup --install` |
-| Firefox shows no camera | v4l2loopback without `exclusive_caps=1` | vcam-setup writes it correctly |
 | Screen overlay is black | (was) wf-recorder hung on Overwrite prompt | rebuild — pre-loaded `y\n` is in stdin now |
 | Screen overlay still black | Compositor doesn't support wlr-screencopy | Use Sway, Hyprland, river, niri, wayfire |
 | Screen image scrolls diagonally | (was) stride misalignment | rebuild — dims snap to 16/2 now |
 | Video overlay is a green block | (was) pre-decode `pix_fmt` was NONE | rebuild — sws is lazy now |
 | Video plays jerky/jumps back | (was) spin limit too tight | rebuild — limit raised, `vid_eof_sent` flag added |
-| `vcam-ctl: ncat: command not found` | ncat not installed | `sudo apt install ncat` |
 | `shell-init: getcwd error retrieving current directory` | Your *shell* sits in a deleted directory — **not a vcam bug** | `cd ~` in that terminal |
 | High CPU at 1080p | `blur` / `painterly` / `voronoi` are O(W·H·r²) | smaller param, drop to 720p, or pick cheaper filters |
+
+---
+
+## License
+
+vcam is free software under the **GNU General Public License, version 2**
+(GPL-2.0-only). See [LICENSE](LICENSE) for the full text and [NOTICE](NOTICE)
+for third-party components.
+
+The dependencies are all GPL-2.0-compatible: FFmpeg (LGPL-2.1+, some parts
+GPL), libpng (permissive), and the ALSA/v4l2loopback runtime tools. One
+caveat worth knowing if you *redistribute builds*: if you bundle an FFmpeg
+compiled with `--enable-nonfree` (e.g. with `libfdk-aac`), that combined
+binary is not redistributable. vcam itself links only the standard LGPL
+FFmpeg libraries and shells out to whatever `ffmpeg` is on your PATH for
+recording, so this only matters if you package FFmpeg together with vcam.

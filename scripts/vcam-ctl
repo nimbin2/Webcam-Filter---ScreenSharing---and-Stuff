@@ -1,4 +1,6 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
 #
 # vcam-ctl – complete runtime control for a running vcam process.
 #
@@ -100,14 +102,14 @@ SOCK="${VCAM_SOCK:-/tmp/vcam.sock}"
 show_help() { sed -n '/^# vcam-ctl/,/^$/p' "$0" | sed 's/^# \?//'; }
 
 # ── basic usage / help ───────────────────────────────────────
-if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then
+if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     show_help
     exit 0
 fi
 
 # ── check vcam is alive ──────────────────────────────────────
 require_running() {
-    if [[ ! -S "$SOCK" ]]; then
+    if [ ! -S "$SOCK" ]; then
         echo "Error: vcam is not running (socket $SOCK not found)" >&2
         exit 1
     fi
@@ -145,14 +147,14 @@ detect_monitors() {
     fi
     # Bare-metal fallback: /sys/class/drm — only gives resolution.
     for status_file in /sys/class/drm/card*/status; do
-        [[ -r "$status_file" ]] || continue
-        [[ "$status_file" =~ /card[0-9]+-[^/]+/status$ ]] || continue
-        if [[ "$(cat "$status_file")" == "connected" ]]; then
+        [ -r "$status_file" ] || continue
+        echo "$status_file" | grep -qE '/card[0-9]+-[^/]+/status$' || continue
+        if [ "$(cat "$status_file")" = "connected" ]; then
             local dir="${status_file%/status}"
             local name mode
             name=$(basename "$dir" | sed 's/^card[0-9]*-//')
             mode=$(head -1 "$dir/modes" 2>/dev/null)
-            if [[ -n "$mode" && "$mode" =~ ^[0-9]+x[0-9]+$ ]]; then
+            if [ -n "$mode" ] && echo "$mode" | grep -qE '^[0-9]+x[0-9]+$'; then
                 echo "$name $mode 0 0"
             fi
         fi
@@ -166,14 +168,14 @@ resolve_monitor() {
     local selector="$1"
     local lines
     lines=$(detect_monitors)
-    [[ -z "$lines" ]] && { return 1; }
+    [ -z "$lines" ] && { return 1; }
 
     local count
     count=$(echo "$lines" | wc -l)
 
     # Specific selector
-    if [[ -n "$selector" ]]; then
-        if [[ "$selector" =~ ^[0-9]+$ ]]; then
+    if [ -n "$selector" ]; then
+        if echo "$selector" | grep -qE '^[0-9]+$'; then
             echo "$lines" | sed -n "${selector}p"
         else
             echo "$lines" | awk -v n="$selector" '$1 == n { print; exit }'
@@ -182,7 +184,7 @@ resolve_monitor() {
     fi
 
     # Single monitor: just use it
-    if [[ $count -eq 1 ]]; then
+    if [ $count -eq 1 ]; then
         echo "$lines"
         return 0
     fi
@@ -190,7 +192,7 @@ resolve_monitor() {
     # Multiple monitors: interactive prompt
     # Only require stdin to be a TTY — stdout is captured by $(...) so
     # -t 1 would always fail when called via command substitution.
-    if [[ ! -t 0 ]]; then
+    if [ ! -t 0 ]; then
         echo "$lines" | head -1
         return 0
     fi
@@ -199,14 +201,19 @@ resolve_monitor() {
     local i=0
     while IFS= read -r line; do
         i=$((i+1))
-        read -r name mode x y <<< "$line"
+        name=$(echo "$line" | awk '{print $1}')
+        mode=$(echo "$line" | awk '{print $2}')
+        x=$(echo "$line" | awk '{print $3}')
+        y=$(echo "$line" | awk '{print $4}')
         printf "  %d) %-12s %s  at (%d,%d)\n" "$i" "$name" "$mode" "$x" "$y" >&2
-    done <<< "$lines"
+    done <<EOF
+$lines
+EOF
     printf "Select monitor (1-%d, default 1): " "$count" >&2
     local choice
     read -r choice
-    [[ -z "$choice" ]] && choice=1
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > count )); then
+    [ -z "$choice" ] && choice=1
+    if ! echo "$choice" | grep -qE '^[0-9]+$' || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
         echo "Invalid selection" >&2; return 1
     fi
     echo "$lines" | sed -n "${choice}p"
@@ -215,7 +222,7 @@ resolve_monitor() {
 # ──────────────────────────────────────────────────────────────
 # screen subcommand — fully merged from old vcam-screen
 # ──────────────────────────────────────────────────────────────
-if [[ "$1" == "screen" ]]; then
+if [ "$1" = "screen" ]; then
     shift
     require_running
 
@@ -226,7 +233,7 @@ if [[ "$1" == "screen" ]]; then
     MONITOR=""
     ACTION="add"   # add | list | remove | remove-all | monitors
 
-    while [[ $# -gt 0 ]]; do
+    while [ $# -gt 0 ]; do
         case "$1" in
             --help) show_help; exit 0 ;;
             -i) ID="$2"; shift 2 ;;
@@ -241,7 +248,7 @@ if [[ "$1" == "screen" ]]; then
             --list) ACTION="list"; shift ;;
             --remove)
                 ACTION="remove"
-                if [[ $# -ge 2 && "$2" != -* ]]; then ID="$2"; shift 2
+                if [ $# -ge 2 ] && [ "$2" != -* ]; then ID="$2"; shift 2
                 else ID="screen"; shift; fi ;;
             --remove-all) ACTION="remove-all"; shift ;;
             *) echo "Unknown screen option: $1  (try --help)" >&2; exit 1 ;;
@@ -249,39 +256,44 @@ if [[ "$1" == "screen" ]]; then
     done
 
     # ── list / remove / monitors paths ──
-    if [[ "$ACTION" == "monitors" ]]; then
+    if [ "$ACTION" = "monitors" ]; then
         lines=$(detect_monitors)
-        if [[ -z "$lines" ]]; then
+        if [ -z "$lines" ]; then
             echo "No monitors detected." >&2; exit 1
         fi
         i=0
         while IFS= read -r line; do
             i=$((i+1))
-            read -r name mode x y <<< "$line"
+            name=$(echo "$line" | awk '{print $1}')
+            mode=$(echo "$line" | awk '{print $2}')
+            x=$(echo "$line" | awk '{print $3}')
+            y=$(echo "$line" | awk '{print $4}')
             printf "  %d) %-12s %s  at (%d,%d)\n" "$i" "$name" "$mode" "$x" "$y"
-        done <<< "$lines"
+        done <<EOF
+$lines
+EOF
         exit 0
     fi
 
-    if [[ "$ACTION" == "list" ]]; then
+    if [ "$ACTION" = "list" ]; then
         ipc_send list | grep '\[screen\]' || echo "no screen overlays"
         exit 0
     fi
-    if [[ "$ACTION" == "remove" ]]; then
+    if [ "$ACTION" = "remove" ]; then
         ipc_send "remove $ID"
         exit 0
     fi
-    if [[ "$ACTION" == "remove-all" ]]; then
+    if [ "$ACTION" = "remove-all" ]; then
         ipc_send list | grep -oE '\[screen\] id=[^ ]+' | \
             awk -F= '{print $2}' | while read -r oid; do
-                [[ -n "$oid" ]] && { echo "removing $oid"; ipc_send "remove $oid"; }
+                [ -n "$oid" ] && { echo "removing $oid"; ipc_send "remove $oid"; }
             done
         exit 0
     fi
 
     # ── add path ──
     # Auto-pick a free ID if user didn't provide one
-    if [[ -z "$ID" ]]; then
+    if [ -z "$ID" ]; then
         EXISTING=$(ipc_send list 2>/dev/null | grep -oE 'id=[^ ]+' | awk -F= '{print $2}')
         if ! echo "$EXISTING" | grep -qx "screen"; then
             ID="screen"
@@ -293,27 +305,28 @@ if [[ "$1" == "screen" ]]; then
     fi
 
     # Detect display server
-    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then DS="wayland"
-    elif [[ -n "${DISPLAY:-}" ]]; then       DS="x11"
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then DS="wayland"
+    elif [ -n "${DISPLAY:-}" ]; then       DS="x11"
     else
         echo "Error: neither WAYLAND_DISPLAY nor DISPLAY is set" >&2; exit 1
     fi
 
     # Obtain geometry
     GEOMETRY=""
-    if [[ $FULL -eq 1 ]]; then
+    if [ $FULL -eq 1 ]; then
         SEL=$(resolve_monitor "$MONITOR")
-        if [[ -z "$SEL" ]]; then
+        if [ -z "$SEL" ]; then
             echo "Could not resolve monitor selection." >&2
             echo "Run 'vcam-ctl screen --monitors' to list connected monitors." >&2
             exit 1
         fi
-        read -r MNAME MMODE MX MY <<< "$SEL"
+        set -- $SEL
+        MNAME="$1" MMODE="$2" MX="$3" MY="$4"
         GEOMETRY="${MMODE}+${MX}+${MY}"
         echo "Full screen on $MNAME: $GEOMETRY"
     else
         echo "Select a screen region..." >&2
-        if [[ "$DS" == "wayland" ]]; then
+        if [ "$DS" = "wayland" ]; then
             command -v slurp >/dev/null || { echo "slurp not installed" >&2; exit 1; }
             SLURP_RAW=$(slurp 2>/dev/null) || { echo "Cancelled." >&2; exit 1; }
             SX=$(echo "$SLURP_RAW" | cut -d',' -f1)
@@ -332,15 +345,15 @@ if [[ "$1" == "screen" ]]; then
         echo "Selected: $GEOMETRY" >&2
     fi
 
-    if [[ $REPLACE -eq 1 ]]; then
+    if [ $REPLACE -eq 1 ]; then
         echo "Removing existing overlay '$ID'..." >&2
         ipc_send "remove $ID" >/dev/null || true
     fi
 
     ARGS="add screen $ID $DST_X $DST_Y"
-    if   [[ $DST_W -gt 0 && $DST_H -gt 0 ]]; then ARGS="$ARGS $DST_W $DST_H"
-    elif [[ $DST_W -gt 0 ]];                    then ARGS="$ARGS $DST_W"
-    elif [[ $DST_H -gt 0 ]];                    then ARGS="$ARGS 0 $DST_H"
+    if   [ $DST_W -gt 0 ] && [ $DST_H -gt 0 ]; then ARGS="$ARGS $DST_W $DST_H"
+    elif [ $DST_W -gt 0 ];                    then ARGS="$ARGS $DST_W"
+    elif [ $DST_H -gt 0 ];                    then ARGS="$ARGS 0 $DST_H"
     fi
     ARGS="$ARGS $GEOMETRY"
 
@@ -378,12 +391,12 @@ fi
 #
 # Default ID is "cam". To run multiple webcam overlays, add them with
 # the lower-level: vcam-ctl add webcam myid <x> <y> [<w>] <device>
-if [[ "$1" == "webcam" ]]; then
+if [ "$1" = "webcam" ]; then
     shift
     require_running
     POS="${1:-tr}"; WIDTH="${2:-320}"; ID="${3:-cam}"
 
-    if [[ "$POS" == "off" || "$POS" == "remove" ]]; then
+    if [ "$POS" = "off" ] || [ "$POS" = "remove" ]; then
         ipc_send "remove $ID"
         exit 0
     fi
@@ -395,7 +408,7 @@ if [[ "$1" == "webcam" ]]; then
         OUT_SIZE=$(v4l2-ctl -d "$OUT" --get-fmt-video 2>/dev/null \
                    | awk -F'/' '/Width\/Height/{print $2}' | tr -d ' ')
     fi
-    [[ "$OUT_SIZE" =~ ^[0-9]+x[0-9]+$ ]] || OUT_SIZE="1280x720"
+    echo "$OUT_SIZE" | grep -qE '^[0-9]+x[0-9]+$' || OUT_SIZE="1280x720"
     OUT_W="${OUT_SIZE%x*}"; OUT_H="${OUT_SIZE#*x}"
 
     # Webcam is 16:9 (height computed from width)
@@ -450,9 +463,9 @@ REC_INFO="/tmp/vcam-record.info"
 REC_LOG="/tmp/vcam-record.log"
 
 rec_is_active() {
-    [[ -f "$REC_PID" ]] || return 1
+    [ -f "$REC_PID" ] || return 1
     local pid; pid=$(cat "$REC_PID" 2>/dev/null) || return 1
-    [[ -z "$pid" ]] && return 1
+    [ -z "$pid" ] && return 1
     kill -0 "$pid" 2>/dev/null
 }
 
@@ -470,16 +483,16 @@ rec_list_mics() {
         local sources
         sources=$(pactl list sources short 2>/dev/null \
                   | awk '{print $2}' | grep -v '\.monitor$' || true)
-        if [[ -n "$sources" ]]; then
+        if [ -n "$sources" ]; then
             have_any=1
             echo "PipeWire/PulseAudio sources (RECOMMENDED — robust buffering):"
             echo ""
             printf "  %-18s %s\n" "--mic" "source"
             printf "  %-18s %s\n" "------------------" "---------------------------------"
             printf "  %-18s %s\n" "pulse" "(default source)"
-            while IFS= read -r src; do
+            printf '%s\n' "$sources" | while IFS= read -r src; do
                 printf "  %-18s %s\n" "pulse:$src" "$src"
-            done <<<"$sources"
+            done
             echo ""
         fi
     fi
@@ -488,24 +501,23 @@ rec_list_mics() {
     if command -v arecord >/dev/null 2>&1; then
         local lines
         lines=$(arecord -l 2>/dev/null | grep -E '^card [0-9]+' || true)
-        if [[ -n "$lines" ]]; then
+        if [ -n "$lines" ]; then
             have_any=1
             echo "Raw ALSA capture devices:"
             echo ""
             printf "  %-18s %s\n" "--mic" "device"
             printf "  %-18s %s\n" "------------------" "---------------------------------"
-            while IFS= read -r line; do
-                local card dev name
+            printf '%s\n' "$lines" | while IFS= read -r line; do
                 card=$(echo "$line" | sed -E 's/^card ([0-9]+):.*/\1/')
                 dev=$(echo  "$line" | sed -E 's/.*device ([0-9]+):.*/\1/')
                 name=$(echo "$line" | sed -E 's/.*\[([^]]*)\][[:space:]]*$/\1/')
                 printf "  %-18s %s\n" "plughw:${card},${dev}" "$name (card $card, device $dev)"
-            done <<<"$lines"
+            done
             echo ""
         fi
     fi
 
-    if [[ $have_any -eq 0 ]]; then
+    if [ $have_any -eq 0 ]; then
         echo "No capture devices found."
         return 1
     fi
@@ -522,11 +534,11 @@ rec_list_mics() {
 
 rec_default_output() {
     local dir="${XDG_VIDEOS_DIR:-$HOME/Videos}"
-    [[ -d "$dir" ]] || dir="$HOME"
+    [ -d "$dir" ] || dir="$HOME"
     echo "$dir/vcam-$(date +%Y-%m-%d_%H-%M-%S).mkv"
 }
 
-if [[ "$1" == "record" ]]; then
+if [ "$1" = "record" ]; then
     shift
     ACTION="${1:-help}"
     shift || true
@@ -538,7 +550,7 @@ if [[ "$1" == "record" ]]; then
             if rec_is_active; then
                 echo "Already recording (pid $(cat $REC_PID))." >&2
                 echo "Use 'vcam-ctl record stop' first, or pass --replace." >&2
-                if [[ " $* " != *" --replace "* && " $* " != *" -r "* ]]; then
+                if [ " $* " != *" --replace "* ] && [ " $* " != *" -r "* ]; then
                     exit 1
                 fi
                 ipc_send "record stop" >/dev/null 2>&1 || true
@@ -549,7 +561,7 @@ if [[ "$1" == "record" ]]; then
             OUT=""; MIC=""; NO_AUDIO=0; CRF=23
             VCODEC="libx264"; VPRESET="ultrafast"; AOFFSET="0.2"
 
-            while [[ $# -gt 0 ]]; do
+            while [ $# -gt 0 ]; do
                 case "$1" in
                     -o|--output)   OUT="$2"; shift 2 ;;
                     -m|--mic)      MIC="$2"; shift 2 ;;
@@ -574,7 +586,7 @@ if [[ "$1" == "record" ]]; then
             #      ffmpeg's direct ALSA reads.
             #   2. ALSA "default"
             #   3. First hardware capture device as plughw:N,M
-            if [[ $NO_AUDIO -eq 0 && -z "$MIC" ]]; then
+            if [ $NO_AUDIO -eq 0 ] && [ -z "$MIC" ]; then
                 if command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1; then
                     MIC="pulse"
                 elif arecord -L 2>/dev/null | grep -q '^default$'; then
@@ -584,11 +596,11 @@ if [[ "$1" == "record" ]]; then
                         | grep -E '^card [0-9]+' \
                         | head -1 \
                         | sed -E 's/^card ([0-9]+).* device ([0-9]+).*/plughw:\1,\2/')
-                    if [[ -n "$FIRST_HW" && "$FIRST_HW" =~ ^plughw: ]]; then
+                    if [ -n "$FIRST_HW" ] && echo "$FIRST_HW" | grep -qE '^plughw:'; then
                         MIC="$FIRST_HW"
                     fi
                 fi
-                if [[ -n "$MIC" ]]; then
+                if [ -n "$MIC" ]; then
                     echo "[record] auto-selected mic: $MIC" \
                          "(override with --mic, or skip with --no-audio)"
                 else
@@ -596,7 +608,7 @@ if [[ "$1" == "record" ]]; then
                 fi
             fi
             # Normalize plain "N,M" → "plughw:N,M"
-            if [[ -n "$MIC" && "$MIC" =~ ^[0-9]+,[0-9]+$ ]]; then
+            if [ -n "$MIC" ] && echo "$MIC" | grep -qE '^[0-9]+,[0-9]+$'; then
                 MIC="plughw:$MIC"
                 echo "[record] interpreting mic as $MIC"
             fi
@@ -608,14 +620,14 @@ if [[ "$1" == "record" ]]; then
             # consumers regardless of who attached first.
             require_running
             REQ="record start file=$OUT crf=$CRF vcodec=$VCODEC preset=$VPRESET aoffset=$AOFFSET"
-            if [[ $NO_AUDIO -eq 0 && -n "$MIC" ]]; then
+            if [ $NO_AUDIO -eq 0 ] && [ -n "$MIC" ]; then
                 REQ="$REQ mic=$MIC"
             fi
             RESP=$(ipc_send "$REQ")
             if ! echo "$RESP" | grep -qE '^OK recording'; then
                 echo "Failed to start recording. Response from vcam:" >&2
                 echo "$RESP" >&2
-                if [[ -s /tmp/vcam-record.log ]]; then
+                if [ -s /tmp/vcam-record.log ]; then
                     echo "" >&2
                     echo "ffmpeg log (last 20 lines, full at /tmp/vcam-record.log):" >&2
                     tail -n 20 /tmp/vcam-record.log >&2
@@ -639,7 +651,7 @@ if [[ "$1" == "record" ]]; then
                 if echo "$CHECK" | grep -q "recording"; then
                     break   # alive and well
                 fi
-                if [[ $ATTEMPT -eq 1 ]] && grep -q "audio device.*busy\|Device or resource busy" /tmp/vcam-record.log 2>/dev/null; then
+                if [ $ATTEMPT -eq 1 ] && grep -q "audio device.*busy\|Device or resource busy" /tmp/vcam-record.log 2>/dev/null; then
                     echo "[record] mic still held by the previous recording — retrying in 2s..."
                     sleep 2
                     ATTEMPT=2
@@ -649,7 +661,7 @@ if [[ "$1" == "record" ]]; then
                     fi
                 fi
                 echo "✗ ffmpeg exited immediately after start." >&2
-                if [[ -s /tmp/vcam-record.log ]]; then
+                if [ -s /tmp/vcam-record.log ]; then
                     echo "" >&2
                     echo "ffmpeg log (last 20 lines, full at /tmp/vcam-record.log):" >&2
                     tail -n 20 /tmp/vcam-record.log >&2
@@ -676,7 +688,7 @@ if [[ "$1" == "record" ]]; then
             echo "● Recording started"
             echo "   file: $OUT"
             echo "   pid:  ${PID:-?}  (ffmpeg, child of vcam)"
-            [[ -n "$MIC" ]] && echo "   mic:  $MIC"
+            [ -n "$MIC" ] && echo "   mic:  $MIC"
             echo "   transport: pipe (vcam → ffmpeg stdin, no /dev/video0 read)"
             ;;
 
@@ -685,24 +697,24 @@ if [[ "$1" == "record" ]]; then
             # Ask vcam to close its end of the pipe; ffmpeg finalises
             # the file in the background.
             require_running 2>/dev/null && ipc_send "record stop" >/dev/null 2>&1 || true
-            if [[ -f "$REC_INFO" ]]; then
+            if [ -f "$REC_INFO" ]; then
                 OUT=$(grep '^file=' "$REC_INFO" 2>/dev/null | cut -d= -f2-)
             fi
             rm -f "$REC_PID" "$REC_STATUS" "$REC_INFO"
             echo "■ Recording stopped"
-            if [[ -n "${OUT:-}" ]]; then
+            if [ -n "${OUT:-}" ]; then
                 # Give ffmpeg a moment to finish the container, then
                 # verify the file actually exists. If it doesn't, the
                 # recording failed at some point — surface the log.
                 for _ in 1 2 3 4 5 6 7 8 9 10; do
-                    [[ -s "$OUT" ]] && break
+                    [ -s "$OUT" ] && break
                     sleep 0.2
                 done
-                if [[ -s "$OUT" ]]; then
+                if [ -s "$OUT" ]; then
                     echo "   saved: $OUT"
                 else
                     echo "   ✗ expected output $OUT was not created!" >&2
-                    if [[ -s /tmp/vcam-record.log ]]; then
+                    if [ -s /tmp/vcam-record.log ]; then
                         echo "" >&2
                         echo "ffmpeg log (last 20 lines, full at /tmp/vcam-record.log):" >&2
                         tail -n 20 /tmp/vcam-record.log >&2
@@ -753,11 +765,11 @@ if [[ "$1" == "record" ]]; then
             fi
             echo "state=$(cat $REC_STATUS 2>/dev/null || echo recording)"
             echo "pid=$(cat $REC_PID)"
-            [[ -f "$REC_INFO" ]] && cat "$REC_INFO"
+            [ -f "$REC_INFO" ] && cat "$REC_INFO"
             # Duration on the fly
-            if [[ -f "$REC_INFO" ]]; then
+            if [ -f "$REC_INFO" ]; then
                 START=$(grep '^started=' "$REC_INFO" | cut -d= -f2)
-                if [[ -n "$START" ]]; then
+                if [ -n "$START" ]; then
                     NOW=$(date +%s)
                     DUR=$((NOW - START))
                     printf "duration=%02d:%02d:%02d\n" \
@@ -779,7 +791,7 @@ if [[ "$1" == "record" ]]; then
                 NOW=$(date +%s)
                 DUR=$((NOW - ${START:-NOW}))
                 LBL=$(printf "%02d:%02d:%02d" $((DUR/3600)) $(((DUR%3600)/60)) $((DUR%60)))
-                if [[ "$STATE" == "paused" ]]; then
+                if [ "$STATE" = "paused" ]; then
                     printf '{"text":"⏸ REC %s","class":"paused","color":"#ffaa00"}\n' "$LBL"
                 else
                     printf '{"text":"● REC %s","class":"recording","color":"#ff5555"}\n' "$LBL"

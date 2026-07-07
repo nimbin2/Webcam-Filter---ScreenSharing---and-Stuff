@@ -1,3 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * vcam — Linux virtual webcam pipeline
+ * Copyright (C) 2026 the vcam authors
+ *
+ * This program is free software under the terms of the GNU General
+ * Public License version 2. See the LICENSE file for the full text.
+ */
+
 #pragma once
 
 #include <stdint.h>
@@ -239,6 +247,14 @@ void        filter_chain_apply  (FilterChain *fc, Frame *f); /* takes lock */
 bool mathwarp_set_expr(const char *dx_expr, const char *dy_expr,
                        char *err, size_t errlen);
 
+/* Recolor expressions for FX_MATHWARP. Each returns a channel value
+ * (0..255) and may read the warped source color via cr/cg/cb, plus
+ * all the usual vars (x y w h t r a). Once set, mathwarp recolors
+ * every pixel until mathwarp_clear_color() is called. */
+bool mathwarp_set_color(const char *r_expr, const char *g_expr,
+                        const char *b_expr, char *err, size_t errlen);
+void mathwarp_clear_color(void);
+
 FilterType  filter_type_from_name(const char *name);
 const char *filter_type_to_name  (FilterType t);
 float       filter_default_param (FilterType t);
@@ -304,6 +320,10 @@ typedef struct V4L2Capture V4L2Capture;
 V4L2Capture *capture_open (const char *dev, int *w, int *h, int *fps);
 bool         capture_read (V4L2Capture *cap, Frame *out);
 void         capture_close(V4L2Capture *cap);
+
+/* Enumerate and print every usable (format, resolution, fps) the
+ * device supports. Returns false if the device can't be opened. */
+bool         capture_list_formats(const char *dev);
 
 /* ──────────────────────────────────────────────
  * V4L2 loopback output

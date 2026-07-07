@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
+# NOTE: this script requires bash (not POSIX sh) — it uses read -rsn1 for
+# single-keypress interactive input, which has no POSIX equivalent.
 #
 # vcam-tune – interactively adjust filter parameters with the keyboard.
 #

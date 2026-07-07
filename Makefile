@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
 CC      := gcc
 CFLAGS  := -std=c11 -O2 -Wall -Wextra -Wpedantic \
             -D_POSIX_C_SOURCE=200809L \
@@ -16,6 +18,7 @@ LDFLAGS := $(shell pkg-config --libs libavcodec libavformat libavutil libswscale
 #   make install DESTDIR=/tmp/stage    (staged install for packaging)
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
+DOCDIR  ?= $(PREFIX)/share/doc/vcam
 
 SRCS := src/main.c src/frame.c src/capture.c src/output.c \
         src/overlay.c src/registry.c src/ipc.c src/filter.c \
@@ -44,8 +47,14 @@ install: $(BIN)
 	install -m 755 scripts/vcam-ctl     $(DESTDIR)$(BINDIR)/
 	install -m 755 scripts/vcam-setup   $(DESTDIR)$(BINDIR)/
 	install -m 755 scripts/vcam-tune    $(DESTDIR)$(BINDIR)/
+	install -d $(DESTDIR)$(DOCDIR)
+	install -m 644 LICENSE              $(DESTDIR)$(DOCDIR)/
+	install -m 644 NOTICE               $(DESTDIR)$(DOCDIR)/
+	install -m 644 README.md            $(DESTDIR)$(DOCDIR)/
+	install -m 644 INSTALL.md           $(DESTDIR)$(DOCDIR)/
+	install -m 644 EXPRESSIONS.md       $(DESTDIR)$(DOCDIR)/
 	@echo
-	@echo "Installed to $(DESTDIR)$(BINDIR)/"
+	@echo "Installed to $(DESTDIR)$(BINDIR)/  (docs in $(DESTDIR)$(DOCDIR)/)"
 	@echo "Make sure that's on your PATH."
 
 uninstall:
@@ -53,6 +62,7 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/vcam-ctl
 	rm -f $(DESTDIR)$(BINDIR)/vcam-setup
 	rm -f $(DESTDIR)$(BINDIR)/vcam-tune
+	rm -rf $(DESTDIR)$(DOCDIR)
 
 clean:
 	rm -f $(OBJS) $(BIN) $(TEST)
