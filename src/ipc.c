@@ -310,7 +310,9 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   opticalflow <mix>             motion visualized as flowing color");
             send_line(client_fd, "OK   bgsub <sensitivity>           moving foreground vivid, static background dimmed");
             send_line(client_fd, "OK   facefx <mode>                 YuNet faces: 0=blur 1=ring+dots 2=googly-eyes (needs model)");
-            send_line(client_fd, "OK   personfx <mode>               person seg (needs model): 0=blur-bg 1=spotlight 2=gradient-bg");
+            send_line(client_fd, "OK   personfx <mode> [<edge> <smooth>] person seg (needs model): 0=blur-bg 1=spotlight 2=gradient-bg");
+            send_line(client_fd, "OK                                    edge 0.05..0.5 (lower=more hair, higher=tighter cut, def 0.22)");
+            send_line(client_fd, "OK                                    smooth 0.4..1 (mask responsiveness, 1=instant, def 0.8)");
             send_line(client_fd, "OK                                    3=YOUR-image-bg (filter bgimage <path>) 4=INVISIBILITY CLOAK 5=neon person");
             send_line(client_fd, "OK   styleai <style> [<blend> <size>] LIVE NEURAL STYLE TRANSFER: 0=mosaic 1=candy 2=rain-princess 3=udnie 4=pointilism");
             send_line(client_fd, "OK                                    blend 0..1 mixes with original; size 96..384 = quality vs speed");

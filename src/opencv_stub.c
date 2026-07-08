@@ -45,8 +45,8 @@ void cv_fx_bgsub(unsigned char *d, int w, int h, int s, float x)
 void cv_fx_face(unsigned char *d, int w, int h, int s, int m)
 { (void)d; (void)w; (void)h; (void)s; (void)m; }
 
-void cv_fx_bgblur(unsigned char *d, int w, int h, int s, int m)
-{ (void)d; (void)w; (void)h; (void)s; (void)m; }
+void cv_fx_bgblur(unsigned char *d, int w, int h, int s, int m, float e, float sm)
+{ (void)d; (void)w; (void)h; (void)s; (void)m; (void)e; (void)sm; }
 
 void cv_fx_style(unsigned char *d, int w, int h, int s, int st, float b, float sz)
 { (void)d; (void)w; (void)h; (void)s; (void)st; (void)b; (void)sz; }

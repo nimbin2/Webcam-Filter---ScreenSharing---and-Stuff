@@ -84,7 +84,7 @@ n_params_for() {
         neon|kaleidoscope|wave) echo 4 ;;
         chromashift|glitch|vignette|feedback|ripples|life|plasma) echo 3 ;;
         swirl|pinch|bulge|shuffle|rain|lightpaint|hologram|duotone|spotlight) echo 3 ;;
-        predator|liquid|clones|styleai) echo 3 ;;
+        predator|liquid|clones|styleai|personfx) echo 3 ;;
         contour|fireworks|infinity|moire) echo 2 ;;
         cartoon|drift|slitscan|mosh|zoompulse|oilslick|ascii|sketch) echo 2 ;;
         shards|portal|heattrail|wormhole|magnet|nightvision|badtv|ghosts) echo 2 ;;
@@ -214,6 +214,8 @@ param_label() {
         bgsub:1) echo "sens" ;;
         facefx:1) echo "mode" ;;
         personfx:1) echo "mode" ;;
+        personfx:2) echo "edge" ;;
+        personfx:3) echo "smooth" ;;
         styleai:1) echo "style" ;;
         styleai:2) echo "blend" ;;
         styleai:3) echo "size" ;;
@@ -291,6 +293,8 @@ param_step() {
         nightvision:2)  echo 5 ;;
         badtv:2)        echo 0.5 ;;
         ghosts:2)       echo 0.5 ;;
+        personfx:2)     echo 0.02 ;;
+        personfx:3)     echo 0.05 ;;
         styleai:2)      echo 0.05 ;;
         styleai:3)      echo 32 ;;
         moodfx:2)       echo 0.1 ;;

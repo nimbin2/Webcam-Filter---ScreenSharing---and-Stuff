@@ -355,7 +355,7 @@ bool ensure_seg()
  * Returns a full-frame CV_8U mask (255 = person) or empty on failure.
  * Preprocessing: (pixel/255 - 0.5)/0.5  ==  pixel/127.5 - 1, which
  * blobFromImage produces as scalefactor=1/127.5, mean=127.5. */
-cv::Mat seg_infer(const cv::Mat &bgr, const cv::Rect &body)
+cv::Mat seg_infer(const cv::Mat &bgr, const cv::Rect &body, float edge)
 {
     /* Segment only the body ROI (from the face detector), LETTERBOXED
      * into the square input instead of aspect-squished. The person now
@@ -428,7 +428,7 @@ cv::Mat seg_infer(const cv::Mat &bgr, const cv::Rect &body)
      * 0.6-0.8, which — used directly as alpha — rendered the person
      * translucent. Remap 0.30..0.60 -> 0..1 (smoothstep): confident
      * regions become solid, the feather survives only at true edges. */
-    full = (full - 0.22) * (1.0 / 0.33);
+    full = (full - edge) * (1.0 / 0.33);
     cv::min(full, 1.0, full);
     cv::max(full, 0.0, full);
     cv::Mat f2 = full.mul(full);
@@ -802,9 +802,16 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode)
     }
 }
 
-void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode)
+void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
+                  float edge, float smooth)
 {
     if (!data || w < 16 || h < 16) return;
+    if (edge <= 0.0f) edge = 0.22f;          /* mask generosity: lower = more hair */
+    if (edge < 0.05f) edge = 0.05f;
+    if (edge > 0.50f) edge = 0.50f;
+    if (smooth <= 0.0f) smooth = 0.80f;      /* responsiveness: 1 = instant */
+    if (smooth < 0.40f) smooth = 0.40f;
+    if (smooth > 1.00f) smooth = 1.00f;
     try {
         std::lock_guard<std::mutex> lock(g_seg.mtx);
         cv::Mat img = wrap_bgr(data, w, h, stride);
@@ -849,10 +856,10 @@ void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode)
                     }
                 }
             }
-            cv::Mat m = seg_infer(img, body);
+            cv::Mat m = seg_infer(img, body, edge);
             if (!m.empty()) {
                 if (!g_seg.mask.empty() && g_seg.mask.size() == m.size())
-                    cv::addWeighted(m, 0.80, g_seg.mask, 0.20, 0.0, g_seg.mask);
+                    cv::addWeighted(m, smooth, g_seg.mask, 1.0 - smooth, 0.0, g_seg.mask);
                 else
                     m.copyTo(g_seg.mask);
             }

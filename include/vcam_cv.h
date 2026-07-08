@@ -109,7 +109,7 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride,
  *   2 = replace background with a moving color gradient
  * Needs human_segmentation_pphumanseg_2023mar.onnx. */
 void cv_fx_bgblur(unsigned char *data, int w, int h, int stride,
-                  int mode);
+                  int mode, float edge, float smooth);
 
 /* Live neural style transfer (fast-neural-style, 5 styles).
  *   style: 0=mosaic 1=candy 2=rain-princess 3=udnie 4=pointilism

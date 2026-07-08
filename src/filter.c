@@ -5903,7 +5903,7 @@ void filter_chain_apply(FilterChain *fc, Frame *frame)
         case FX_CV_FLOW:      cv_fx_flow   (frame->data, frame->width, frame->height, frame->stride, f->param); break;
         case FX_CV_BGSUB:     cv_fx_bgsub  (frame->data, frame->width, frame->height, frame->stride, f->param); break;
         case FX_CV_FACE:      cv_fx_face   (frame->data, frame->width, frame->height, frame->stride, (int)f->param); break;
-        case FX_CV_PERSON:    cv_fx_bgblur (frame->data, frame->width, frame->height, frame->stride, (int)f->param); break;
+        case FX_CV_PERSON:    cv_fx_bgblur (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3); break;
         case FX_CV_STYLE:     cv_fx_style  (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3); break;
         case FX_CV_MOOD:      cv_fx_mood   (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2); break;
         case FX_CV_PAINT:     cv_fx_paintflow(frame->data, frame->width, frame->height, frame->stride, f->param, f->param2); break;
