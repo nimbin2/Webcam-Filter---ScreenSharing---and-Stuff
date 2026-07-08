@@ -15,6 +15,7 @@
  */
 
 #include "vcam.h"
+#include "vcam_cv.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,6 +166,28 @@ static const struct { const char *name; FilterType t; } NAMES[] = {
     {"symmetry",    FX_SYMMETRY},
     {"timebubble",  FX_TIMEBUBBLE},
     {"pastbubble",  FX_TIMEBUBBLE},
+    /* OpenCV-backed (optional) */
+    {"cvcartoon",   FX_CV_CARTOON},
+    {"cvpencil",    FX_CV_PENCIL},
+    {"sketch2",     FX_CV_PENCIL},
+    {"cvstylize",   FX_CV_STYLIZE},
+    {"watercolor",  FX_CV_STYLIZE},
+    {"opticalflow", FX_CV_FLOW},
+    {"cvflow",      FX_CV_FLOW},
+    {"bgsub",       FX_CV_BGSUB},
+    {"motionmask",  FX_CV_BGSUB},
+    {"facefx",      FX_CV_FACE},
+    {"face",        FX_CV_FACE},
+    {"personfx",    FX_CV_PERSON},
+    {"portrait",    FX_CV_PERSON},
+    {"styleai",     FX_CV_STYLE},
+    {"neuralstyle", FX_CV_STYLE},
+    {"moodfx",      FX_CV_MOOD},
+    {"emotion",     FX_CV_MOOD},
+    {"paintflow",   FX_CV_PAINT},
+    {"smear",       FX_CV_PAINT},
+    {"speedlines",  FX_CV_SPEED},
+    {"anime",       FX_CV_SPEED},
     /* new effect additions */
     {"saturate",    FX_SATURATE},
     {"crt",         FX_CRT},
@@ -286,6 +309,18 @@ float filter_default_param(FilterType t)
     case FX_OUTLINE:     return 2.0f;
     case FX_SYMMETRY:    return 0.0f;
     case FX_TIMEBUBBLE:  return 1.5f;
+    /* OpenCV-backed */
+    case FX_CV_CARTOON:  return 0.6f;
+    case FX_CV_PENCIL:   return 1.0f;   /* 1 = keep color, 0 = graphite */
+    case FX_CV_STYLIZE:  return 0.6f;
+    case FX_CV_FLOW:     return 0.6f;
+    case FX_CV_BGSUB:    return 0.5f;
+    case FX_CV_FACE:     return 0.0f;   /* mode 0 = privacy blur */
+    case FX_CV_PERSON:   return 0.0f;   /* mode 0 = background blur */
+    case FX_CV_STYLE:    return 0.0f;   /* style 0 = mosaic */
+    case FX_CV_MOOD:     return 0.0f;   /* mode 0 = aura */
+    case FX_CV_PAINT:    return 1.0f;
+    case FX_CV_SPEED:    return 1.0f;
     default:             return 0.0f;
     }
 }
@@ -5860,6 +5895,19 @@ void filter_chain_apply(FilterChain *fc, Frame *frame)
         case FX_OUTLINE:      fx_outline(frame, f->param, f->param2); break;
         case FX_SYMMETRY:     fx_symmetry(frame, f->param); break;
         case FX_TIMEBUBBLE:   fx_timebubble(frame, f->param, f->param2); break;
+        /* OpenCV-backed effects operate on the whole BGR24 frame.
+         * In the non-OpenCV build these resolve to no-op stubs. */
+        case FX_CV_CARTOON:   cv_fx_cartoon(frame->data, frame->width, frame->height, frame->stride, f->param); break;
+        case FX_CV_PENCIL:    cv_fx_pencil (frame->data, frame->width, frame->height, frame->stride, (int)f->param); break;
+        case FX_CV_STYLIZE:   cv_fx_stylize(frame->data, frame->width, frame->height, frame->stride, f->param); break;
+        case FX_CV_FLOW:      cv_fx_flow   (frame->data, frame->width, frame->height, frame->stride, f->param); break;
+        case FX_CV_BGSUB:     cv_fx_bgsub  (frame->data, frame->width, frame->height, frame->stride, f->param); break;
+        case FX_CV_FACE:      cv_fx_face   (frame->data, frame->width, frame->height, frame->stride, (int)f->param); break;
+        case FX_CV_PERSON:    cv_fx_bgblur (frame->data, frame->width, frame->height, frame->stride, (int)f->param); break;
+        case FX_CV_STYLE:     cv_fx_style  (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3); break;
+        case FX_CV_MOOD:      cv_fx_mood   (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2); break;
+        case FX_CV_PAINT:     cv_fx_paintflow(frame->data, frame->width, frame->height, frame->stride, f->param, f->param2); break;
+        case FX_CV_SPEED:     cv_fx_speedlines(frame->data, frame->width, frame->height, frame->stride, f->param, f->param2); break;
         default: break;
         }
     }

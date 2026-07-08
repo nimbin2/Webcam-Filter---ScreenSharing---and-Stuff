@@ -7,6 +7,7 @@ Wayland.
 
 - [Dependencies](#dependencies)
 - [Build & install](#build--install)
+- [Optional: OpenCV filters](#optional-opencv-filters)
 - [One-time device setup (the Chromium fix)](#one-time-device-setup-the-chromium-fix)
 - [Verify](#verify)
 - [Uninstall](#uninstall)
@@ -69,6 +70,96 @@ make install DESTDIR=/tmp/pkg PREFIX=/usr     # staged, for packaging
 `install` also drops LICENSE, NOTICE, README.md, and EXPRESSIONS.md into
 `PREFIX/share/doc/vcam`. Make sure your chosen `bin` directory is on
 `PATH`.
+
+---
+
+## Optional: OpenCV filters
+
+vcam has seven extra filters powered by **OpenCV 5** — cartoon,
+pencil-sketch, watercolor, optical-flow, background subtraction, face
+effects, and person-segmentation background effects (see the OpenCV
+section in [README.md](README.md)). They are **off by default**: the
+normal build has no OpenCV dependency at all, and these filters simply
+aren't compiled in.
+
+**OpenCV 5 is the recommended version** — the filters are written
+OpenCV-5-first. Built against 5.x, they use the features new in that
+release:
+
+- the **new graph-based DNN engine** (`ENGINE_AUTO`): 80%+ ONNX operator
+  coverage (vs ~22% in 4.x), shape inference, constant folding, and
+  operator fusion — the segmentation and face models load through it
+- **first-class FP16** (`cv::hfloat`/`CV_16F`): the person-matte blend in
+  `personfx` runs at half precision, halving the memory traffic of its
+  heaviest per-frame step
+
+OpenCV 4.5–4.x also works; the same code then compiles a
+classic-engine/FP32 fallback path, selected at compile time. Ask a
+running vcam which path it has with `vcam-ctl opencv`.
+
+```bash
+# OpenCV 5 dev files. If your distro still packages 4.x as
+# libopencv-dev, build 5.x from source (github.com/opencv/opencv,
+# branch 5.x) or use your distro's opencv5 package when available.
+sudo apt install libopencv-dev
+
+# Build with OpenCV support
+make OPENCV=1
+sudo make install     # remembers the OPENCV=1 flavor automatically
+```
+
+**After any rebuild, restart the running vcam** — `vcam-ctl` talks to the
+already-running process, which keeps serving the old binary until you
+replace it:
+
+```bash
+pkill vcam
+vcam &
+vcam-ctl opencv       # should now report your OpenCV version + engine
+```
+
+The build finds OpenCV via pkg-config, probing the module names
+`opencv5`, `opencv4`, and `opencv` in that order — note that an OpenCV 5
+install often still ships its pkg-config file under the `opencv4` name
+for compatibility, which is fine: the version, not the module name,
+decides which code path is compiled. If nothing is found, `make
+OPENCV=1` stops with a clear message; you can force a name with
+`OPENCV_PC=<name>`.
+
+### Model files (for `facefx` and `personfx`)
+
+The five classic OpenCV filters work immediately. The two DNN-based ones
+need small ONNX model files, which you download once:
+
+```bash
+vcam-setup --models          # → ~/.local/share/vcam/models
+# or system-wide:
+sudo vcam-setup --models --system
+```
+
+This fetches two models, both free and permissively licensed:
+
+- **YuNet** face detector — ~230 KB, MIT license
+- **PP-HumanSeg** person segmentation — a few MB, Apache-2.0 license
+- **MobileFaceNet FER** expression recognition (for `moodfx`) — Apache-2.0
+
+The `styleai` neural-style filter has its own optional pack (five
+fast-neural-style networks, MIT license, ~6.5 MB each, from the ONNX
+Model Zoo mirror on HuggingFace):
+
+```bash
+vcam-setup --models-style
+```
+
+They're pulled from the official OpenCV model repository on HuggingFace.
+If you'd rather place them yourself, drop the `.onnx` files in any of
+`$VCAM_MODEL_DIR`, `~/.local/share/vcam/models`, or
+`/usr/local/share/vcam/models` — vcam checks those in order. Until the
+models are present, `facefx` and `personfx` pass the frame through
+unchanged and print a one-time hint.
+
+Nothing about these filters is required: if you never build with
+`OPENCV=1`, vcam is exactly the pure-C program it always was.
 
 ---
 

@@ -299,7 +299,7 @@ shown above.
 
 ---
 
-## Filters (100 total, 11 categories)
+## Filters (111 total, 12 categories)
 
 Filters run in chain order on every frame from the webcam, *before*
 overlays are composited. Every filter has a primary parameter; many
@@ -407,7 +407,70 @@ blend), plus `emboss dither tiles zoompulse oilslick`.
 | `symmetry`   | mode | face-symmetry mirrors — 0 left→right, 1 right→left, 2 quad kaleidoscope |
 | `timebubble` | delay, radius | a glowing bubble drifts around; inside it you see seconds into the past |
 
-### mathwarp — warp *and recolor* the image with your own formulas
+### OpenCV-backed set (optional — build with `make OPENCV=1`)
+
+These seven use OpenCV's computer-vision algorithms for effects the
+hand-rolled filters can't do: real motion analysis, background
+segmentation, and face detection. They're **opt-in at build time** —
+the default build has no OpenCV dependency and these filters simply
+aren't present.
+
+They're written **OpenCV-5-first**: built against OpenCV 5, the DNN
+filters load their models on the **new graph-based DNN engine**
+(`ENGINE_AUTO` — 80%+ ONNX operator coverage, shape inference, operator
+fusion) and the person-matte blend runs in **first-class FP16**
+(`cv::hfloat`), both new in 5.0. Against OpenCV 4.5+ the same code
+compiles a classic-engine/FP32 fallback. Check which path your build
+uses with `vcam-ctl opencv`. See
+[INSTALL.md](INSTALL.md#optional-opencv-filters) to enable the filters
+and fetch the (free, tiny) model files.
+
+| Name | Knob | Effect | Needs model |
+|---|---|---|---|
+| `cvcartoon`   | strength | edge-preserving bilateral smoothing + adaptive ink outlines — a proper cartoon, not a posterize | no |
+| `cvpencil`    | color (1/0) | OpenCV's non-photorealistic pencil sketch; 1 keeps color, 0 is graphite | no |
+| `cvstylize`   | strength | watercolor / poster stylization (edge-aware) | no |
+| `opticalflow` | mix | dense Farnebäck optical flow — motion becomes flowing color (direction = hue, speed = brightness) | no |
+| `bgsub`       | sensitivity | MOG2 background subtraction: whatever moves stays vivid, the learned static background dims and desaturates | no |
+| `facefx`      | mode | YuNet face detection — 0 privacy-pixelate, 1 glossy ring + landmark dots, 2 googly eyes, 3 **bighead**, 4 **deal-with-it sunglasses**, 5 **laser eyes**, 6 **bobblehead** (rhythmically wobble-inflating head), 7 **third eye** (your own eye cloned onto your forehead), 8 **crown** (tracked golden crown with jewels) | **yes** |
+| `personfx`    | mode | PP-HumanSeg person segmentation, soft-alpha matte, per-frame + temporally smoothed — 0 = blur background, 1 = spotlight, 2 = moving gradient, 3 = **your own image** (`vcam-ctl filter bgimage /path/pic.jpg`), 4 = **invisibility cloak**, 5 = **neon person**, 6 = **clone army**, 7 = **window-3D**, 8 = **chrono clones**, 9 = **tiny you** (shrunk to 45%, standing in the learned room), 10 = **hologram you** (only your body becomes a flickering cyan scanline projection; the room stays real) | **yes** |
+| `styleai`     | style, blend, size | **live neural style transfer** — your webcam through actual neural nets: 0 mosaic, 1 candy, 2 rain-princess, 3 udnie, 4 pointilism. `blend` mixes with the original; `size` (96–384) is the quality↔speed dial | **yes** (`--models-style`) |
+| `moodfx`      | mode, gain | **emotion-reactive**: an expression model reads your face (7 emotions, ~2 ms) and the effect responds — 0 aura, 1 HUD label, 2 party (happy→confetti, sad→rain, surprised→flash, angry→screen-shake), 3 **emoji face**, 4 **paintmood** — two neural nets chained: the emotion model *selects the neural style* live (happy→candy, sad→rain-princess, angry→mosaic, surprised→pointillism) and your confidence drives the blend; needs the `--models-style` pack | **yes** |
+| `speedlines`  | sens, density | **anime speed lines**: mean optical flow past a threshold fires white motion streaks from the border opposite your movement — dodge left, lines fly right | no |
+| `paintflow`   | strength, decay | **motion paints**: dense optical flow drags a persistent canvas — wave and you smear reality like wet paint; hold still and it sharpens back | no |
+
+They're laptop-friendly: classic effects run on the CPU at 720p, and the
+two DNN filters run inference on a downscaled frame every few frames
+(the models are ~85 KB and ~6 MB, milliseconds per inference). If a model
+file is missing, that filter passes the frame through untouched and prints
+a one-time hint to run `vcam-setup --models`.
+
+```bash
+vcam-ctl filter add cvcartoon 0.7
+vcam-ctl filter add opticalflow 0.7      # wave your hand, watch it flow
+vcam-ctl filter add facefx 2             # googly eyes
+vcam-ctl filter add personfx 0           # blur everything but you
+vcam-ctl filter bgimage ~/pics/beach.jpg # then:
+vcam-ctl filter add personfx 3           # you, at the beach
+vcam-ctl filter add styleai 2 0.9 256    # live rain-princess painting, high quality
+vcam-ctl filter add moodfx 2             # smile → confetti rains down
+vcam-ctl filter add personfx 4           # invisibility cloak
+vcam-ctl filter add personfx 5           # neon silhouette in a black room
+vcam-ctl filter add personfx 6           # CLONE ARMY: three of you
+vcam-ctl filter add facefx 3             # bighead mode
+vcam-ctl filter add facefx 4             # deal-with-it sunglasses
+vcam-ctl filter add moodfx 3             # you are the emoji now
+vcam-ctl filter add paintflow 1.5        # smear reality by moving
+vcam-ctl filter add personfx 7           # WINDOW-3D: move your head, see parallax
+vcam-ctl filter add personfx 8           # your past selves follow you
+vcam-ctl filter add facefx 5             # laser eyes
+vcam-ctl filter add facefx 6             # bobblehead
+vcam-ctl filter add facefx 7             # third eye
+vcam-ctl filter add personfx 10          # hologram you
+vcam-ctl filter add speedlines 1.5       # anime dodge lines
+```
+
+
 
 `mathwarp` has two independent expression sets. **Warp** moves pixels;
 **color** repaints them. Use either or both.

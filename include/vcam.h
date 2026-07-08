@@ -209,6 +209,19 @@ typedef enum {
     FX_SYMMETRY,    /* face symmetry mirrors (left/right/quad)              */
     FX_TIMEBUBBLE,  /* drifting bubble showing N seconds into the past      */
 
+    /* ── OpenCV-backed (optional; built with OPENCV=1) ── */
+    FX_CV_CARTOON,  /* edge-preserving bilateral cartoon + ink outlines     */
+    FX_CV_PENCIL,   /* non-photorealistic pencil sketch                     */
+    FX_CV_STYLIZE,  /* watercolor/poster stylization                        */
+    FX_CV_FLOW,     /* dense optical-flow motion visualization              */
+    FX_CV_BGSUB,    /* MOG2: moving foreground vivid, static bg dimmed      */
+    FX_CV_FACE,     /* YuNet face detection: blur / ring / googly-eyes      */
+    FX_CV_PERSON,   /* PP-HumanSeg: blur/spotlight/gradient/your-image bg   */
+    FX_CV_STYLE,    /* live neural style transfer (5 styles, blend, size)   */
+    FX_CV_MOOD,     /* emotion-reactive: aura / HUD / party / emoji         */
+    FX_CV_PAINT,    /* optical-flow paint smear: motion drags reality       */
+    FX_CV_SPEED,    /* anime speed lines when you move fast                 */
+
     FX_UNKNOWN,
 } FilterType;
 

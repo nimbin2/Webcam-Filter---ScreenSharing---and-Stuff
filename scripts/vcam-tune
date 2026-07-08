@@ -84,11 +84,11 @@ n_params_for() {
         neon|kaleidoscope|wave) echo 4 ;;
         chromashift|glitch|vignette|feedback|ripples|life|plasma) echo 3 ;;
         swirl|pinch|bulge|shuffle|rain|lightpaint|hologram|duotone|spotlight) echo 3 ;;
-        predator|liquid|clones) echo 3 ;;
+        predator|liquid|clones|styleai) echo 3 ;;
         contour|fireworks|infinity|moire) echo 2 ;;
         cartoon|drift|slitscan|mosh|zoompulse|oilslick|ascii|sketch) echo 2 ;;
         shards|portal|heattrail|wormhole|magnet|nightvision|badtv|ghosts) echo 2 ;;
-        meltdown|rotozoom|starfield|lightning|scatter|vhs|outline|timebubble) echo 2 ;;
+        meltdown|rotozoom|starfield|lightning|scatter|vhs|outline|timebubble|moodfx|paintflow|speedlines) echo 2 ;;
         *) echo 1 ;;
     esac
 }
@@ -207,6 +207,22 @@ param_label() {
         outline:2) echo "huespd" ;;
         timebubble:1) echo "delay" ;;
         timebubble:2) echo "radius" ;;
+        cvcartoon:1) echo "strength" ;;
+        cvpencil:1) echo "color" ;;
+        cvstylize:1) echo "strength" ;;
+        opticalflow:1) echo "mix" ;;
+        bgsub:1) echo "sens" ;;
+        facefx:1) echo "mode" ;;
+        personfx:1) echo "mode" ;;
+        styleai:1) echo "style" ;;
+        styleai:2) echo "blend" ;;
+        styleai:3) echo "size" ;;
+        moodfx:1) echo "mode" ;;
+        moodfx:2) echo "gain" ;;
+        speedlines:1) echo "sens" ;;
+        speedlines:2) echo "density" ;;
+        paintflow:1) echo "strength" ;;
+        paintflow:2) echo "decay" ;;
         *:1) echo "param" ;;
         *) echo "p$slot" ;;
     esac
@@ -275,6 +291,10 @@ param_step() {
         nightvision:2)  echo 5 ;;
         badtv:2)        echo 0.5 ;;
         ghosts:2)       echo 0.5 ;;
+        styleai:2)      echo 0.05 ;;
+        styleai:3)      echo 32 ;;
+        moodfx:2)       echo 0.1 ;;
+        paintflow:2)    echo 0.01 ;;
         clones:2)       echo 0.5 ;;
         clones:3)       echo 0.05 ;;
         meltdown:2)     echo 0.05 ;;
@@ -330,6 +350,8 @@ default_step() {
         scatter|vhs) echo 0.05 ;;
         outline|symmetry) echo 1 ;;
         timebubble) echo 0.25 ;;
+        cvcartoon|cvstylize|opticalflow|bgsub|paintflow|speedlines) echo 0.05 ;;
+        cvpencil|facefx|personfx|styleai|moodfx) echo 1 ;;
         *) echo 0.1 ;;
     esac
 }
@@ -419,6 +441,10 @@ default_param_for() {
         outline) echo 2 ;;
         symmetry) echo 0 ;;
         timebubble) echo 1.5 ;;
+        cvcartoon|cvstylize|opticalflow) echo 0.6 ;;
+        bgsub) echo 0.5 ;;
+        cvpencil) echo 1 ;;
+        facefx|personfx|styleai|moodfx) echo 0 ;;
         *) echo 1 ;;
     esac
 }
@@ -476,6 +502,7 @@ FILTER_CATEGORIES=(
     "Artistic:ascii duotone sketch"
     "AI-Craze:predator shards portal heattrail wormhole magnet liquid nightvision badtv ghosts"
     "Craze-2:clones meltdown rotozoom starfield lightning scatter vhs outline symmetry timebubble"
+    "OpenCV:cvcartoon cvpencil cvstylize opticalflow bgsub facefx personfx styleai moodfx paintflow speedlines"
 )
 
 # Show an interactive picker, return chosen filter name on stdout

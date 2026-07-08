@@ -65,6 +65,53 @@ restrictions on vcam's own source.
       is not part of vcam's source or binary.
 
 
+Optional OpenCV components
+==========================
+
+These are used ONLY when vcam is built with `make OPENCV=1`. The default
+build does not link or depend on any of them.
+
+  OpenCV 5 (linked when OPENCV=1)
+      Licensed under the Apache License 2.0. Used for the optional cv*
+      filters (cartoon, pencil, stylize, optical flow, background
+      subtraction, face and person effects). https://opencv.org
+
+      Note on licensing: OpenCV is an optional, separately-installed system
+      library that vcam links against only when explicitly built with
+      OPENCV=1. vcam does not bundle or redistribute OpenCV. If you intend
+      to redistribute a binary built with OPENCV=1, be aware that Apache
+      2.0 and GPL-2.0-only are considered incompatible for forming a single
+      combined work; the default vcam build links no Apache-2.0 code and is
+      unaffected. Building with OPENCV=1 for personal use is fine.
+
+  YuNet face detection model — face_detection_yunet_2023mar.onnx
+      Licensed under the MIT License. Downloaded on request by
+      'vcam-setup --models' from the OpenCV model repository; not bundled
+      with vcam. Copyright (C) Shenzhen Institute of Artificial
+      Intelligence and Robotics for Society.
+      https://github.com/ShiqiYu/libfacedetection
+
+  PP-HumanSeg segmentation model — human_segmentation_pphumanseg_2023mar.onnx
+      Licensed under the Apache License 2.0. Downloaded on request by
+      'vcam-setup --models'; not bundled with vcam. Originates from
+      PaddlePaddle/PaddleSeg. https://github.com/PaddlePaddle/PaddleSeg
+
+  MobileFaceNet facial expression model —
+  facial_expression_recognition_mobilefacenet_2022july.onnx
+      Licensed under the Apache License 2.0. Downloaded on request by
+      'vcam-setup --models'; not bundled. From the OpenCV Zoo.
+
+  Fast neural style transfer models — mosaic-9 / candy-9 /
+  rain-princess-9 / udnie-9 / pointilism-9 (.onnx)
+      Licensed under the MIT License (ONNX Project Contributors).
+      Downloaded on request by 'vcam-setup --models-style' from the ONNX
+      Model Zoo mirror (huggingface.co/onnxmodelzoo); not bundled.
+      Originals from pytorch/examples fast_neural_style.
+
+  None of the model files above are distributed with vcam; each is fetched by the
+  user from its upstream source and retains its own license above.
+
+
 The fonts embedded in filter.c (the 8x8 ASCII-art glyph ramp and the VHS
 timecode digits) are original bitmap data created for this project and are
 covered by vcam's GPL-2.0 license along with the rest of the source.

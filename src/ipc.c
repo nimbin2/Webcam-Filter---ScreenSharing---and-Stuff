@@ -25,6 +25,7 @@
  */
 
 #include "vcam.h"
+#include "vcam_cv.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -295,6 +296,34 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   outline <thick> [<huespd>](*) marching-ants lasso traces whatever MOVES");
             send_line(client_fd, "OK   symmetry <mode>               face symmetry: 0=left mirrored, 1=right, 2=quad");
             send_line(client_fd, "OK   timebubble <delay_s> [<radius>](*) a drifting bubble shows THE PAST inside it");
+            send_line(client_fd, "OK");
+            if (cv_available()) {
+                char cvline[256];
+                snprintf(cvline, sizeof cvline, "OK OpenCV-backed (%s):", cv_engine_info());
+                send_line(client_fd, cvline);
+            } else {
+                send_line(client_fd, "OK OpenCV-backed (NOT in this build — rebuild with 'make OPENCV=1' to enable):");
+            }
+            send_line(client_fd, "OK   cvcartoon <strength>          edge-preserving cartoon with ink outlines");
+            send_line(client_fd, "OK   cvpencil <color>              pencil sketch: 1=color, 0=graphite");
+            send_line(client_fd, "OK   cvstylize <strength>          watercolor / poster stylization");
+            send_line(client_fd, "OK   opticalflow <mix>             motion visualized as flowing color");
+            send_line(client_fd, "OK   bgsub <sensitivity>           moving foreground vivid, static background dimmed");
+            send_line(client_fd, "OK   facefx <mode>                 YuNet faces: 0=blur 1=ring+dots 2=googly-eyes (needs model)");
+            send_line(client_fd, "OK   personfx <mode>               person seg (needs model): 0=blur-bg 1=spotlight 2=gradient-bg");
+            send_line(client_fd, "OK                                    3=YOUR-image-bg (filter bgimage <path>) 4=INVISIBILITY CLOAK 5=neon person");
+            send_line(client_fd, "OK   styleai <style> [<blend> <size>] LIVE NEURAL STYLE TRANSFER: 0=mosaic 1=candy 2=rain-princess 3=udnie 4=pointilism");
+            send_line(client_fd, "OK                                    blend 0..1 mixes with original; size 96..384 = quality vs speed");
+            send_line(client_fd, "OK   moodfx <mode> [<gain>]         EMOTION-REACTIVE: model reads your expression, effect responds");
+            send_line(client_fd, "OK                                    0=aura 1=HUD 2=party 3=EMOJI face 4=PAINTMOOD (emotion picks the neural style!)");
+            send_line(client_fd, "OK   paintflow <strength> [<decay>] motion smears reality like wet paint (dense optical flow)");
+            send_line(client_fd, "OK   facefx extra modes: 3=BIGHEAD (inflated tracked head) 4=deal-with-it sunglasses");
+            send_line(client_fd, "OK   personfx extra modes: 6=CLONE ARMY 7=WINDOW-3D (head-coupled parallax) 8=CHRONO CLONES (past-selves trail)");
+            send_line(client_fd, "OK   facefx extra modes: 5=LASER EYES 6=BOBBLEHEAD 7=THIRD EYE 8=CROWN");
+            send_line(client_fd, "OK   personfx extra modes: 9=TINY YOU (desk gnome) 10=HOLOGRAM YOU (cyan flicker projection)");
+            send_line(client_fd, "OK   speedlines <sens> [<density>] anime motion lines streak in when you move fast");
+            send_line(client_fd, "OK   filter bgimage <path|off>      set the background image for personfx mode 3");
+            send_line(client_fd, "OK   (face/person models: run 'vcam-setup --models' to download)");
             return;
         }
 
@@ -418,6 +447,33 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 return;
             }
             send_line(client_fd, "OK mathwarp recolor updated (needs the 'mathwarp' filter active)");
+            return;
+        }
+
+        if (strcmp(sub, "bgimage") == 0) {
+            /* filter bgimage <path> — background image for personfx mode 3
+             * filter bgimage off    — remove it (mode 3 falls back to gradient) */
+            char *path = strtok_r(NULL, "", &save);   /* rest of line (paths may have spaces) */
+            while (path && (*path == ' ' || *path == '\t')) path++;
+            if (!path || !*path) {
+                send_line(client_fd, "ERR usage: filter bgimage </abs/path/to/image.jpg | off>");
+                send_line(client_fd, "ERR   used by: filter add personfx 3   (person stays, background becomes your image)");
+                return;
+            }
+            if (!strcmp(path, "off") || !strcmp(path, "none")) {
+                cv_clear_bg_image();
+                send_line(client_fd, "OK background image cleared (personfx 3 shows the gradient)");
+                return;
+            }
+            if (!cv_available()) {
+                send_line(client_fd, "ERR this build has no OpenCV (rebuild with 'make OPENCV=1')");
+                return;
+            }
+            if (cv_set_bg_image(path)) {
+                send_line(client_fd, "OK background image loaded — add/keep 'personfx 3' to use it");
+            } else {
+                send_line(client_fd, "ERR could not load image (check the path; PNG/JPEG supported)");
+            }
             return;
         }
 
@@ -555,6 +611,18 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
     if (strcmp(cmd, "quit") == 0) {
         send_line(client_fd, "OK bye");
         return; /* connection will be closed after return */
+    }
+
+    /* ── opencv — report build info + DNN engine ── */
+    if (strcmp(cmd, "opencv") == 0) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "OK %s", cv_engine_info());
+        send_line(client_fd, buf);
+        if (cv_available()) {
+            snprintf(buf, sizeof buf, "OK model dir: %s", cv_model_dir());
+            send_line(client_fd, buf);
+        }
+        return;
     }
 
     /* ── remove <id> ── */

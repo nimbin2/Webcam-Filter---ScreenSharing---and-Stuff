@@ -34,6 +34,7 @@
  */
 
 #include "vcam.h"
+#include "vcam_cv.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -401,5 +402,6 @@ int main(int argc, char *argv[])
     if (cap) capture_close(cap);
     registry_destroy(&g_registry);
     filter_chain_destroy(&g_filters);
+    cv_shutdown();   /* free any OpenCV state (no-op in non-OpenCV builds) */
     return 0;
 }
