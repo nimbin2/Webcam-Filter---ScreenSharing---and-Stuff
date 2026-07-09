@@ -45,11 +45,28 @@ LDFLAGS := $(shell pkg-config --libs libavcodec libavformat libavutil libswscale
 #   sudo make install        <- installs the OpenCV flavor, as intended
 # just works. An explicit OPENCV=0/1 on the command line always wins,
 # and 'make clean' resets the memory.
-LAST_OPENCV := $(patsubst .built-opencv-%,%,$(firstword $(wildcard .built-opencv-*)))
+LAST_STAMP  := $(firstword $(wildcard .built-opencv-*))
+# stamp form: .built-opencv-<0|1>-ort-<0|1> ; split on '-' ->
+#   word1=".built" word2="opencv" word3=<0|1> word4="ort" word5=<0|1>
+LAST_OPENCV := $(word 3,$(subst -, ,$(LAST_STAMP)))
+LAST_ORT    := $(word 5,$(subst -, ,$(LAST_STAMP)))
 ifeq ($(strip $(LAST_OPENCV)),)
     OPENCV ?= 0
 else
     OPENCV ?= $(LAST_OPENCV)
+endif
+ifeq ($(strip $(LAST_ORT)),)
+    ORT ?= 0
+else
+    ORT ?= $(LAST_ORT)
+endif
+# the stamp file's CONTENT stores the ORT_HOME used, so plain
+# 'sudo make install' after 'make OPENCV=1 ORT=1 ORT_HOME=…' just works
+ifneq ($(strip $(LAST_STAMP)),)
+    LAST_ORT_HOME := $(strip $(shell cat $(LAST_STAMP) 2>/dev/null))
+    ifneq ($(strip $(LAST_ORT_HOME)),)
+        ORT_HOME ?= $(LAST_ORT_HOME)
+    endif
 endif
 
 ifeq ($(OPENCV),1)
@@ -89,6 +106,34 @@ else
     CFLAGS   += -DVCAM_HAVE_OPENCV=0
 endif
 
+# ── Optional ONNX Runtime backend (ORT=1) ──────────────────────────
+# Runs the RVM video-matting model CORRECTLY (OpenCV 5's young graph
+# engine loads it but miscomputes it — verified). Opt-in:
+#
+#   vcam-setup --ort            # one-time: fetch onnxruntime to
+#                               #   ~/.local/share/vcam/onnxruntime
+#   make OPENCV=1 ORT=1         # build with the backend
+#
+# ORT_HOME points at a directory containing include/onnxruntime_c_api.h
+# and lib/libonnxruntime.so; override it for a custom install:
+#   make OPENCV=1 ORT=1 ORT_HOME=/opt/onnxruntime
+ifeq ($(ORT),1)
+    ifneq ($(OPENCV),1)
+        $(error ORT=1 requires OPENCV=1 (the matting pipeline lives in the OpenCV shim))
+    endif
+    ORT_HOME ?= $(HOME)/.local/share/vcam/onnxruntime
+    ifeq ($(wildcard $(ORT_HOME)/include/onnxruntime_c_api.h),)
+        ifeq ($(filter clean uninstall,$(MAKECMDGOALS)),)
+            $(error ORT=1 but $(ORT_HOME)/include/onnxruntime_c_api.h not found. Run 'vcam-setup --ort' first, or set ORT_HOME=<dir>)
+        endif
+    endif
+    CFLAGS  += -DVCAM_HAVE_ORT=1 -isystem $(ORT_HOME)/include
+    LDFLAGS += -L$(ORT_HOME)/lib -lonnxruntime -Wl,-rpath,$(ORT_HOME)/lib
+    $(info vcam: ONNX Runtime backend enabled — $(ORT_HOME))
+else
+    CFLAGS  += -DVCAM_HAVE_ORT=0
+endif
+
 # ── Install paths (overridable) ─────────────────────────────────────
 #   make install                       (default: /usr/local)
 #   make install PREFIX=$HOME/.local   (user-local)
@@ -100,7 +145,7 @@ DATADIR ?= $(PREFIX)/share/vcam
 
 SRCS := src/main.c src/frame.c src/capture.c src/output.c \
         src/overlay.c src/registry.c src/ipc.c src/filter.c \
-        src/record.c
+        src/record.c src/ort_rvm.c
 OBJS := $(SRCS:.c=.o) $(CV_OBJ)
 BIN  := vcam
 TEST := test_screen
@@ -113,7 +158,7 @@ TEST := test_screen
 # 'make install' after 'make OPENCV=1' fail-safe: without the stamp,
 # plain 'make install' (OPENCV defaulting to 0) would silently relink
 # and install the stub flavor over your OpenCV build.
-CONFIG_STAMP := .built-opencv-$(OPENCV)
+CONFIG_STAMP := .built-opencv-$(OPENCV)-ort-$(ORT)
 
 .PHONY: all clean install uninstall
 
@@ -121,12 +166,20 @@ all: $(BIN) $(TEST)
 
 $(CONFIG_STAMP):
 	@rm -f .built-opencv-*
+ifeq ($(ORT),1)
+	@printf '%s\n' '$(ORT_HOME)' > $@
+else
 	@touch $@
+endif
 
 $(BIN): $(OBJS) $(CONFIG_STAMP)
 	$(LINK) -o $@ $(OBJS) $(LDFLAGS)
 ifeq ($(OPENCV),1)
+ifeq ($(ORT),1)
+	@echo "vcam: linked WITH OpenCV filters ($(OPENCV_PC) $(CV_VER)) + ONNX Runtime backend"
+else
 	@echo "vcam: linked WITH OpenCV filters ($(OPENCV_PC) $(CV_VER))"
+endif
 else
 	@echo "vcam: linked WITHOUT OpenCV filters (build with 'make OPENCV=1' to enable)"
 endif
@@ -145,7 +198,11 @@ src/opencv_fx.o: src/opencv_fx.cpp include/vcam_cv.h
 
 install: $(BIN)
 ifeq ($(OPENCV),1)
+ifeq ($(ORT),1)
+	@echo "Installing vcam WITH OpenCV filters ($(OPENCV_PC) $(CV_VER)) + ONNX Runtime backend."
+else
 	@echo "Installing vcam WITH OpenCV filters ($(OPENCV_PC) $(CV_VER))."
+endif
 else
 	@echo "Installing vcam WITHOUT OpenCV filters."
 	@echo "  (If you built with 'make OPENCV=1', install with 'sudo make install OPENCV=1'"

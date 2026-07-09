@@ -26,6 +26,7 @@
 
 #include "vcam.h"
 #include "vcam_cv.h"
+#include "vcam_ort.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -317,12 +318,13 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   styleai <style> [<blend> <size>] LIVE NEURAL STYLE TRANSFER: 0=mosaic 1=candy 2=rain-princess 3=udnie 4=pointilism");
             send_line(client_fd, "OK                                    blend 0..1 mixes with original; size 96..384 = quality vs speed");
             send_line(client_fd, "OK   moodfx <mode> [<gain>]         EMOTION-REACTIVE: model reads your expression, effect responds");
-            send_line(client_fd, "OK                                    0=aura 1=HUD 2=party 3=EMOJI face 4=PAINTMOOD (emotion picks the neural style!)");
+            send_line(client_fd, "OK                                    0=aura 1=HUD 2=party 3=EMOJI 4=PAINTMOOD 5=AUTO-GRADE (cinematic grade by emotion)");
             send_line(client_fd, "OK   paintflow <strength> [<decay>] motion smears reality like wet paint (dense optical flow)");
             send_line(client_fd, "OK   facefx extra modes: 3=BIGHEAD (inflated tracked head) 4=deal-with-it sunglasses");
             send_line(client_fd, "OK   personfx extra modes: 6=CLONE ARMY 7=WINDOW-3D (head-coupled parallax) 8=CHRONO CLONES (past-selves trail)");
-            send_line(client_fd, "OK   facefx extra modes: 5=LASER EYES 6=BOBBLEHEAD 7=THIRD EYE 8=CROWN");
-            send_line(client_fd, "OK   personfx extra modes: 9=TINY YOU (desk gnome) 10=HOLOGRAM YOU (cyan flicker projection)");
+            send_line(client_fd, "OK   facefx extra modes: 5=LASERS 6=BOBBLE 7=3RD-EYE 8=CROWN 9=MIRROR 10=CYCLOPS 11=HEART-EYES 12=INTERROGATE 13=TARGET-LOCK");
+            send_line(client_fd, "OK   personfx extra modes: 9=TINY 10=HOLOGRAM 11=RAINBOW-AURA 12=PAINTED-WORLD 13=BODY-PIXELATE 14=GRAVITY-FLIP");
+            send_line(client_fd, "OK                                    15=MOTION-ECHO (comet trail of past poses) 16=DOUBLE-EXPOSURE (room shows through you)");
             send_line(client_fd, "OK   speedlines <sens> [<density>] anime motion lines streak in when you move fast");
             send_line(client_fd, "OK   filter bgimage <path|off>      set the background image for personfx mode 3");
             send_line(client_fd, "OK   (face/person models: run 'vcam-setup --models' to download)");
@@ -623,6 +625,15 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
         if (cv_available()) {
             snprintf(buf, sizeof buf, "OK model dir: %s", cv_model_dir());
             send_line(client_fd, buf);
+        }
+        if (ort_available()) {
+            snprintf(buf, sizeof buf,
+                     "OK ONNX Runtime backend: v%s (RVM matting runs here)",
+                     ort_version());
+            send_line(client_fd, buf);
+        } else {
+            send_line(client_fd, "OK ONNX Runtime backend: not built in "
+                      "(vcam-setup --ort, then make OPENCV=1 ORT=1)");
         }
         return;
     }

@@ -65,6 +65,16 @@ restrictions on vcam's own source.
       is not part of vcam's source or binary.
 
 
+Optional ONNX Runtime backend
+=============================
+
+  ONNX Runtime (linked when built with ORT=1; default build does not)
+      Licensed under the MIT License. An optional, separately-installed
+      inference runtime ('vcam-setup --ort') used to run the RVM matting
+      model correctly. Not bundled or redistributed with vcam.
+      https://onnxruntime.ai
+
+
 Optional OpenCV components
 ==========================
 
@@ -107,6 +117,12 @@ build does not link or depend on any of them.
       Downloaded on request by 'vcam-setup --models-style' from the ONNX
       Model Zoo mirror (huggingface.co/onnxmodelzoo); not bundled.
       Originals from pytorch/examples fast_neural_style.
+
+  RVM — Robust Video Matting (rvm_mobilenetv3_fp32.onnx)
+      Licensed under the GPL-3.0 license. Downloaded on request by
+      'vcam-setup --models-rvm' from the official GitHub release
+      (PeterL1n/RobustVideoMatting); not bundled with vcam. Used as an
+      optional higher-quality matting engine for the personfx filter.
 
   None of the model files above are distributed with vcam; each is fetched by the
   user from its upstream source and retains its own license above.

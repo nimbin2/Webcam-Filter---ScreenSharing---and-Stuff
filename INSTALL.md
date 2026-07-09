@@ -126,6 +126,28 @@ decides which code path is compiled. If nothing is found, `make
 OPENCV=1` stops with a clear message; you can force a name with
 `OPENCV_PC=<name>`.
 
+### Best matting quality: the ONNX Runtime backend
+
+OpenCV 5's new DNN engine *loads* the RVM video-matting model but
+currently **miscomputes** it (verified: empty mattes). ONNX Runtime is
+RVM's reference runtime and computes it correctly. Enabling it gives
+`personfx` its best-quality engine — temporally stable, hair-level
+mattes:
+
+```bash
+vcam-setup --ort              # fetch onnxruntime (MIT, ~60 MB, one-time)
+vcam-setup --models-rvm       # fetch the RVM model if you haven't
+make OPENCV=1 ORT=1
+sudo make install             # the build remembers ORT=1 afterwards
+pkill vcam; vcam &
+vcam-ctl opencv               # should report the ONNX Runtime backend
+```
+
+vcam picks matting engines in order: ONNX-Runtime RVM → OpenCV-DNN RVM
+(auto-disabled if it produces empty mattes) → PP-HumanSeg. Every step
+falls back automatically, so a missing library or model never breaks
+the filter. `ORT_HOME=<dir>` overrides the library location.
+
 ### Model files (for `facefx` and `personfx`)
 
 The five classic OpenCV filters work immediately. The two DNN-based ones

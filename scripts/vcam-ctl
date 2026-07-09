@@ -99,6 +99,53 @@
 
 SOCK="${VCAM_SOCK:-/tmp/vcam.sock}"
 
+# ── ai "<text>": tell vcam what you want in plain words ─────
+# Deterministic keyword router (local, no cloud). Examples:
+#   vcam-ctl ai "make me invisible"     vcam-ctl ai "hologram with laser eyes"
+#   vcam-ctl ai "blur my background"    vcam-ctl ai "reset"
+if [ "${1:-}" = "ai" ]; then
+    shift
+    T=$(printf '%s' "$*" | tr '[:upper:]' '[:lower:]')
+    [ -z "$T" ] && { echo "usage: vcam-ctl ai \"what you want\""; exit 1; }
+    ADDED=0
+    say() { printf '  + %s\n' "$1"; }
+    fadd() { "$0" filter add $1 >/dev/null 2>&1 && { say "$2"; ADDED=$((ADDED+1)); }; }
+    case "$T" in *reset*|*normal*|*clear*) "$0" filter clear >/dev/null 2>&1; echo "  cleared all filters"; exit 0;; esac
+    case "$T" in *invisib*|*disappear*|*vanish*) fadd "personfx 4" "invisibility cloak";; esac
+    case "$T" in *hologram*) fadd "personfx 10" "hologram you";; esac
+    case "$T" in *laser*) fadd "facefx 5" "laser eyes";; esac
+    case "$T" in *blur*back*|*back*blur*|*portrait*) fadd "personfx 0" "background blur";; esac
+    case "$T" in *clone*|*army*) fadd "personfx 6" "clone army";; esac
+    case "$T" in *tiny*|*shrink*) fadd "personfx 9" "tiny you";; esac
+    case "$T" in *upside*|*flip*|*gravity*) fadd "personfx 14" "gravity flip";; esac
+    case "$T" in *3d*|*window*|*parallax*) fadd "personfx 7" "window-3D";; esac
+    case "$T" in *ghost*|*trail*|*echo*) fadd "personfx 15" "motion echo";; esac
+    case "$T" in *crown*|*king*|*queen*) fadd "facefx 8" "crown";; esac
+    case "$T" in *sunglass*|*shades*) fadd "facefx 4" "sunglasses";; esac
+    case "$T" in *googly*) fadd "facefx 2" "googly eyes";; esac
+    case "$T" in *bighead*|*bobble*) fadd "facefx 6" "bobblehead";; esac
+    case "$T" in *cyclop*) fadd "facefx 10" "cyclops";; esac
+    case "$T" in *heart*) fadd "facefx 11" "heart eyes";; esac
+    case "$T" in *anonym*|*privacy*) fadd "facefx 0" "face pixelate";; esac
+    case "$T" in *confetti*|*smile*|*party*) fadd "moodfx 2" "emotion party";; esac
+    case "$T" in *emoji*) fadd "moodfx 3" "emoji face";; esac
+    case "$T" in *red*|*warm*) fadd "duotone 0.8" "red-warm duotone";; esac
+    case "$T" in *paint*|*style*|*art*) fadd "styleai 1 0.85" "neural style (candy)";; esac
+    case "$T" in *mosaic*) fadd "styleai 0 0.85" "neural style (mosaic)";; esac
+    case "$T" in *smear*|*liquid*) fadd "paintflow 1.5" "paint smear";; esac
+    case "$T" in *anime*|*speed*) fadd "speedlines 1.5" "anime lines";; esac
+    case "$T" in *cartoon*) fadd "cvcartoon 0.7" "cartoon";; esac
+    case "$T" in *sketch*|*pencil*) fadd "cvpencil 1" "pencil sketch";; esac
+    if [ "$ADDED" -eq 0 ]; then
+        echo "  didn't recognize an effect. Try: invisible, hologram, laser,"
+        echo "  blur background, clones, tiny, crown, confetti, painting,"
+        echo "  cartoon, anime, red, reset"
+        exit 1
+    fi
+    exit 0
+fi
+
+
 show_help() { sed -n '/^# vcam-ctl/,/^$/p' "$0" | sed 's/^# \?//'; }
 
 # ── basic usage / help ───────────────────────────────────────

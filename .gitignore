@@ -6,7 +6,6 @@
 *.so.*
 vcam
 test_screen
-.built-opencv-1
 
 # Distribution archives
 *.tar.gz

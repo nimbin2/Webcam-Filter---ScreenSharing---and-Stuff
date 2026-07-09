@@ -27,6 +27,8 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     echo "  sudo vcam-setup --uninstall  remove it"
     echo "  vcam-setup --models          download the OpenCV model files (face/person/emotion)"
     echo "  vcam-setup --models-style    download the 5 neural style transfer models"
+    echo "  vcam-setup --models-rvm      download RVM video matting (best personfx quality)"
+    echo "  vcam-setup --ort             download ONNX Runtime (runs RVM correctly)"
     exit 0
 fi
 
@@ -92,6 +94,88 @@ if [ "${1:-}" = "--models" ]; then
         echo "If you built without OpenCV, rebuild with:  make OPENCV=1 && sudo make install"
     fi
     exit "$rc"
+fi
+
+# ── ONNX Runtime: the backend that runs RVM correctly ────────
+# OpenCV 5's young DNN graph engine loads RVM but miscomputes it
+# (empty mattes). ONNX Runtime is RVM's reference runtime. This
+# fetches the official prebuilt library (MIT license, ~60 MB) into
+# ~/.local/share/vcam/onnxruntime, then vcam is rebuilt with ORT=1.
+if [ "${1:-}" = "--ort" ]; then
+    ORT_VER="${VCAM_ORT_VERSION:-1.27.0}"
+    ORT_DIR="${VCAM_ORT_DIR:-$HOME/.local/share/vcam/onnxruntime}"
+    F="onnxruntime-linux-x64-$ORT_VER.tgz"
+    U="https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VER/$F"
+    if [ -e "$ORT_DIR/include/onnxruntime_c_api.h" ]; then
+        echo "already installed: $ORT_DIR"
+        echo "build with:  make OPENCV=1 ORT=1 && sudo make install"
+        exit 0
+    fi
+    if command -v curl >/dev/null 2>&1; then DL="curl -fL --retry 3 -o";
+    elif command -v wget >/dev/null 2>&1; then DL="wget -O";
+    else echo "Error: need curl or wget." >&2; exit 1; fi
+    TMP="${TMPDIR:-/tmp}/vcam-ort.$$"
+    mkdir -p "$TMP" "$ORT_DIR" || { echo "Error: cannot create dirs" >&2; exit 1; }
+    echo "downloading ONNX Runtime $ORT_VER (~60 MB) ..."
+    # shellcheck disable=SC2086
+    if $DL "$TMP/$F" "$U" && [ -s "$TMP/$F" ]; then
+        tar -xzf "$TMP/$F" -C "$ORT_DIR" --strip-components=1
+        rm -rf "$TMP"
+        if [ -e "$ORT_DIR/include/onnxruntime_c_api.h" ]; then
+            echo "ok: $ORT_DIR"
+            echo ""
+            echo "Now rebuild vcam with the backend:"
+            echo "    make OPENCV=1 ORT=1 && sudo make install"
+            echo "    pkill vcam; vcam &"
+            echo "(and make sure the RVM model is there: vcam-setup --models-rvm)"
+        else
+            echo "extraction looks wrong — check $ORT_DIR" >&2; exit 1
+        fi
+    else
+        rm -rf "$TMP"
+        echo "FAILED to download. Manual route:" >&2
+        echo "  1. fetch $U" >&2
+        echo "  2. tar -xzf $F --strip-components=1 -C $ORT_DIR" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# ── RVM: Robust Video Matting (recommended personfx upgrade) ─
+# A recurrent video-native matting network: temporally stable, hair-
+# level alpha. GPL-3.0 licensed weights, fetched from the official
+# GitHub release; ~15 MB. vcam uses it automatically when present and
+# falls back to PP-HumanSeg when not (or if this OpenCV can't load it).
+if [ "${1:-}" = "--models-rvm" ]; then
+    if [ "${2:-}" = "--system" ]; then
+        MODEL_DIR="${VCAM_MODEL_DIR:-/usr/local/share/vcam/models}"
+    else
+        MODEL_DIR="${VCAM_MODEL_DIR:-$HOME/.local/share/vcam/models}"
+    fi
+    if command -v curl >/dev/null 2>&1; then DL="curl -fL --retry 3 -o";
+    elif command -v wget >/dev/null 2>&1; then DL="wget -O";
+    else echo "Error: need curl or wget." >&2; exit 1; fi
+    mkdir -p "$MODEL_DIR" || { echo "Error: cannot create $MODEL_DIR" >&2; exit 1; }
+    F="rvm_mobilenetv3_fp32.onnx"
+    U="https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/$F"
+    if [ -s "$MODEL_DIR/$F" ]; then
+        echo "already have $F"
+        exit 0
+    fi
+    echo "downloading $F (~15 MB) ..."
+    # shellcheck disable=SC2086
+    if $DL "$MODEL_DIR/$F.part" "$U" && [ -s "$MODEL_DIR/$F.part" ]; then
+        mv "$MODEL_DIR/$F.part" "$MODEL_DIR/$F"
+        echo "ok: $MODEL_DIR/$F"
+        echo "Restart vcam; personfx will pick it up automatically."
+        echo "(If your OpenCV can't run it, vcam prints a note and falls back.)"
+    else
+        rm -f "$MODEL_DIR/$F.part"
+        echo "FAILED — check your network, or download manually from:" >&2
+        echo "  $U" >&2
+        exit 1
+    fi
+    exit 0
 fi
 
 # ── Neural style transfer models ─────────────────────────────

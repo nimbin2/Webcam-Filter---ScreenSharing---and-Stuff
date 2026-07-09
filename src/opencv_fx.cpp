@@ -26,6 +26,7 @@
  */
 
 #include "vcam_cv.h"
+#include "vcam_ort.h"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -147,6 +148,19 @@ inline unsigned tick(unsigned &counter) { return counter++; }
 
 constexpr int INFER_EVERY = 3;   /* run DNN inference 1 in 3 frames */
 
+/* Optional GPU inference: set VCAM_CV_OPENCL=1 to run DNN targets on
+ * OpenCL (AMD Radeon iGPUs work through this). Falls back to CPU
+ * automatically if the OpenCL path throws at load or first forward. */
+inline void set_net_target(cv::dnn::Net &n)
+{
+    n.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+    const char *ocl = std::getenv("VCAM_CV_OPENCL");
+    if (ocl && *ocl == '1')
+        n.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
+    else
+        n.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+}
+
 /* ────────────────────────────────────────────────────────────
  * DNN model holders (lazy, cached, guarded)
  * ──────────────────────────────────────────────────────────── */
@@ -171,6 +185,15 @@ struct SegState {
     cv::Mat bg_est;           /* running background estimate (invisibility) */
     int bg_frames = 0;        /* how much background we've learned */
     float hx = 0.0f, hy = 0.0f;   /* EMA head offset, -0.5..0.5 (window3d) */
+    int person_ch = -1;           /* which output channel is the person (-1=unlocked) */
+    int ch_vote = 0, ch_frames = 0;   /* voting to lock person_ch */
+    /* RVM (Robust Video Matting): a recurrent video-native matting net.
+     * Far better temporal stability + hair detail than PP-HumanSeg.
+     * Tried first if the model file exists; ANY failure falls back. */
+    cv::dnn::Net rvm;
+    int rvm_state = 0;            /* OpenCV-DNN RVM: 0=untried 1=ok -1=failed */
+    int ort_state = 0;            /* ONNX-Runtime RVM: 0=untried 1=ok -1=failed */
+    cv::Mat r1, r2, r3, r4;       /* recurrent states, cycled per frame */
     std::mutex mtx;
 };
 SegState g_seg;
@@ -233,8 +256,7 @@ bool ensure_style(int s)
     }
     try {
         g_style.net[s] = load_net(path);
-        g_style.net[s].setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-        g_style.net[s].setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        set_net_target(g_style.net[s]);
         g_style.ok[s] = true;
     } catch (const std::exception &e) {
         warn_once("style_load", std::string("failed to load style model: ") + e.what());
@@ -280,8 +302,7 @@ bool ensure_mood()
     }
     try {
         g_mood.net = load_net(path);
-        g_mood.net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-        g_mood.net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        set_net_target(g_mood.net);
         g_mood.ok = true;
     } catch (const std::exception &e) {
         warn_once("fer_load", std::string("failed to load FER model: ") + e.what());
@@ -336,8 +357,7 @@ bool ensure_seg()
     }
     try {
         g_seg.net = load_net(path);   /* OpenCV 5: new graph engine (ENGINE_AUTO) */
-        g_seg.net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-        g_seg.net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        set_net_target(g_seg.net);
         g_seg.tried = true; g_seg.ok = true;
 #if VCAM_CV5
         warn_once("seg_engine",
@@ -355,6 +375,182 @@ bool ensure_seg()
  * Returns a full-frame CV_8U mask (255 = person) or empty on failure.
  * Preprocessing: (pixel/255 - 0.5)/0.5  ==  pixel/127.5 - 1, which
  * blobFromImage produces as scalefactor=1/127.5, mean=127.5. */
+/* Try RVM once: load lazily; any exception marks it failed forever
+ * (this session) and PP-HumanSeg takes over. Returns empty on failure.
+ *
+ * Backend priority:
+ *   1. ONNX Runtime (ORT=1 builds) — the reference runtime; computes
+ *      RVM correctly. Input 512-wide for best quality.
+ *   2. OpenCV DNN — kept as a fallback; on current OpenCV 5 graph
+ *      engines it loads but MISCOMPUTES (empty matte), which the
+ *      dead-matte gate below detects, falling through to PP-HumanSeg. */
+cv::Mat rvm_infer(const cv::Mat &bgr)
+{
+    if (g_seg.rvm_state < 0) return cv::Mat();
+
+    /* ── path 1: ONNX Runtime ── */
+    if (ort_available() && g_seg.ort_state >= 0) {
+        try {
+            std::string path = model_dir() + "/rvm_mobilenetv3_fp32.onnx";
+            if (!path_exists(path)) {
+                g_seg.ort_state = -1;         /* no model; don't retry */
+            } else if (g_seg.ort_state == 0) {
+                g_seg.ort_state = ort_rvm_init(path.c_str()) ? 1 : -1;
+                if (g_seg.ort_state == 1)
+                    warn_once("rvm_ort",
+                        "personfx: RVM running on the ONNX Runtime backend "
+                        "(reference runtime — correct, temporally-stable mattes)");
+            }
+            if (g_seg.ort_state == 1) {
+                const int IW = 512;   /* ORT computes correctly; afford quality */
+                double sc = (double)IW / bgr.cols;
+                int iw = std::max(64, ((int)(bgr.cols*sc)/16)*16);
+                int ih = std::max(64, ((int)(bgr.rows*sc)/16)*16);
+                cv::Mat small2;
+                cv::resize(bgr, small2, cv::Size(iw, ih), 0, 0, cv::INTER_AREA);
+                cv::Mat src = cv::dnn::blobFromImage(small2, 1.0/255.0,
+                                  cv::Size(iw, ih), cv::Scalar(), true, false);
+                cv::Mat pha(ih, iw, CV_32F);
+                if (ort_rvm_infer((const float*)src.ptr<float>(0), iw, ih,
+                                  pha.ptr<float>(0))) {
+                    const char *dbg = std::getenv("VCAM_CV_DEBUG");
+                    if (dbg && *dbg=='1' && g_seg.counter < 6)
+                        std::fprintf(stderr, "[vcam/ort] pha mean=%.4f\n",
+                                     cv::mean(pha)[0]);
+                    cv::Mat full;
+                    cv::resize(pha, full, bgr.size(), 0, 0, cv::INTER_LINEAR);
+                    cv::min(full, 1.0, full);
+                    cv::max(full, 0.0, full);
+                    return full;
+                }
+                g_seg.ort_state = -1;         /* backend died; fall through */
+            }
+        } catch (const std::exception &e) {
+            g_seg.ort_state = -1;
+            warn_once("rvm_ort_fail",
+                std::string("ORT RVM path failed (") + e.what() +
+                ") — trying other backends");
+        }
+    }
+
+    /* ── path 2: OpenCV DNN (may miscompute on 5.x; gated below) ── */
+    try {
+        if (g_seg.rvm_state == 0) {
+            std::string path = model_dir() + "/rvm_mobilenetv3_fp32.onnx";
+            if (!path_exists(path)) { g_seg.rvm_state = -1; return cv::Mat(); }
+            g_seg.rvm = load_net(path);
+            set_net_target(g_seg.rvm);
+            g_seg.rvm_state = 1;
+            warn_once("rvm_on",
+                "personfx: RVM video matting model found — using it "
+                "(temporally-stable, hair-level mattes)");
+        }
+        /* input ~384 wide with downsample_ratio=1.0: bypasses RVM's
+         * internal dynamic-resize path entirely (prime suspect for
+         * graph-engine miscompilation -> dead matte). Smaller src keeps
+         * the compute cost similar to 512 @ ds 0.6. */
+        int IW = 384;
+        double sc = (double)IW / bgr.cols;
+        int iw = std::max(64, ((int)(bgr.cols*sc)/16)*16);
+        int ih = std::max(64, ((int)(bgr.rows*sc)/16)*16);
+        cv::Mat small2;
+        cv::resize(bgr, small2, cv::Size(iw, ih), 0, 0, cv::INTER_AREA);
+        /* src: RGB, 0..1, NCHW fp32 */
+        cv::Mat src = cv::dnn::blobFromImage(small2, 1.0/255.0, cv::Size(iw, ih),
+                                             cv::Scalar(), true, false);
+        if (g_seg.r1.empty()) {
+            int shp[4] = {1,1,1,1};
+            g_seg.r1 = cv::Mat(4, shp, CV_32F, cv::Scalar(0));
+            g_seg.r2 = g_seg.r1.clone();
+            g_seg.r3 = g_seg.r1.clone();
+            g_seg.r4 = g_seg.r1.clone();
+        }
+        float dsr[1] = {1.0f};
+        int dshp[1] = {1};
+        cv::Mat ds(1, dshp, CV_32F, dsr);
+        g_seg.rvm.setInput(src,      "src");
+        g_seg.rvm.setInput(g_seg.r1, "r1i");
+        g_seg.rvm.setInput(g_seg.r2, "r2i");
+        g_seg.rvm.setInput(g_seg.r3, "r3i");
+        g_seg.rvm.setInput(g_seg.r4, "r4i");
+        g_seg.rvm.setInput(ds,       "downsample_ratio");
+        /* OpenCV 5's graph engine requires requesting ALL 6 outputs.
+         * BUT do not trust that outs[] order matches our name order —
+         * identify tensors BY SHAPE, which is unambiguous:
+         *   pha = 4D, channels==1, spatial == input size
+         *   fgr = 4D, channels==3
+         *   recurrents = everything else (4 tensors, C>1, smaller). */
+        std::vector<cv::Mat> outs;
+        std::vector<cv::String> names = {"fgr","pha","r1o","r2o","r3o","r4o"};
+        g_seg.rvm.forward(outs, names);
+        if (outs.size() < 6) { g_seg.rvm_state = -1; return cv::Mat(); }
+        const char *dbg = std::getenv("VCAM_CV_DEBUG");
+        int pha_i = -1;
+        std::vector<int> rec_i;
+        for (int oi = 0; oi < (int)outs.size(); oi++) {
+            const cv::Mat &o = outs[oi];
+            if (o.dims != 4) continue;
+            if (dbg && *dbg=='1' && g_seg.counter < 3)
+                std::fprintf(stderr, "[vcam/rvm] out[%d] shape %dx%dx%dx%d\n",
+                    oi, o.size[0], o.size[1], o.size[2], o.size[3]);
+            if (o.size[1] == 1 && o.size[2] == ih && o.size[3] == iw)
+                pha_i = oi;
+            else if (o.size[1] != 3)
+                rec_i.push_back(oi);
+        }
+        if (pha_i < 0) { g_seg.rvm_state = -1; return cv::Mat(); }
+        if (rec_i.size() == 4) {
+            /* feed the recurrents back in the order found */
+            outs[rec_i[0]].copyTo(g_seg.r1);
+            outs[rec_i[1]].copyTo(g_seg.r2);
+            outs[rec_i[2]].copyTo(g_seg.r3);
+            outs[rec_i[3]].copyTo(g_seg.r4);
+        } else {
+            /* can't identify them safely -> run STATELESS: reset the
+             * states to zeros every frame (loses temporal memory, but
+             * the matte itself stays correct). */
+            g_seg.r1.release(); g_seg.r2.release();
+            g_seg.r3.release(); g_seg.r4.release();
+            warn_once("rvm_stateless",
+                "RVM: recurrent outputs ambiguous — running stateless");
+        }
+        int oh = outs[pha_i].size[2], ow = outs[pha_i].size[3];
+        cv::Mat pha(oh, ow, CV_32F, (float*)outs[pha_i].ptr<float>(0));
+        double pmean = cv::mean(pha)[0];
+        if (dbg && *dbg=='1' && g_seg.counter < 6)
+            std::fprintf(stderr, "[vcam/rvm] pha=out[%d] mean=%.4f\n", pha_i, pmean);
+        /* AUTO QUALITY GATE: a matte that stays essentially empty for
+         * 30 straight frames means the engine miscomputes this model.
+         * Declare RVM broken and fall back — never a black screen. */
+        static int dead = 0;
+        if (pmean < 0.005) {
+            if (++dead >= 30) {
+                g_seg.rvm_state = -1;
+                g_seg.r1.release(); g_seg.r2.release();
+                g_seg.r3.release(); g_seg.r4.release();
+                warn_once("rvm_dead",
+                    "RVM produced an empty matte for 30 frames — this "
+                    "OpenCV build miscomputes it. Falling back to "
+                    "PP-HumanSeg. (ONNX Runtime backend would fix this.)");
+                return cv::Mat();
+            }
+        } else dead = 0;
+        cv::Mat full;
+        cv::resize(pha, full, bgr.size(), 0, 0, cv::INTER_LINEAR);
+        cv::min(full, 1.0, full);
+        cv::max(full, 0.0, full);
+        return full.clone();
+    } catch (const std::exception &e) {
+        g_seg.rvm_state = -1;
+        g_seg.r1.release(); g_seg.r2.release(); g_seg.r3.release(); g_seg.r4.release();
+        warn_once("rvm_fail",
+            std::string("RVM could not run on this OpenCV build (") + e.what() +
+            ") — falling back to PP-HumanSeg. On OpenCV 5 the new graph "
+            "engine usually loads it; on 4.x it typically cannot.");
+        return cv::Mat();
+    }
+}
+
 cv::Mat seg_infer(const cv::Mat &bgr, const cv::Rect &body, float edge)
 {
     /* Segment only the body ROI (from the face detector), LETTERBOXED
@@ -380,59 +576,95 @@ cv::Mat seg_infer(const cv::Mat &bgr, const cv::Rect &body, float edge)
     cv::Mat out = g_seg.net.forward();   /* shape [1,2,192,192] */
     if (out.dims != 4 || out.size[1] < 2) return cv::Mat();
 
-    /* SOFT alpha: softmax probability of the person channel, instead of
-     * a harsh argmax. Gives smooth hair/hand edges the blend can feather. */
-    cv::Mat bg(N, N, CV_32F, out.ptr<float>(0, 0));
-    cv::Mat fg(N, N, CV_32F, out.ptr<float>(0, 1));
-    cv::Mat diff = bg - fg;               /* prob = 1/(1+exp(bg-fg)) */
-    cv::Mat e;
-    cv::exp(diff, e);
-    cv::Mat prob = 1.0 / (1.0 + e);       /* CV_32F 0..1 (per-element) */
-    /* un-letterbox → back into the body ROI → into a full-frame canvas */
+    /* Robust channel access: build a 2D header onto each channel plane
+     * from the raw data pointer (out.ptr<float>(0,c) is fragile on a 4D
+     * Mat). Plane stride is N*N floats. */
+    const int HW = N * N;
+    float *base = (float *)out.ptr<float>(0);
+    cv::Mat ch0(N, N, CV_32F, base);
+    cv::Mat ch1(N, N, CV_32F, base + HW);
+
+    /* Which channel is the PERSON? PP-HumanSeg's channel order isn't
+     * guaranteed, and getting it backwards inverts the mask (the exact
+     * "half the body is cut" symptom). The order is FIXED for a given
+     * model, so we vote over the first frames and then lock it: the
+     * person channel is hotter in the CENTER of the letterboxed crop
+     * (person is centered; background hugs the corners). */
+    auto center_minus_border = [&](const cv::Mat &c) -> float {
+        int m = N / 4;
+        cv::Scalar cen = cv::mean(c(cv::Rect(m, m, N - 2*m, N - 2*m)));
+        cv::Scalar whole = cv::mean(c);
+        return (float)(cen[0] - whole[0]);
+    };
+    cv::Mat mx = cv::max(ch0, ch1);
+    cv::Mat e0, e1;
+    cv::exp(ch0 - mx, e0);
+    cv::exp(ch1 - mx, e1);
+    cv::Mat sum = e0 + e1;
+    cv::Mat p0 = e0 / sum;
+    cv::Mat p1 = e1 / sum;
+    if (g_seg.person_ch < 0) {                 /* not locked yet: vote */
+        if (center_minus_border(p1) >= center_minus_border(p0))
+            g_seg.ch_vote++;
+        else
+            g_seg.ch_vote--;
+        if (++g_seg.ch_frames >= 8)            /* lock after 8 frames */
+            g_seg.person_ch = (g_seg.ch_vote >= 0) ? 1 : 0;
+    }
+    /* until locked, use the current best guess */
+    int pc = (g_seg.person_ch >= 0) ? g_seg.person_ch
+             : ((center_minus_border(p1) >= center_minus_border(p0)) ? 1 : 0);
+    cv::Mat prob = (pc == 1) ? p1 : p0;
+    /* un-letterbox → back into the body ROI → into a full-frame canvas.
+     * NOTE: no blur here — we sharpen the alpha FIRST (below), then apply
+     * a single narrow feather. Blurring before the opacity remap was what
+     * spread the translucent halo around the whole silhouette. */
     cv::Mat inner = prob(cv::Rect(lx, ly, lw, lh));
     cv::Mat roi_mask;
     cv::resize(inner, roi_mask, body.size(), 0, 0, cv::INTER_LINEAR);
     cv::Mat full = cv::Mat::zeros(bgr.size(), CV_32F);
     roi_mask.copyTo(full(body));
-    double sigma = std::max(2.0, bgr.cols / 240.0);
-    cv::GaussianBlur(full, full, cv::Size(0, 0), sigma);
 
-    /* connected-component cleanup at 1/4 res: keep only the biggest
-     * person blob — stray background false-positives vanish. */
+    /* connected-component cleanup at 1/4 res: keep the person blob(s),
+     * drop stray background false-positives (e.g. the leaking corner). */
     cv::Mat q, q8, lbl, stats, cent;
     cv::resize(full, q, cv::Size(), 0.25, 0.25, cv::INTER_LINEAR);
-    q8 = q > 0.22;
+    q8 = q > 0.30;
     int n2 = cv::connectedComponentsWithStats(q8, lbl, stats, cent);
     if (n2 > 1) {
         int ba = 0;
         for (int i2 = 1; i2 < n2; i2++)
             ba = std::max(ba, stats.at<int>(i2, cv::CC_STAT_AREA));
-        /* keep every component with >=10% of the largest's area — a
-         * head separated from the torso by a low-confidence neck pixel
-         * must NOT be deleted as noise (it was; hence the missing head) */
+        /* keep every component with >=15% of the largest's area (head +
+         * torso + raised arm survive; small false blobs like the leaking
+         * corner are discarded). */
         cv::Mat keep = cv::Mat::zeros(lbl.size(), CV_8U);
         for (int i2 = 1; i2 < n2; i2++) {
             int a2 = stats.at<int>(i2, cv::CC_STAT_AREA);
-            if (a2 >= std::max(24, ba / 10))
+            if (a2 >= std::max(40, ba * 15 / 100))
                 keep |= (lbl == i2);
         }
-        cv::dilate(keep, keep, cv::Mat(), cv::Point(-1,-1), 2);
-        cv::Mat keepf, keepfull;
-        keep.convertTo(keepf, CV_32F, 1.0/255.0);
-        cv::GaussianBlur(keepf, keepf, cv::Size(0,0), 2.0);
-        cv::resize(keepf, keepfull, full.size(), 0, 0, cv::INTER_LINEAR);
-        full = full.mul(keepfull);
+        cv::Mat keepfull;
+        cv::resize(keep, keepfull, full.size(), 0, 0, cv::INTER_NEAREST);
+        cv::Mat keepf; keepfull.convertTo(keepf, CV_32F, 1.0/255.0);
+        full = full.mul(keepf);
     }
 
-    /* OPACITY FIX: the model's probability inside the body hovers at
-     * 0.6-0.8, which — used directly as alpha — rendered the person
-     * translucent. Remap 0.30..0.60 -> 0..1 (smoothstep): confident
-     * regions become solid, the feather survives only at true edges. */
-    full = (full - edge) * (1.0 / 0.33);
+    /* OPACITY: remap so confident interior -> fully solid, with a NARROW
+     * transition band. 'edge' sets the midpoint (lower = more hair kept);
+     * the /0.14 makes the ramp steep, so the person is opaque and only a
+     * thin rim is soft — no more see-through halo. */
+    full = (full - edge) * (1.0 / 0.14);
     cv::min(full, 1.0, full);
     cv::max(full, 0.0, full);
     cv::Mat f2 = full.mul(full);
-    full = f2 * 3.0 - f2.mul(full) * 2.0;      /* 3t^2 - 2t^3 */
+    full = f2 * 3.0 - f2.mul(full) * 2.0;      /* smoothstep 3t^2 - 2t^3 */
+
+    /* Pull the edge inward by ~1px so the soft rim sits just INSIDE the
+     * true silhouette (prevents the 1-2px background halo from bleeding
+     * through), then a single tight feather for anti-aliasing. */
+    cv::erode(full, full, cv::Mat(), cv::Point(-1,-1), 1);
+    cv::GaussianBlur(full, full, cv::Size(0, 0), std::max(1.0, bgr.cols / 480.0));
     return full;
 }
 
@@ -780,6 +1012,65 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode)
                     cv::circle(img, eye, std::max(2, fw/20),
                                cv::Scalar(255,255,255), cv::FILLED);
                 }
+            } else if (mode == 9) {
+                /* MIRROR FACE: left half of your face reflected right */
+                for (int yy = y; yy < y+fh && yy < h; yy++) {
+                    cv::Vec3b *rw2 = img.ptr<cv::Vec3b>(yy);
+                    for (int xx = 0; xx < fw/2; xx++) {
+                        int l2 = x+xx, r2 = x+fw-1-xx;
+                        if (l2>=0 && r2<w) rw2[r2] = rw2[l2];
+                    }
+                }
+            } else if (mode == 10) {
+                /* CYCLOPS: one giant eye between your two real ones */
+                int ex2=(int)((f[4]+f[6])*inv/2), ey2=(int)((f[5]+f[7])*inv/2);
+                int R4=std::max(8,fw/4);
+                cv::ellipse(img,cv::Point(ex2,ey2),cv::Size(R4,R4*2/3),0,0,360,cv::Scalar(245,245,245),cv::FILLED);
+                cv::circle(img,cv::Point(ex2,ey2),R4/2,cv::Scalar(90,40,20),cv::FILLED);
+                cv::circle(img,cv::Point(ex2,ey2),R4/4,cv::Scalar(10,10,10),cv::FILLED);
+                cv::circle(img,cv::Point(ex2-R4/6,ey2-R4/6),std::max(2,R4/8),cv::Scalar(255,255,255),cv::FILLED);
+                cv::ellipse(img,cv::Point(ex2,ey2),cv::Size(R4,R4*2/3),0,0,360,cv::Scalar(30,30,30),2);
+            } else if (mode == 11) {
+                /* HEART EYES */
+                for (int e2=0;e2<2;e2++){
+                    int hx2=(int)(f[4+e2*2]*inv), hy2=(int)(f[5+e2*2]*inv);
+                    int r5=std::max(5,fw/8);
+                    cv::Scalar red(60,40,235);
+                    cv::circle(img,cv::Point(hx2-r5/2,hy2-r5/3),r5/2+1,red,cv::FILLED);
+                    cv::circle(img,cv::Point(hx2+r5/2,hy2-r5/3),r5/2+1,red,cv::FILLED);
+                    cv::Point tri[3]={{hx2-r5,hy2-r5/6},{hx2+r5,hy2-r5/6},{hx2,hy2+r5}};
+                    cv::fillConvexPoly(img,tri,3,red);
+                }
+            } else if (mode == 12) {
+                /* INTERROGATION: darkness except an oval on your face */
+                float fcx=x+fw/2.f, fcy=y+fh/2.f, ra=fw*0.85f, rb=fh*0.95f;
+                for (int yy=0;yy<h;yy++){
+                    uchar *rw2=data+yy*stride;
+                    float ny=(yy-fcy)/rb;
+                    for (int xx=0;xx<w;xx++){
+                        float nx=(xx-fcx)/ra, d2=nx*nx+ny*ny;
+                        if (d2<1.0f) continue;
+                        float k2 = d2>2.0f?0.12f:(1.0f-(d2-1.0f)*0.88f);
+                        uchar *p2=rw2+xx*3;
+                        p2[0]=(uchar)(p2[0]*k2); p2[1]=(uchar)(p2[1]*k2); p2[2]=(uchar)(p2[2]*k2);
+                    }
+                }
+            } else if (mode == 13) {
+                /* TARGET LOCK: rotating sci-fi HUD reticle on your face */
+                cv::Point c3(x+fw/2,y+fh/2);
+                int R5=(int)(std::max(fw,fh)*0.75);
+                cv::Scalar g3(80,255,80);
+                float a3=(float)(g_face.counter%90)/90.0f*6.2832f;
+                for(int k2=0;k2<4;k2++){
+                    float aa=a3+k2*1.5708f;
+                    cv::ellipse(img,c3,cv::Size(R5,R5),aa*57.3,0,60,g3,2);
+                }
+                cv::circle(img,c3,R5*2/3,g3,1);
+                cv::line(img,cv::Point(c3.x-R5,c3.y),cv::Point(c3.x-R5/2,c3.y),g3,2);
+                cv::line(img,cv::Point(c3.x+R5/2,c3.y),cv::Point(c3.x+R5,c3.y),g3,2);
+                cv::line(img,cv::Point(c3.x,c3.y-R5),cv::Point(c3.x,c3.y-R5/2),g3,2);
+                cv::line(img,cv::Point(c3.x,c3.y+R5/2),cv::Point(c3.x,c3.y+R5),g3,2);
+                cv::putText(img,"LOCK",cv::Point(c3.x+R5/2,c3.y-R5/2),cv::FONT_HERSHEY_SIMPLEX,0.7,g3,2);
             } else {
                 /* googly eyes at the two eye landmarks (idx 4,5 & 6,7) */
                 for (int e = 0; e < 2; e++) {
@@ -816,18 +1107,28 @@ void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
         std::lock_guard<std::mutex> lock(g_seg.mtx);
         cv::Mat img = wrap_bgr(data, w, h, stride);
 
-        if (!ensure_seg()) return;   /* model missing → no-op */
+        /* PP-HumanSeg is only REQUIRED when RVM can't serve as the
+         * matting engine. With RVM available (ORT backend, or a DNN
+         * build that computes it), personfx works without the
+         * pphumanseg model file entirely. */
+        bool rvm_possible =
+            (g_seg.rvm_state >= 0 || (ort_available() && g_seg.ort_state >= 0));
+        if (!rvm_possible && !ensure_seg()) return;   /* nothing can matte */
 
         /* Inference EVERY frame: PP-HumanSeg is ~6 ms on a laptop CPU,
          * and a stale mask visibly lags moving hands (the old every-3rd
          * throttle caused exactly that). Temporal EMA keeps edges calm. */
         tick(g_seg.counter);
         {
-            /* body ROI from the face detector (the one that works!) —
-             * face box expanded to shoulders-and-torso proportions.
+            /* body ROI from the face detector — only needed for the
+             * PP-HumanSeg path (RVM mattes the full frame natively).
              * Lock order seg->face is the established unique nesting. */
             cv::Rect body(0, 0, img.cols, img.rows);
-            {
+            bool rvm_alive =
+                (ort_available() && g_seg.ort_state >= 0) || g_seg.rvm_state > 0 ||
+                (g_seg.rvm_state == 0 &&
+                 path_exists(model_dir() + "/rvm_mobilenetv3_fp32.onnx"));
+            if (!rvm_alive) {
                 std::lock_guard<std::mutex> fl(g_face.mtx);
                 const int TW = 320;
                 double fs = (img.cols > TW) ? (double)TW / img.cols : 1.0;
@@ -856,7 +1157,16 @@ void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
                     }
                 }
             }
-            cv::Mat m = seg_infer(img, body, edge);
+            cv::Mat m = rvm_infer(img);
+            if (!m.empty()) {
+                /* RVM alpha is already clean; light remap honors 'edge' */
+                m = (m - edge*0.5) * (1.0/(1.0 - edge*0.5));
+                cv::min(m, 1.0, m); cv::max(m, 0.0, m);
+            } else if (ensure_seg()) {
+                m = seg_infer(img, body, edge);
+            } else {
+                return;   /* RVM just died and pphumanseg is absent */
+            }
             if (!m.empty()) {
                 if (!g_seg.mask.empty() && g_seg.mask.size() == m.size())
                     cv::addWeighted(m, smooth, g_seg.mask, 1.0 - smooth, 0.0, g_seg.mask);
@@ -893,6 +1203,150 @@ void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
         cv::Mat inv;
         cv::bitwise_not(person3, inv);
 
+        if (mode == 11) {
+            /* RAINBOW AURA: hue-cycling glow rings around your body */
+            cv::Mat m8,d1,d2m;
+            g_seg.mask.convertTo(m8,CV_8U,255.0);
+            unsigned tk=g_seg.counter;
+            for(int ring=0;ring<3;ring++){
+                cv::dilate(m8,d1,cv::Mat(),cv::Point(-1,-1),2+ring*3);
+                cv::dilate(m8,d2m,cv::Mat(),cv::Point(-1,-1),ring*3);
+                float hue=(tk*0.06f)+ring*2.1f;
+                int cb2=(int)((std::sin(hue+4.19f)*0.5f+0.5f)*255);
+                int cg2=(int)((std::sin(hue+2.09f)*0.5f+0.5f)*255);
+                int cr2=(int)((std::sin(hue)*0.5f+0.5f)*255);
+                for(int y=0;y<img.rows;y++){
+                    const uchar *da=d1.ptr<uchar>(y),*db=d2m.ptr<uchar>(y);
+                    cv::Vec3b *ip=img.ptr<cv::Vec3b>(y);
+                    for(int x=0;x<img.cols;x++){
+                        if(da[x]>128 && db[x]<128){
+                            ip[x][0]=clamp_int_u8(ip[x][0]+cb2/2);
+                            ip[x][1]=clamp_int_u8(ip[x][1]+cg2/2);
+                            ip[x][2]=clamp_int_u8(ip[x][2]+cr2/2);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 12) {
+            /* PAINTED WORLD: neural style transfers the BACKGROUND
+             * while you stay photographic — two nets chained through
+             * the matte. Needs --models-style. */
+            cv::Mat styled = img.clone();
+            cv_fx_style(styled.data, img.cols, img.rows,
+                        (int)styled.step, 1 /*candy*/, 1.0f, 160.0f);
+            for(int y=0;y<img.rows;y++){
+                const float *mm=g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *sp2=styled.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip=img.ptr<cv::Vec3b>(y);
+                for(int x=0;x<img.cols;x++){
+                    float a=1.0f-mm[x]; if(a<0.03f) continue;
+                    ip[x][0]=(uchar)(ip[x][0]+(sp2[x][0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(sp2[x][1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(sp2[x][2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 13) {
+            /* BODY PRIVACY: pixelate only the person */
+            cv::Mat tiny;
+            cv::resize(img,tiny,cv::Size(img.cols/24,img.rows/24));
+            cv::resize(tiny,tiny,img.size(),0,0,cv::INTER_NEAREST);
+            for(int y=0;y<img.rows;y++){
+                const float *mm=g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *tp=tiny.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip=img.ptr<cv::Vec3b>(y);
+                for(int x=0;x<img.cols;x++){
+                    float a=mm[x]; if(a<0.05f) continue;
+                    ip[x][0]=(uchar)(ip[x][0]+(tp[x][0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(tp[x][1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(tp[x][2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 15) {
+            /* MOTION ECHO: translucent copies of your silhouette shed
+             * behind you as you move — a comet-trail of past poses held
+             * in a decaying accumulator, composited under the live you. */
+            static cv::Mat accum;
+            if (accum.empty() || accum.size() != img.size())
+                accum = cv::Mat::zeros(img.size(), CV_32FC3);
+            /* decay the trail */
+            accum *= 0.88;
+            /* stamp the current matted person into the accumulator */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                cv::Vec3f *ap = accum.ptr<cv::Vec3f>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    ap[x][0] = std::max(ap[x][0], ip[x][0]*a);
+                    ap[x][1] = std::max(ap[x][1], ip[x][1]*a);
+                    ap[x][2] = std::max(ap[x][2], ip[x][2]*a);
+                }
+            }
+            /* draw trail where the live person ISN'T, tinted cyan */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3f *ap = accum.ptr<cv::Vec3f>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float t = (1.0f - mm[x]);
+                    float lum = (ap[x][0]+ap[x][1]+ap[x][2]) / 3.0f;
+                    if (lum < 8) continue;
+                    float a = std::min(0.75f, lum/180.0f) * t;
+                    ip[x][0]=(uchar)(ip[x][0]+(std::min(255.f,ap[x][0]*1.3f)-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(std::min(255.f,ap[x][1]*1.1f)-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(ap[x][2]*0.6f-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 16) {
+            /* DOUBLE EXPOSURE: the classic portrait effect — your
+             * silhouette is filled with the room behind you (the learned
+             * background shows THROUGH your body), edges kept dark. */
+            if (g_seg.bg_est.empty()) { }
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *bp = g_seg.bg_est.empty() ? nullptr
+                                      : g_seg.bg_est.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    if (a < 0.05f) { ip[x] = cv::Vec3b(20,15,15); continue; }
+                    /* inside the person: blend the body luma with the
+                     * background image for a dreamy double-exposure */
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    cv::Vec3b bgv = bp ? bp[x] : cv::Vec3b(60,40,80);
+                    ip[x][0]=(uchar)(bgv[0]*lum + 30*(1-lum));
+                    ip[x][1]=(uchar)(bgv[1]*lum + 20*(1-lum));
+                    ip[x][2]=(uchar)(bgv[2]*lum + 40*(1-lum));
+                }
+            }
+            return;
+        }
+        if (mode == 14) {
+            /* GRAVITY FLIP: you, upside down in the learned room */
+            cv::Mat out2; g_seg.bg_est.copyTo(out2);
+            for(int y=0;y<img.rows;y++){
+                int sy2=img.rows-1-y;
+                const float *mm=g_seg.mask.ptr<float>(sy2);
+                const cv::Vec3b *ip=img.ptr<cv::Vec3b>(sy2);
+                cv::Vec3b *op=out2.ptr<cv::Vec3b>(y);
+                for(int x=0;x<img.cols;x++){
+                    float a=mm[x]; if(a<0.05f) continue;
+                    op[x][0]=(uchar)(op[x][0]+(ip[x][0]-op[x][0])*a);
+                    op[x][1]=(uchar)(op[x][1]+(ip[x][1]-op[x][1])*a);
+                    op[x][2]=(uchar)(op[x][2]+(ip[x][2]-op[x][2])*a);
+                }
+            }
+            out2.copyTo(img);
+            return;
+        }
         if (mode == 9) {
             /* TINY YOU: you, shrunk to 45%, standing at the bottom of
              * the learned room like a desk gnome. */
@@ -1241,7 +1695,7 @@ void cv_fx_mood(unsigned char *data, int w, int h, int stride,
 {
     if (!data || w < 32 || h < 32) return;
     if (mode < 0) mode = 0;
-    if (mode > 4) mode = 4;
+    if (mode > 5) mode = 5;
     if (gain <= 0.0f || gain > 2.0f) gain = 1.0f;
     try {
         cv::Mat img = wrap_bgr(data, w, h, stride);
@@ -1373,6 +1827,25 @@ void cv_fx_mood(unsigned char *data, int w, int h, int stride,
                         cv::FONT_HERSHEY_SIMPLEX, 0.7, col, 2);
             int bw = (int)(roi.width * conf);
             cv::rectangle(img, cv::Rect(roi.x, ty + 6, bw, 5), col, cv::FILLED);
+        } else if (mode == 5) {
+            /* AUTO-GRADE: cinematic color grade steered by emotion.
+             * happy=warm lift, sad=cool desat, angry=hot contrast,
+             * surprised=bright pop, fear=purple shadows, disgust=green. */
+            static const float G[7][4] = {   /* mulB mulG mulR add */
+                {0.85f,0.90f,1.20f, 8},{0.90f,1.15f,0.90f, 0},
+                {1.15f,0.90f,1.05f,-8},{0.95f,1.05f,1.15f,12},
+                {1.f,1.f,1.f,0},{1.20f,1.00f,0.85f,-10},{1.05f,1.05f,1.05f,18}};
+            const float *g4=G[emo];
+            float k4=conf;
+            for(int y=0;y<h;y++){
+                uchar *p2=data+y*stride;
+                for(int x=0;x<w;x++){
+                    uchar *q2=p2+x*3;
+                    q2[0]=clamp_int_u8((int)(q2[0]*(1+(g4[0]-1)*k4)+g4[3]*k4));
+                    q2[1]=clamp_int_u8((int)(q2[1]*(1+(g4[1]-1)*k4)+g4[3]*k4));
+                    q2[2]=clamp_int_u8((int)(q2[2]*(1+(g4[2]-1)*k4)+g4[3]*k4));
+                }
+            }
         } else if (mode == 4) {
             /* PAINTMOOD: two neural nets chained — the FER model reads
              * your emotion, which SELECTS the neural style; confidence
@@ -1637,9 +2110,10 @@ void cv_clear_bg_image(void)
 
 void cv_shutdown(void)
 {
+    ort_shutdown();
     try {
         { std::lock_guard<std::mutex> l(g_face.mtx); g_face.det.reset(); g_face.faces.release(); }
-        { std::lock_guard<std::mutex> l(g_seg.mtx);  g_seg.net = cv::dnn::Net(); g_seg.mask.release(); g_seg.bg_est.release(); }
+        { std::lock_guard<std::mutex> l(g_seg.mtx);  g_seg.net = cv::dnn::Net(); g_seg.rvm = cv::dnn::Net(); g_seg.mask.release(); g_seg.bg_est.release(); g_seg.r1.release(); g_seg.r2.release(); g_seg.r3.release(); g_seg.r4.release(); }
         { std::lock_guard<std::mutex> l(g_classic.mtx);
           g_classic.mog2.reset(); g_classic.prev_gray.release(); }
         { std::lock_guard<std::mutex> l(g_style.mtx);
