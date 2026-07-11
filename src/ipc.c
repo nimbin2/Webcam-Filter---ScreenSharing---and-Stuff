@@ -134,6 +134,37 @@ extern int         g_output_w;
 extern int         g_output_h;
 extern int         g_output_fps;
 
+
+/* ── mode-name tables: the single source of truth for what each AI
+ * filter's mode numbers mean. Surfaced via 'filter modes <name>' and
+ * consumed by vcam-tune's picker. Keep in sync when adding modes. */
+static const char *PERSONFX_MODES[] = {
+    "blur-bg","spotlight","gradient-bg","image-bg","invisibility","neon-person",
+    "clone-army","window-3d","chrono-clones","tiny-you","hologram","rainbow-aura",
+    "painted-world","body-pixelate","gravity-flip","motion-echo","double-exposure",
+    "glitch-body","sliced","disintegrate","light-paint","mirror-twin","crystal",
+    "x-ray-scan","wanted-poster","stage-spotlight","haunted-shadow","cosmic-you",
+    "paper-sticker","heat-signature","afterimage-burst","mandala","topo-aura",
+    "ball-pit","orbit-rim-light","mind-vortex","stained-glass","upside-down-room",
+    "snowfall","fire-silhouette","bubbles","thor-lightning","fireflies","stardust",
+    "matrix-you","black-hole","pet-moons","portals","god-rays","tron-trace",
+    "shockwave","rapture-beam","kaleido-body","liquid-floor","astral-soul",
+    "mystic-fog","color-pop","cinema","bokeh-pro","studio-light","night-boost",
+    "green-screen","brb-privacy","pop-out-3d","dolly-zoom","duotone-poster",
+};
+static const char *FACEFX_MODES[] = {
+    "pixelate","ring-dots","googly-eyes","bighead","deal-with-it","laser-eyes",
+    "bobblehead","third-eye","crown","mirror-face","cyclops","heart-eyes",
+    "interrogation","target-lock","face-satellites","melting-face","sparkle-eyes",
+    "halo","clown","auto-director","picasso","time-ripple","fisheye","golden-ratio",
+};
+static const char *MOODFX_MODES[] = {
+    "aura","hud","party","emoji","paintmood","auto-grade","mood-ring","fountain",
+};
+static const char *STYLEAI_MODES[] = {
+    "mosaic","candy","rain-princess","udnie","pointilism",
+};
+
 static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
 {
     char *save;
@@ -155,10 +186,10 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
         if (!sub || strcmp(sub, "help") == 0) {
             send_line(client_fd, "OK filter commands:");
             send_line(client_fd, "OK   filter list                    show active filters + all params");
-            send_line(client_fd, "OK   filter add <name> <p> [<p2> [<p3> [<p4>]]]");
+            send_line(client_fd, "OK   filter add <name> <p> [<p2> [<p3> [<p4> [<p5>]]]]");
             send_line(client_fd, "OK                                    append a filter with up to 4 params");
             send_line(client_fd, "OK   filter set <index> <param>       update the primary param");
-            send_line(client_fd, "OK   filter set <index> p2|p3|p4 <v>  update a specific extra param");
+            send_line(client_fd, "OK   filter set <index> p2|p3|p4|p5 <v>  update a specific extra param (LIVE, no re-add)");
             send_line(client_fd, "OK   filter remove <index>          remove filter at index");
             send_line(client_fd, "OK   filter clear                   remove all filters");
             send_line(client_fd, "OK   filter help                    this message");
@@ -310,21 +341,40 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   cvstylize <strength>          watercolor / poster stylization");
             send_line(client_fd, "OK   opticalflow <mix>             motion visualized as flowing color");
             send_line(client_fd, "OK   bgsub <sensitivity>           moving foreground vivid, static background dimmed");
-            send_line(client_fd, "OK   facefx <mode>                 YuNet faces: 0=blur 1=ring+dots 2=googly-eyes (needs model)");
-            send_line(client_fd, "OK   personfx <mode> [<edge> <smooth>] person seg (needs model): 0=blur-bg 1=spotlight 2=gradient-bg");
+            send_line(client_fd, "OK   facefx <mode> [<amount> <speed>] YuNet faces: 0=blur 1=ring+dots 2=googly-eyes (needs model)");
+            send_line(client_fd, "OK                                    amount 0.3..2.5 = effect size; speed 0.2..3 = animation rate");
+            send_line(client_fd, "OK   personfx <mode> [<edge> <smooth> <size>] person matting: 0=blur-bg 1=spotlight 2=gradient-bg");
             send_line(client_fd, "OK                                    edge 0.05..0.5 (lower=more hair, higher=tighter cut, def 0.22)");
-            send_line(client_fd, "OK                                    smooth 0.4..1 (mask responsiveness, 1=instant, def 0.8)");
+            send_line(client_fd, "OK                                    smooth 0.4..1 (mask responsiveness, def 0.8)");
+            send_line(client_fd, "OK                                    size 256..640 (RVM detail vs speed, def 512; try 384 on slower CPUs)");
             send_line(client_fd, "OK                                    3=YOUR-image-bg (filter bgimage <path>) 4=INVISIBILITY CLOAK 5=neon person");
             send_line(client_fd, "OK   styleai <style> [<blend> <size>] LIVE NEURAL STYLE TRANSFER: 0=mosaic 1=candy 2=rain-princess 3=udnie 4=pointilism");
             send_line(client_fd, "OK                                    blend 0..1 mixes with original; size 96..384 = quality vs speed");
-            send_line(client_fd, "OK   moodfx <mode> [<gain>]         EMOTION-REACTIVE: model reads your expression, effect responds");
-            send_line(client_fd, "OK                                    0=aura 1=HUD 2=party 3=EMOJI 4=PAINTMOOD 5=AUTO-GRADE (cinematic grade by emotion)");
+            send_line(client_fd, "OK   moodfx <mode> [<gain> <extra>] EMOTION-REACTIVE: model reads your expression, effect responds");
+            send_line(client_fd, "OK                                    0=aura 1=HUD 2=party 3=EMOJI 4=PAINTMOOD 5=AUTO-GRADE 6=MOOD-RING 7=EMOTION-FOUNTAIN");
             send_line(client_fd, "OK   paintflow <strength> [<decay>] motion smears reality like wet paint (dense optical flow)");
             send_line(client_fd, "OK   facefx extra modes: 3=BIGHEAD (inflated tracked head) 4=deal-with-it sunglasses");
             send_line(client_fd, "OK   personfx extra modes: 6=CLONE ARMY 7=WINDOW-3D (head-coupled parallax) 8=CHRONO CLONES (past-selves trail)");
             send_line(client_fd, "OK   facefx extra modes: 5=LASERS 6=BOBBLE 7=3RD-EYE 8=CROWN 9=MIRROR 10=CYCLOPS 11=HEART-EYES 12=INTERROGATE 13=TARGET-LOCK");
+            send_line(client_fd, "OK                       14=FACE-SATELLITES 15=MELTING-FACE 16=SPARKLE-EYES 17=HALO 18=CLOWN");
+            send_line(client_fd, "OK                       19=AUTO-DIRECTOR (camera follows + frames your face; amount=tightness speed=follow)");
+            send_line(client_fd, "OK                       20=PICASSO 21=TIME-RIPPLE 22=FISHEYE 23=GOLDEN-RATIO (da-Vinci face analysis)");
             send_line(client_fd, "OK   personfx extra modes: 9=TINY 10=HOLOGRAM 11=RAINBOW-AURA 12=PAINTED-WORLD 13=BODY-PIXELATE 14=GRAVITY-FLIP");
-            send_line(client_fd, "OK                                    15=MOTION-ECHO (comet trail of past poses) 16=DOUBLE-EXPOSURE (room shows through you)");
+            send_line(client_fd, "OK                                    15=MOTION-ECHO 16=DOUBLE-EXPOSURE 17=GLITCH-BODY 18=SLICED 19=DISINTEGRATE");
+            send_line(client_fd, "OK                                    20=LIGHT-PAINT 21=MIRROR-TWIN 22=CRYSTAL 23=X-RAY-SCAN 24=WANTED-POSTER");
+            send_line(client_fd, "OK                                    25=STAGE-SPOTLIGHT 26=HAUNTED-SHADOW (your shadow lags 1s) 27=COSMIC-YOU");
+            send_line(client_fd, "OK                                    28=PAPER-STICKER 29=HEAT-SIGNATURE 30=AFTERIMAGE-BURST (dodge fast!)");
+            send_line(client_fd, "OK                                    31=MANDALA (kaleidoscoped outline) 32=TOPO-AURA 33=BALL-PIT (balls bounce off YOU!)");
+            send_line(client_fd, "OK                                    34=ORBIT-RIM-LIGHT 35=MIND-VORTEX 36=STAINED-GLASS 37=UPSIDE-DOWN-ROOM");
+            send_line(client_fd, "OK                                    38=SNOWFALL (piles up on you!) 39=FIRE-SILHOUETTE 40=BUBBLES (pop them!) 41=THOR");
+            send_line(client_fd, "OK                                    42=FIREFLIES 43=STARDUST 44=MATRIX-YOU 45=BLACK-HOLE 46=PET-MOONS 47=PORTALS");
+            send_line(client_fd, "OK                                    48=GOD-RAYS 49=TRON-TRACE 50=SHOCKWAVE (move fast!) 51=RAPTURE-BEAM");
+            send_line(client_fd, "OK                                    52=KALEIDO-BODY 53=LIQUID-FLOOR 54=ASTRAL-SOUL 55=MYSTIC-FOG");
+            send_line(client_fd, "OK                                    PRO LOOKS: 56=COLOR-POP 57=CINEMA 58=BOKEH-PRO 59=STUDIO-LIGHT 60=NIGHT-BOOST");
+            send_line(client_fd, "OK                                    61=GREEN-SCREEN-OUT 62=BRB-PRIVACY (auto) 63=POP-OUT-3D 64=DOLLY-ZOOM 65=DUOTONE");
+            send_line(client_fd, "OK   filter modes <name>            list ALL modes of personfx/facefx/moodfx/styleai BY NAME");
+            send_line(client_fd, "OK   personfx p5 = fx  per-mode effect strength 0.2..3 (glitch amp, fire, rays, lift, fog...) — tune LIVE:");
+            send_line(client_fd, "OK                       vcam-ctl filter set 0 p5 1.8");
             send_line(client_fd, "OK   speedlines <sens> [<density>] anime motion lines streak in when you move fast");
             send_line(client_fd, "OK   filter bgimage <path|off>      set the background image for personfx mode 3");
             send_line(client_fd, "OK   (face/person models: run 'vcam-setup --models' to download)");
@@ -340,9 +390,9 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 for (int i = 0; i < g_filters.count; i++) {
                     Filter *f = &g_filters.filters[i];
                     snprintf(buf, sizeof buf,
-                        "OK %d: %s param=%.2f p2=%.2f p3=%.2f p4=%.2f",
+                        "OK %d: %s param=%.2f p2=%.2f p3=%.2f p4=%.2f p5=%.2f",
                         i, filter_type_to_name(f->type),
-                        f->param, f->param2, f->param3, f->param4);
+                        f->param, f->param2, f->param3, f->param4, f->param5);
                     send_line(client_fd, buf);
                 }
             }
@@ -388,9 +438,9 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             if (filter_chain_add_multi(&g_filters, t, params, n_parsed)) {
                 char b[192];
                 snprintf(b, sizeof b,
-                    "OK added filter '%s' param=%.2f p2=%.2f p3=%.2f p4=%.2f",
+                    "OK added filter '%s' param=%.2f p2=%.2f p3=%.2f p4=%.2f p5=%.2f",
                     filter_type_to_name(t),
-                    params[0], params[1], params[2], params[3]);
+                    params[0], params[1], params[2], params[3], params[4]);
                 send_line(client_fd, b);
             } else {
                 send_line(client_fd, "ERR filter chain full");
@@ -454,6 +504,30 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             return;
         }
 
+        if (strcmp(sub, "modes") == 0) {
+            /* filter modes <name> — list an AI filter's modes by name */
+            char *fname = strtok_r(NULL, " \t", &save);
+            const char **tbl = NULL; int n2 = 0;
+            if (fname && (!strcmp(fname,"personfx")||!strcmp(fname,"portrait")))
+                { tbl = PERSONFX_MODES; n2 = (int)(sizeof PERSONFX_MODES/sizeof *PERSONFX_MODES); }
+            else if (fname && (!strcmp(fname,"facefx")||!strcmp(fname,"faces")))
+                { tbl = FACEFX_MODES; n2 = (int)(sizeof FACEFX_MODES/sizeof *FACEFX_MODES); }
+            else if (fname && (!strcmp(fname,"moodfx")||!strcmp(fname,"emotion")))
+                { tbl = MOODFX_MODES; n2 = (int)(sizeof MOODFX_MODES/sizeof *MOODFX_MODES); }
+            else if (fname && (!strcmp(fname,"styleai")||!strcmp(fname,"neuralstyle")))
+                { tbl = STYLEAI_MODES; n2 = (int)(sizeof STYLEAI_MODES/sizeof *STYLEAI_MODES); }
+            if (!tbl) {
+                send_line(client_fd, "ERR usage: filter modes <personfx|facefx|moodfx|styleai>");
+                return;
+            }
+            char b[96];
+            for (int k2 = 0; k2 < n2; k2++) {
+                snprintf(b, sizeof b, "OK %2d %s", k2, tbl[k2]);
+                send_line(client_fd, b);
+            }
+            return;
+        }
+
         if (strcmp(sub, "bgimage") == 0) {
             /* filter bgimage <path> — background image for personfx mode 3
              * filter bgimage off    — remove it (mode 3 falls back to gradient) */
@@ -489,13 +563,13 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             char *istr = strtok_r(NULL, " \t", &save);
             char *first = strtok_r(NULL, " \t", &save);
             if (!istr || !first) {
-                send_line(client_fd, "ERR filter set: usage 'filter set <index> [p2|p3|p4] <param>'");
+                send_line(client_fd, "ERR filter set: usage 'filter set <index> [p2|p3|p4|p5] <param>'");
                 return;
             }
             int idx = atoi(istr);
             int which = 1;
             char *pstr = first;
-            if (!strcmp(first, "p2") || !strcmp(first, "p3") || !strcmp(first, "p4")) {
+            if (!strcmp(first, "p2") || !strcmp(first, "p3") || !strcmp(first, "p4") || !strcmp(first, "p5")) {
                 which = first[1] - '0';
                 pstr = strtok_r(NULL, " \t", &save);
                 if (!pstr) { send_line(client_fd, "ERR filter set: missing value"); return; }
@@ -513,6 +587,7 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             case 2: g_filters.filters[idx].param2 = v; break;
             case 3: g_filters.filters[idx].param3 = v; break;
             case 4: g_filters.filters[idx].param4 = v; break;
+            case 5: g_filters.filters[idx].param5 = v; break;
             }
             const char *name = filter_type_to_name(g_filters.filters[idx].type);
             pthread_mutex_unlock(&g_filters.lock);

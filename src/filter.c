@@ -374,6 +374,7 @@ bool filter_chain_add_multi(FilterChain *fc, FilterType t,
     f->param2 = (n_params > 1) ? params[1] : 0.0f;
     f->param3 = (n_params > 2) ? params[2] : 0.0f;
     f->param4 = (n_params > 3) ? params[3] : 0.0f;
+    f->param5 = (n_params > 4) ? params[4] : 0.0f;
     fc->count++;
     pthread_mutex_unlock(&fc->lock);
     return true;
@@ -5902,10 +5903,10 @@ void filter_chain_apply(FilterChain *fc, Frame *frame)
         case FX_CV_STYLIZE:   cv_fx_stylize(frame->data, frame->width, frame->height, frame->stride, f->param); break;
         case FX_CV_FLOW:      cv_fx_flow   (frame->data, frame->width, frame->height, frame->stride, f->param); break;
         case FX_CV_BGSUB:     cv_fx_bgsub  (frame->data, frame->width, frame->height, frame->stride, f->param); break;
-        case FX_CV_FACE:      cv_fx_face   (frame->data, frame->width, frame->height, frame->stride, (int)f->param); break;
-        case FX_CV_PERSON:    cv_fx_bgblur (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3); break;
+        case FX_CV_FACE:      cv_fx_face   (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3); break;
+        case FX_CV_PERSON:    cv_fx_bgblur (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3, f->param4, f->param5); break;
         case FX_CV_STYLE:     cv_fx_style  (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3); break;
-        case FX_CV_MOOD:      cv_fx_mood   (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2); break;
+        case FX_CV_MOOD:      cv_fx_mood   (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3); break;
         case FX_CV_PAINT:     cv_fx_paintflow(frame->data, frame->width, frame->height, frame->stride, f->param, f->param2); break;
         case FX_CV_SPEED:     cv_fx_speedlines(frame->data, frame->width, frame->height, frame->stride, f->param, f->param2); break;
         default: break;

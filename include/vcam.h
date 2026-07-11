@@ -228,11 +228,11 @@ typedef enum {
 typedef struct {
     FilterType type;
     float      param;         /* primary — kept for backwards compat */
-    float      param2, param3, param4;  /* optional additional knobs */
+    float      param2, param3, param4, param5;  /* optional additional knobs */
 } Filter;
 
 #define MAX_FILTERS 16
-#define FILTER_MAX_PARAMS 4
+#define FILTER_MAX_PARAMS 5
 
 typedef struct {
     Filter          filters[MAX_FILTERS];

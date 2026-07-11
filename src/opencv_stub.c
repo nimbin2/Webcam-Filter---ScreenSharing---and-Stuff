@@ -42,17 +42,17 @@ void cv_fx_flow(unsigned char *d, int w, int h, int s, float m)
 void cv_fx_bgsub(unsigned char *d, int w, int h, int s, float x)
 { (void)d; (void)w; (void)h; (void)s; (void)x; }
 
-void cv_fx_face(unsigned char *d, int w, int h, int s, int m)
-{ (void)d; (void)w; (void)h; (void)s; (void)m; }
+void cv_fx_face(unsigned char *d, int w, int h, int s, int m, float a, float sp)
+{ (void)d; (void)w; (void)h; (void)s; (void)m; (void)a; (void)sp; }
 
-void cv_fx_bgblur(unsigned char *d, int w, int h, int s, int m, float e, float sm)
-{ (void)d; (void)w; (void)h; (void)s; (void)m; (void)e; (void)sm; }
+void cv_fx_bgblur(unsigned char *d, int w, int h, int s, int m, float e, float sm, float sz, float fx)
+{ (void)d; (void)w; (void)h; (void)s; (void)m; (void)e; (void)sm; (void)sz; (void)fx; }
 
 void cv_fx_style(unsigned char *d, int w, int h, int s, int st, float b, float sz)
 { (void)d; (void)w; (void)h; (void)s; (void)st; (void)b; (void)sz; }
 
-void cv_fx_mood(unsigned char *d, int w, int h, int s, int m, float g)
-{ (void)d; (void)w; (void)h; (void)s; (void)m; (void)g; }
+void cv_fx_mood(unsigned char *d, int w, int h, int s, int m, float g, float e)
+{ (void)d; (void)w; (void)h; (void)s; (void)m; (void)g; (void)e; }
 
 void cv_fx_paintflow(unsigned char *d, int w, int h, int s, float st, float dc)
 { (void)d; (void)w; (void)h; (void)s; (void)st; (void)dc; }

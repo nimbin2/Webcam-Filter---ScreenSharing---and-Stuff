@@ -178,22 +178,25 @@ fail:
     return 0;
 }
 
-int ort_rvm_infer(const float *src_chw, int iw, int ih, float *pha_out)
+int ort_rvm_infer(const float *src_chw, int iw, int ih, float ds,
+                  float *pha_out)
 {
     if (!src_chw || !pha_out || iw < 16 || ih < 16) return 0;
+    if (ds <= 0.0f || ds > 1.0f) ds = 1.0f;
     pthread_mutex_lock(&g_mtx);
     if (!g_sess || g_dead) { pthread_mutex_unlock(&g_mtx); return 0; }
 
-    /* frame size changed -> the recurrent state's spatial dims no longer
-     * match; restart it from zeros */
-    if (iw != g_iw || ih != g_ih) {
+    /* frame size or downsample ratio changed -> the recurrent state's
+     * spatial dims no longer match; restart it from zeros */
+    static float g_ds = 0.0f;
+    if (iw != g_iw || ih != g_ih || ds != g_ds) {
         if (!init_rec()) goto dead;
-        g_iw = iw; g_ih = ih;
+        g_iw = iw; g_ih = ih; g_ds = ds;
     }
 
     OrtValue *in_src = NULL, *in_ds = NULL;
     OrtValue *outs[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
-    static float dsr = 1.0f;               /* we pre-scale frames ourselves */
+    float dsr = ds;
     int ret = 0;
 
     {
@@ -282,8 +285,8 @@ const char *ort_version(void) { return "not built in"; }
 
 int ort_rvm_init(const char *p) { (void)p; return 0; }
 
-int ort_rvm_infer(const float *s, int w, int h, float *o)
-{ (void)s; (void)w; (void)h; (void)o; return 0; }
+int ort_rvm_infer(const float *s, int w, int h, float d, float *o)
+{ (void)s; (void)w; (void)h; (void)d; (void)o; return 0; }
 
 void ort_rvm_reset(void) { }
 

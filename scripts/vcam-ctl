@@ -109,6 +109,61 @@ if [ "${1:-}" = "ai" ]; then
     [ -z "$T" ] && { echo "usage: vcam-ctl ai \"what you want\""; exit 1; }
     ADDED=0
     say() { printf '  + %s\n' "$1"; }
+    # ── modifiers: adjust the LAST filter in the chain, live ──
+    # "stronger/weaker" -> effect strength (p5 for personfx, p2 others)
+    # "faster/slower"   -> speed (facefx p3)
+    # "bigger/smaller"  -> amount (facefx p2) / fx (personfx p5)
+    last_filter() {
+        "$0" filter list 2>/dev/null | sed -n 's/^OK \([0-9]*\): \([a-z-]*\) .*/\1 \2/p' | tail -1
+    }
+    bump() {  # bump <p1|p2|p3|p5> <delta> <floor> <ceil>
+        set -- "$1" "$2" "$3" "$4" "$(last_filter)"
+        [ -z "$5" ] && { echo "  (no active filter to adjust)"; exit 1; }
+        idx=${5%% *}; fname=${5#* }
+        if [ "$1" = "p1" ]; then
+            cur=$("$0" filter list 2>/dev/null | sed -n "s/^OK $idx: [a-z-]* param=\([0-9.-]*\).*/\1/p")
+        else
+            cur=$("$0" filter list 2>/dev/null | sed -n "s/^OK $idx: .*$1=\([0-9.-]*\).*/\1/p")
+        fi
+        [ -z "$cur" ] && cur=0
+        nv=$(awk -v c="$cur" -v d="$2" -v lo="$3" -v hi="$4" \
+             'BEGIN{v=c+d; if(v==d)v=1+d; if(v<lo)v=lo; if(v>hi)v=hi; printf "%.2f", v}')
+        if [ "$1" = "p1" ]; then
+            "$0" filter set "$idx" "$nv" >/dev/null 2>&1 \
+                && echo "  ~ $fname param -> $nv"
+        else
+            "$0" filter set "$idx" "$1" "$nv" >/dev/null 2>&1 \
+                && echo "  ~ $fname $1 -> $nv"
+        fi
+        exit 0
+    }
+    case "$T" in
+        *stronger*|*"more intense"*|*harder*)
+            f=$(last_filter); case "${f#* }" in
+                personfx) bump p5  0.4 0.2 3.0 ;;
+                facefx)   bump p2  0.3 0.3 2.5 ;;
+                moodfx)   bump p2  0.3 0.1 2.0 ;;
+                styleai)  bump p2  0.1 0.1 1.0 ;;
+                *)        bump p1  0.2 0.0 3.0 ;;
+            esac ;;
+        *weaker*|*subtle*|*softer*|*"less intense"*)
+            f=$(last_filter); case "${f#* }" in
+                personfx) bump p5 -0.4 0.2 3.0 ;;
+                facefx)   bump p2 -0.3 0.3 2.5 ;;
+                moodfx)   bump p2 -0.3 0.1 2.0 ;;
+                styleai)  bump p2 -0.1 0.1 1.0 ;;
+                *)        bump p1 -0.2 0.0 3.0 ;;
+            esac ;;
+        *faster*)  bump p3  0.4 0.2 3.0 ;;
+        *slower*)  bump p3 -0.4 0.2 3.0 ;;
+        *bigger*|*larger*)  f=$(last_filter); case "${f#* }" in
+                facefx) bump p2 0.3 0.3 2.5 ;; *) bump p5 0.4 0.2 3.0 ;; esac ;;
+        *smaller*) f=$(last_filter); case "${f#* }" in
+                facefx) bump p2 -0.3 0.3 2.5 ;; *) bump p5 -0.4 0.2 3.0 ;; esac ;;
+        *"remove last"*|*"undo"*)
+            f=$(last_filter); [ -n "$f" ] && { "$0" filter remove "${f%% *}" >/dev/null 2>&1;
+                echo "  - removed ${f#* }"; }; exit 0 ;;
+    esac
     fadd() { "$0" filter add $1 >/dev/null 2>&1 && { say "$2"; ADDED=$((ADDED+1)); }; }
     case "$T" in *reset*|*normal*|*clear*) "$0" filter clear >/dev/null 2>&1; echo "  cleared all filters"; exit 0;; esac
     case "$T" in *invisib*|*disappear*|*vanish*) fadd "personfx 4" "invisibility cloak";; esac
@@ -120,6 +175,67 @@ if [ "${1:-}" = "ai" ]; then
     case "$T" in *upside*|*flip*|*gravity*) fadd "personfx 14" "gravity flip";; esac
     case "$T" in *3d*|*window*|*parallax*) fadd "personfx 7" "window-3D";; esac
     case "$T" in *ghost*|*trail*|*echo*) fadd "personfx 15" "motion echo";; esac
+    case "$T" in *glitch*) fadd "personfx 17" "glitch body";; esac
+    case "$T" in *slice*) fadd "personfx 18" "sliced portrait";; esac
+    case "$T" in *disintegrat*|*thanos*|*dissolve*|*ember*) fadd "personfx 19" "disintegration";; esac
+    case "$T" in *lightpaint*|*"light paint"*) fadd "personfx 20" "light-paint silhouette";; esac
+    case "$T" in *twin*|*double*) fadd "personfx 21" "mirror twin";; esac
+    case "$T" in *crystal*|*"low poly"*|*lowpoly*|*triangle*) fadd "personfx 22" "crystal you";; esac
+    case "$T" in *xray*|*"x-ray"*|*scan*) fadd "personfx 23" "x-ray scanner";; esac
+    case "$T" in *wanted*|*poster*|*bounty*) fadd "personfx 24" "wanted poster";; esac
+    case "$T" in *satellite*|*orbit*) fadd "facefx 14" "face satellites";; esac
+    case "$T" in *melt*|*dali*|*drip*) fadd "facefx 15" "melting face";; esac
+    case "$T" in *"mood ring"*|*border*) fadd "moodfx 6" "mood ring border";; esac
+    case "$T" in *spotlight*|*stage*) fadd "personfx 25" "stage spotlight";; esac
+    case "$T" in *shadow*|*haunt*) fadd "personfx 26" "haunted shadow";; esac
+    case "$T" in *cosmic*|*star*|*space*) fadd "personfx 27" "cosmic you";; esac
+    case "$T" in *sticker*|*paper*|*cutout*) fadd "personfx 28" "paper sticker";; esac
+    case "$T" in *heat*|*thermal*|*predator*) fadd "personfx 29" "heat signature";; esac
+    case "$T" in *afterimage*|*dodge*) fadd "personfx 30" "afterimage burst";; esac
+    case "$T" in *sparkle*|*glint*) fadd "facefx 16" "sparkle eyes";; esac
+    case "$T" in *halo*|*angel*|*saint*) fadd "facefx 17" "halo";; esac
+    case "$T" in *clown*) fadd "facefx 18" "clown";; esac
+    case "$T" in *director*|*follow*|*center*|*frame*me*) fadd "facefx 19" "auto-director";; esac
+    case "$T" in *mandala*|*kaleido*) fadd "personfx 31" "mandala you";; esac
+    case "$T" in *topo*|*radar*|*ring*) fadd "personfx 32" "topo aura";; esac
+    case "$T" in *ball*|*bounc*|*juggle*) fadd "personfx 33" "ball pit";; esac
+    case "$T" in *rim*|*studio*light*) fadd "personfx 34" "orbit rim light";; esac
+    case "$T" in *vortex*|*spiral*|*swirl*) fadd "personfx 35" "mind vortex";; esac
+    case "$T" in *glass*|*church*|*window*) fadd "personfx 36" "stained glass";; esac
+    case "$T" in *upside*room*|*room*flip*|*world*flip*) fadd "personfx 37" "upside-down room";; esac
+    case "$T" in *picasso*|*cubis*) fadd "facefx 20" "picasso face";; esac
+    case "$T" in *ripple*|*"time wave"*|*timewave*) fadd "facefx 21" "time ripple";; esac
+    case "$T" in *fisheye*|*lens*|*bulge*) fadd "facefx 22" "fisheye face";; esac
+    case "$T" in *snow*|*winter*) fadd "personfx 38" "snowfall";; esac
+    case "$T" in *fire*|*flame*|*burn*) fadd "personfx 39" "fire silhouette";; esac
+    case "$T" in *bubble*|*pop*) fadd "personfx 40" "bubbles";; esac
+    case "$T" in *thor*|*lightning*|*zeus*|*storm*) fadd "personfx 41" "thor lightning";; esac
+    case "$T" in *firefl*|*glowworm*) fadd "personfx 42" "fireflies";; esac
+    case "$T" in *stardust*|*glitter*|*shed*) fadd "personfx 43" "stardust";; esac
+    case "$T" in *matrix*|*code*rain*) fadd "personfx 44" "matrix you";; esac
+    case "$T" in *"black hole"*|*blackhole*|*suck*) fadd "personfx 45" "black hole";; esac
+    case "$T" in *moon*|*planet*|*mini*me*) fadd "personfx 46" "pet moons";; esac
+    case "$T" in *portal*|*teleport*) fadd "personfx 47" "portals";; esac
+    case "$T" in *godray*|*"god ray"*|*volumetric*|*sunbeam*) fadd "personfx 48" "god rays";; esac
+    case "$T" in *tron*|*neon*trace*|*circuit*) fadd "personfx 49" "tron trace";; esac
+    case "$T" in *shockwave*|*kamehameha*|*blast*) fadd "personfx 50" "shockwave";; esac
+    case "$T" in *rapture*|*levitat*|*ascend*|*"beam me"*) fadd "personfx 51" "rapture beam";; esac
+    case "$T" in *kaleido*body*|*"body mandala"*|*wedge*) fadd "personfx 52" "kaleido-body";; esac
+    case "$T" in *water*|*lake*|*"liquid floor"*|*reflect*) fadd "personfx 53" "liquid floor";; esac
+    case "$T" in *soul*|*astral*|*spirit*) fadd "personfx 54" "astral soul";; esac
+    case "$T" in *fog*|*mist*|*smoke*) fadd "personfx 55" "mystic fog";; esac
+    case "$T" in *golden*|*ratio*|*davinci*|*"da vinci"*|*phi*) fadd "facefx 23" "golden ratio scan";; esac
+    case "$T" in *fountain*|*erupt*) fadd "moodfx 7" "emotion fountain";; esac
+    case "$T" in *"color pop"*|*colorpop*|*"black and white"*) fadd "personfx 56" "color pop";; esac
+    case "$T" in *cinema*|*movie*|*film*) fadd "personfx 57" "cinema grade";; esac
+    case "$T" in *bokeh*) fadd "personfx 58" "bokeh pro";; esac
+    case "$T" in *"studio"*|*"look better"*|*relight*) fadd "personfx 59" "studio light";; esac
+    case "$T" in *night*|*dark*room*|*"low light"*) fadd "personfx 60" "night boost";; esac
+    case "$T" in *"green screen"*|*greenscreen*|*chroma*) fadd "personfx 61" "green screen out";; esac
+    case "$T" in *brb*|*away*|*privacy*mode*) fadd "personfx 62" "brb privacy";; esac
+    case "$T" in *"pop out"*|*popout*|*depth*|*"3d shadow"*) fadd "personfx 63" "pop-out 3d";; esac
+    case "$T" in *vertigo*|*dolly*|*hitchcock*) fadd "personfx 64" "dolly zoom";; esac
+    case "$T" in *twotone*|*"two tone"*|*"gradient map"*|*spotify*) fadd "personfx 65" "duotone poster";; esac
     case "$T" in *crown*|*king*|*queen*) fadd "facefx 8" "crown";; esac
     case "$T" in *sunglass*|*shades*) fadd "facefx 4" "sunglasses";; esac
     case "$T" in *googly*) fadd "facefx 2" "googly eyes";; esac

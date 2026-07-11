@@ -100,7 +100,7 @@ void cv_fx_bgsub(unsigned char *data, int w, int h, int stride,
  *   2 = "googly eyes" drawn at the eye landmarks
  * Needs face_detection_yunet_2023mar.onnx. */
 void cv_fx_face(unsigned char *data, int w, int h, int stride,
-                int mode);
+                int mode, float amount, float speed);
 
 /* PP-HumanSeg person segmentation → background effect.
  * mode selects what happens to the background:
@@ -109,7 +109,7 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride,
  *   2 = replace background with a moving color gradient
  * Needs human_segmentation_pphumanseg_2023mar.onnx. */
 void cv_fx_bgblur(unsigned char *data, int w, int h, int stride,
-                  int mode, float edge, float smooth);
+                  int mode, float edge, float smooth, float size, float fx);
 
 /* Live neural style transfer (fast-neural-style, 5 styles).
  *   style: 0=mosaic 1=candy 2=rain-princess 3=udnie 4=pointilism
@@ -129,7 +129,7 @@ void cv_fx_style(unsigned char *data, int w, int h, int stride,
  *   gain: sensitivity multiplier 0..2 (0 -> 1).
  * Needs the YuNet face model AND the FER model ('vcam-setup --models'). */
 void cv_fx_mood(unsigned char *data, int w, int h, int stride,
-                int mode, float gain);
+                int mode, float gain, float extra);
 
 /* Flow-advected paint canvas: dense optical flow drags a persistent
  * canvas — anything that moves smears reality like wet paint.

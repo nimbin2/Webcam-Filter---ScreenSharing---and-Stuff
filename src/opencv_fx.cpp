@@ -43,6 +43,7 @@
 #include <mutex>
 #include <memory>
 #include <sys/stat.h>
+#include <chrono>
 
 /* ── OpenCV 5 feature gate ─────────────────────────────────────
  * When built against OpenCV 5 we light up the 5.x-only features:
@@ -94,6 +95,14 @@ inline cv::Mat wrap_bgr(unsigned char *data, int w, int h, int stride)
 inline unsigned char clamp_int_u8(int v)
 {
     return (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+/* cheap deterministic 2D+time hash -> [0,1) for noise-driven effects */
+inline float uhash(int x, int y, unsigned t)
+{
+    unsigned h = (unsigned)x * 374761393u + (unsigned)y * 668265263u + t * 2246822519u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return (float)((h ^ (h >> 16)) & 0xFFFFFF) / 16777216.0f;
 }
 
 bool path_exists(const std::string &p)
@@ -384,7 +393,7 @@ bool ensure_seg()
  *   2. OpenCV DNN — kept as a fallback; on current OpenCV 5 graph
  *      engines it loads but MISCOMPUTES (empty matte), which the
  *      dead-matte gate below detects, falling through to PP-HumanSeg. */
-cv::Mat rvm_infer(const cv::Mat &bgr)
+cv::Mat rvm_infer(const cv::Mat &bgr, int size_w)
 {
     if (g_seg.rvm_state < 0) return cv::Mat();
 
@@ -402,16 +411,21 @@ cv::Mat rvm_infer(const cv::Mat &bgr)
                         "(reference runtime — correct, temporally-stable mattes)");
             }
             if (g_seg.ort_state == 1) {
-                const int IW = 512;   /* ORT computes correctly; afford quality */
+                /* size_w = refinement resolution (the quality knob).
+                 * downsample_ratio pins the heavy encoder at ~256px
+                 * regardless — RVM's intended realtime operation, which
+                 * we can finally use because ORT computes it right. */
+                int IW = size_w;
                 double sc = (double)IW / bgr.cols;
                 int iw = std::max(64, ((int)(bgr.cols*sc)/16)*16);
                 int ih = std::max(64, ((int)(bgr.rows*sc)/16)*16);
+                float ds = (float)std::min(1.0, std::max(0.25, 256.0 / iw));
                 cv::Mat small2;
                 cv::resize(bgr, small2, cv::Size(iw, ih), 0, 0, cv::INTER_AREA);
                 cv::Mat src = cv::dnn::blobFromImage(small2, 1.0/255.0,
                                   cv::Size(iw, ih), cv::Scalar(), true, false);
                 cv::Mat pha(ih, iw, CV_32F);
-                if (ort_rvm_infer((const float*)src.ptr<float>(0), iw, ih,
+                if (ort_rvm_infer((const float*)src.ptr<float>(0), iw, ih, ds,
                                   pha.ptr<float>(0))) {
                     const char *dbg = std::getenv("VCAM_CV_DEBUG");
                     if (dbg && *dbg=='1' && g_seg.counter < 6)
@@ -840,9 +854,17 @@ void cv_fx_bgsub(unsigned char *data, int w, int h, int stride, float sensitivit
 
 /* ── DNN effects ── */
 
-void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode)
+void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode,
+                float amount, float speed)
 {
     if (!data || w < 16 || h < 16) return;
+    if (amount <= 0.0f) amount = 1.0f;       /* effect size/intensity */
+    if (amount < 0.3f) amount = 0.3f;
+    if (amount > 2.5f) amount = 2.5f;
+    if (speed <= 0.0f) speed = 1.0f;         /* animation rate */
+    if (speed < 0.2f) speed = 0.2f;
+    if (speed > 3.0f) speed = 3.0f;
+    float T = (float)g_face.counter * speed; /* knob-scaled time base */
     try {
         std::lock_guard<std::mutex> lock(g_face.mtx);
 
@@ -900,9 +922,9 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode)
                 /* BIGHEAD (3) / BOBBLEHEAD (6: scale oscillates): magnify the head in place, tracked live.
                  * Grab a region around the face, enlarge it, paste it
                  * back centered with an elliptical feather. */
-                float scale = 1.45f;
+                float scale = 1.0f + 0.45f * amount;
                 if (mode == 6)
-                    scale = 1.30f + 0.28f * std::sin((float)g_face.counter * 0.35f);
+                    scale = 1.0f + 0.30f * amount + 0.28f * amount * std::sin(T * 0.35f);
                 int ex = std::max(0, x - fw/3), ey = std::max(0, y - fh/2);
                 int ew = std::min(w - ex, fw + 2*fw/3);
                 int eh = std::min(h - ey, fh + fh);
@@ -1004,13 +1026,281 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode)
                     if (L < 1) { ddx = e ? -1.f : 1.f; ddy = -0.3f; L = 1; }
                     cv::Point tip(eye.x + (int)(ddx/L * (w+h)),
                                   eye.y + (int)(ddy/L * (w+h)));
-                    cv::line(img, eye, tip, cv::Scalar(20,20,140), std::max(6, fw/8));
-                    cv::line(img, eye, tip, cv::Scalar(40,40,255), std::max(3, fw/16));
+                    cv::line(img, eye, tip, cv::Scalar(20,20,140), std::max(6, (int)(fw/8*amount)));
+                    cv::line(img, eye, tip, cv::Scalar(40,40,255), std::max(3, (int)(fw/16*amount)));
                     cv::line(img, eye, tip, cv::Scalar(220,220,255), std::max(1, fw/40));
                     cv::circle(img, eye, std::max(4, fw/10),
                                cv::Scalar(60,60,255), cv::FILLED);
                     cv::circle(img, eye, std::max(2, fw/20),
                                cv::Scalar(255,255,255), cv::FILLED);
+                }
+            } else if (mode == 23) {
+                /* GOLDEN RATIO: the da-Vinci face-analysis meme —
+                 * fibonacci spiral, phi grid, rotating measurement
+                 * ticks and a suspiciously precise symmetry score. */
+                cv::Scalar gold(60, 200, 245);
+                float PHI = 1.618f;
+                /* phi grid over the face box */
+                int g1x = x + (int)(fw / PHI), g2x = x + fw - (int)(fw / PHI);
+                int g1y = y + (int)(fh / PHI), g2y = y + fh - (int)(fh / PHI);
+                cv::rectangle(img, cv::Rect(x, y, fw, fh), gold, 1, cv::LINE_AA);
+                cv::line(img, {g1x, y}, {g1x, y+fh}, gold, 1, cv::LINE_AA);
+                cv::line(img, {g2x, y}, {g2x, y+fh}, gold, 1, cv::LINE_AA);
+                cv::line(img, {x, g1y}, {x+fw, g1y}, gold, 1, cv::LINE_AA);
+                cv::line(img, {x, g2y}, {x+fw, g2y}, gold, 1, cv::LINE_AA);
+                /* fibonacci spiral: nested quarter-arcs shrinking by phi */
+                float rr3 = fw * 0.62f * amount;
+                float sxq = (float)(x + fw/2), syq = (float)(y + fh/2);
+                float aa0 = T * 0.01f;
+                for (int k2 = 0; k2 < 7 && rr3 > 3; k2++) {
+                    cv::ellipse(img, cv::Point((int)sxq,(int)syq),
+                                cv::Size((int)rr3,(int)rr3),
+                                aa0*57.3f + k2*90.0f, 0, 90, gold, 1, cv::LINE_AA);
+                    float na = aa0 + k2*1.5708f;
+                    sxq += std::cos(na) * rr3 * (1.0f - 1.0f/PHI);
+                    syq += std::sin(na) * rr3 * (1.0f - 1.0f/PHI);
+                    rr3 /= PHI;
+                }
+                /* landmark ticks + readouts */
+                for (int lm = 0; lm < 5; lm++) {
+                    int lx3 = (int)(f[4+lm*2]*inv), ly3 = (int)(f[5+lm*2]*inv);
+                    cv::drawMarker(img, {lx3, ly3}, gold, cv::MARKER_CROSS, 9, 1);
+                }
+                int sym = 90 + (int)(uhash((int)(x/9), (int)(y/9), 0) * 9);
+                char lab[48];
+                snprintf(lab, sizeof lab, "PHI 1.618  SYM %d%%", sym);
+                int ty2 = std::max(16, y - 10);
+                cv::putText(img, lab, {x, ty2}, cv::FONT_HERSHEY_SIMPLEX,
+                            0.55, cv::Scalar(0,0,0), 3);
+                cv::putText(img, lab, {x, ty2}, cv::FONT_HERSHEY_SIMPLEX,
+                            0.55, gold, 1);
+            } else if (mode == 20) {
+                /* PICASSO: cubism by patch surgery — your eyes, nose
+                 * and mouth swap places with soft circular blends.
+                 * amount = how far features stray. */
+                struct FPt { float sx2, sy2, dx2, dy2, r2; };
+                float k2 = 0.6f * amount;
+                FPt parts[4] = {
+                    /* src (landmark)      dst offset (face-relative) */
+                    { f[4], f[5],  0.30f, -0.34f, fw/5.5f },  /* R eye -> forehead */
+                    { f[6], f[7],  0.05f,  0.28f, fw/5.5f },  /* L eye -> cheek */
+                    { f[8], f[9], -0.30f, -0.10f, fw/5.0f },  /* nose -> left */
+                    { (f[10]+f[12])/2, (f[11]+f[13])/2,
+                                   0.26f,  0.05f, fw/4.5f },  /* mouth -> right */
+                };
+                cv::Mat srcimg = img.clone();
+                for (int p2 = 0; p2 < 4; p2++) {
+                    int r3 = std::max(6, (int)parts[p2].r2);
+                    int sx3 = (int)(parts[p2].sx2 * inv);
+                    int sy3 = (int)(parts[p2].sy2 * inv);
+                    int dx3 = sx3 + (int)(parts[p2].dx2 * fw * k2);
+                    int dy3 = sy3 + (int)(parts[p2].dy2 * fh * k2);
+                    if (sx3-r3<0||sy3-r3<0||sx3+r3>=w||sy3+r3>=h) continue;
+                    if (dx3-r3<0||dy3-r3<0||dx3+r3>=w||dy3+r3>=h) continue;
+                    for (int yy = -r3; yy < r3; yy++) {
+                        const cv::Vec3b *sr = srcimg.ptr<cv::Vec3b>(sy3+yy);
+                        cv::Vec3b *dr = img.ptr<cv::Vec3b>(dy3+yy);
+                        float ny = (float)yy / r3;
+                        for (int xx = -r3; xx < r3; xx++) {
+                            float nx = (float)xx / r3;
+                            float d2 = nx*nx + ny*ny;
+                            if (d2 >= 1.0f) continue;
+                            float al = d2 < 0.55f ? 1.0f : (1.0f-d2)/0.45f;
+                            dr[dx3+xx][0]=(uchar)(dr[dx3+xx][0]+(sr[sx3+xx][0]-dr[dx3+xx][0])*al);
+                            dr[dx3+xx][1]=(uchar)(dr[dx3+xx][1]+(sr[sx3+xx][1]-dr[dx3+xx][1])*al);
+                            dr[dx3+xx][2]=(uchar)(dr[dx3+xx][2]+(sr[sx3+xx][2]-dr[dx3+xx][2])*al);
+                        }
+                    }
+                }
+            } else if (mode == 21) {
+                /* TIME RIPPLE: pixels near your face live in the
+                 * present; the further away, the deeper in the past —
+                 * waves of time delay radiate from your head. amount =
+                 * how deep the past reaches. */
+                static cv::Mat ring[14];
+                static int ri = 0, rqw = 0, rqh = 0;
+                int QW = w/4, QH = h/4;
+                if (rqw != QW || rqh != QH) {
+                    for (int i = 0; i < 14; i++) ring[i].release();
+                    rqw = QW; rqh = QH; ri = 0;
+                }
+                cv::Mat q;
+                cv::resize(img, q, cv::Size(QW, QH), 0, 0, cv::INTER_AREA);
+                q.copyTo(ring[ri]);
+                float fcx = (x + fw/2) / 4.0f, fcy = (y + fh/2) / 4.0f;
+                float rmax = std::sqrt((float)(QW*QW + QH*QH)) * 0.55f;
+                cv::Mat outq(QH, QW, CV_8UC3);
+                for (int yy = 0; yy < QH; yy++) {
+                    cv::Vec3b *op = outq.ptr<cv::Vec3b>(yy);
+                    float dy = yy - fcy;
+                    for (int xx = 0; xx < QW; xx++) {
+                        float dx = xx - fcx;
+                        float d = std::sqrt(dx*dx + dy*dy) / rmax;
+                        int delay = (int)(d * 13 * std::min(1.0f, amount));
+                        if (delay > 13) delay = 13;
+                        int gi = (ri - delay + 14) % 14;
+                        const cv::Mat &g2 = ring[gi].empty() ? ring[ri] : ring[gi];
+                        op[xx] = g2.at<cv::Vec3b>(yy, xx);
+                    }
+                }
+                ri = (ri + 1) % 14;
+                cv::resize(outq, img, img.size(), 0, 0, cv::INTER_LINEAR);
+            } else if (mode == 22) {
+                /* FISHEYE FACE: a barrel-lens bulge rides your face —
+                 * the closer to your nose, the bigger. amount = bulge. */
+                float R = fw * 0.95f;
+                float k2 = 0.42f * amount;
+                float fcx = (float)(x + fw/2), fcy = (float)(y + fh/2);
+                int x0 = std::max(0, (int)(fcx - R)), x1 = std::min(w-1, (int)(fcx + R));
+                int y0 = std::max(0, (int)(fcy - R)), y1 = std::min(h-1, (int)(fcy + R));
+                if (x1 > x0+8 && y1 > y0+8) {
+                    cv::Mat srcimg = img(cv::Rect(x0, y0, x1-x0, y1-y0)).clone();
+                    for (int Y = y0; Y < y1; Y++) {
+                        cv::Vec3b *ip = img.ptr<cv::Vec3b>(Y);
+                        float dy = (Y - fcy) / R;
+                        for (int X = x0; X < x1; X++) {
+                            float dx = (X - fcx) / R;
+                            float r2 = dx*dx + dy*dy;
+                            if (r2 >= 1.0f) continue;
+                            float f2 = 1.0f - k2 * (1.0f - r2);
+                            int sx2 = (int)(fcx + dx*R*f2) - x0;
+                            int sy2 = (int)(fcy + dy*R*f2) - y0;
+                            if (sx2 < 0 || sy2 < 0 ||
+                                sx2 >= srcimg.cols || sy2 >= srcimg.rows) continue;
+                            ip[X] = srcimg.at<cv::Vec3b>(sy2, sx2);
+                        }
+                    }
+                }
+            } else if (mode == 16) {
+                /* SPARKLE EYES: anime glints — 4-point stars twinkling
+                 * at your eyes and cheeks. amount = density/size. */
+                int nsp = (int)(3 * amount) + 2;
+                for (int k2 = 0; k2 < nsp; k2++) {
+                    /* anchor on eyes + cheek points, jittered per-star */
+                    float bx2 = (k2 % 2) ? f[4] : f[6];
+                    float by2 = (k2 % 2) ? f[5] : f[7];
+                    if (k2 >= 2) { by2 += fh * 0.22f / inv; }
+                    int sx2 = (int)(bx2 * inv) + (int)((uhash(k2,3,0)-0.5f)*fw*0.3f);
+                    int sy2 = (int)(by2 * inv) + (int)((uhash(k2,7,0)-0.5f)*fh*0.2f);
+                    float tw = 0.5f + 0.5f * std::sin(T * 0.22f + k2 * 1.9f);
+                    if (tw < 0.35f) continue;              /* twinkle off-phase */
+                    int r5 = std::max(2, (int)(fw / 22 * amount * tw));
+                    if (sx2 < r5 || sy2 < r5 || sx2 >= w-r5 || sy2 >= h-r5) continue;
+                    cv::Scalar wht(255,255,255);
+                    cv::line(img, {sx2-r5,sy2}, {sx2+r5,sy2}, wht, 2);
+                    cv::line(img, {sx2,sy2-r5}, {sx2,sy2+r5}, wht, 2);
+                    cv::line(img, {sx2-r5/2,sy2-r5/2}, {sx2+r5/2,sy2+r5/2}, wht, 1);
+                    cv::line(img, {sx2-r5/2,sy2+r5/2}, {sx2+r5/2,sy2-r5/2}, wht, 1);
+                    cv::circle(img, {sx2,sy2}, std::max(1,r5/3), wht, cv::FILLED);
+                }
+            } else if (mode == 17) {
+                /* HALO: a golden ring floats and bobs above your head,
+                 * with a soft additive glow. amount = size. */
+                int hx2 = x + fw/2;
+                int hy2 = y - fh/3 + (int)(std::sin(T * 0.08f) * fh * 0.06f);
+                int ra = (int)(fw * 0.42f * amount);
+                int rb = std::max(3, ra / 4);
+                if (hy2 - rb > 0) {
+                    for (int g2 = 3; g2 >= 1; g2--)      /* glow layers */
+                        cv::ellipse(img, cv::Point(hx2, hy2), cv::Size(ra+g2*3, rb+g2*2),
+                                    0, 0, 360, cv::Scalar(30*g2, 60*g2, 70*g2), 2);
+                    cv::ellipse(img, cv::Point(hx2, hy2), cv::Size(ra, rb),
+                                0, 0, 360, cv::Scalar(90, 210, 255),
+                                std::max(3, fw/28));
+                    cv::ellipse(img, cv::Point(hx2, hy2), cv::Size(ra, rb),
+                                0, 200, 340, cv::Scalar(200, 250, 255),
+                                std::max(1, fw/56));
+                }
+            } else if (mode == 18) {
+                /* CLOWN: red nose (tracks the nose landmark), white eye
+                 * patches, rosy cheeks. amount = nose size. */
+                cv::Point nz((int)(f[8]*inv), (int)(f[9]*inv));
+                int nr = std::max(5, (int)(fw / 6 * amount));
+                for (int e2 = 0; e2 < 2; e2++) {          /* eye patches */
+                    cv::Point ey((int)(f[4+e2*2]*inv), (int)(f[5+e2*2]*inv));
+                    cv::circle(img, ey, (int)(nr*0.9f), cv::Scalar(240,240,245), cv::FILLED);
+                    cv::circle(img, ey, std::max(2,(int)(nr*0.35f)), cv::Scalar(40,40,40), cv::FILLED);
+                }
+                cv::circle(img, {x + fw/6, y + fh*2/3}, nr,           /* cheeks */
+                           cv::Scalar(120,120,250), cv::FILLED);
+                cv::circle(img, {x + fw*5/6, y + fh*2/3}, nr,
+                           cv::Scalar(120,120,250), cv::FILLED);
+                cv::circle(img, nz, nr, cv::Scalar(40,40,230), cv::FILLED);
+                cv::circle(img, {nz.x - nr/3, nz.y - nr/3},
+                           std::max(2, nr/4), cv::Scalar(120,120,255), cv::FILLED);
+            } else if (mode == 19) {
+                /* AUTO-DIRECTOR: the camera dollies to keep your face
+                 * centered at a constant size, smoothly — Center Stage
+                 * for any app. amount = framing tightness (how big your
+                 * face is held), speed = follow responsiveness. */
+                static float zcx = -1, zcy = -1, zfw = -1;
+                float k2 = 0.03f * speed;                  /* follow EMA */
+                float tcx = x + fw/2.f, tcy = y + fh/2.f, tfw = (float)fw;
+                if (zcx < 0) { zcx = tcx; zcy = tcy; zfw = tfw; }
+                zcx += (tcx - zcx) * k2;
+                zcy += (tcy - zcy) * k2;
+                zfw += (tfw - zfw) * k2 * 0.6f;
+                /* target: face occupies ~ amount * 22% of frame width */
+                float zoom = (0.22f * amount * w) / std::max(24.0f, zfw);
+                if (zoom < 1.02f) zoom = 1.02f;
+                if (zoom > 2.6f)  zoom = 2.6f;
+                int cw = (int)(w / zoom), ch = (int)(h / zoom);
+                int cx0 = (int)(zcx - cw/2), cy0 = (int)(zcy - ch*0.42f);
+                cx0 = std::max(0, std::min(w - cw, cx0));
+                cy0 = std::max(0, std::min(h - ch, cy0));
+                cv::Mat crop = img(cv::Rect(cx0, cy0, cw, ch)).clone();
+                cv::resize(crop, img, img.size(), 0, 0, cv::INTER_LINEAR);
+            } else if (mode == 14) {
+                /* FACE SATELLITES: three mini-copies of your face orbit
+                 * your head like moons. */
+                int cx3 = x + fw/2, cy3 = y + fh/2;
+                int rad = (int)(std::max(fw, fh) * 1.05 * amount);
+                int mw = std::max(12, fw*2/5), mh2 = std::max(12, fh*2/5);
+                if (x >= 0 && y >= 0 && x+fw < w && y+fh < h) {
+                    cv::Mat facecp = img(cv::Rect(x, y, fw, fh)).clone();
+                    cv::Mat mini;
+                    cv::resize(facecp, mini, cv::Size(mw, mh2));
+                    float base = T * 0.05f;
+                    for (int k2 = 0; k2 < 3; k2++) {
+                        float aa = base + k2 * 2.0944f;
+                        int px = cx3 + (int)(std::cos(aa) * rad) - mw/2;
+                        int py = cy3 + (int)(std::sin(aa) * rad * 0.6f) - mh2/2;
+                        if (px < 0 || py < 0 || px+mw >= w || py+mh2 >= h) continue;
+                        for (int yy = 0; yy < mh2; yy++) {
+                            cv::Vec3b *dr = img.ptr<cv::Vec3b>(py+yy) + px;
+                            const cv::Vec3b *sr = mini.ptr<cv::Vec3b>(yy);
+                            float ny = (yy - mh2/2.f) / (mh2/2.f);
+                            for (int xx = 0; xx < mw; xx++) {
+                                float nx = (xx - mw/2.f) / (mw/2.f);
+                                float d2 = nx*nx + ny*ny;
+                                if (d2 >= 1.0f) continue;
+                                float al = d2 < 0.6f ? 1.0f : (1.0f-d2)/0.4f;
+                                dr[xx][0]=(uchar)(dr[xx][0]+(sr[xx][0]-dr[xx][0])*al);
+                                dr[xx][1]=(uchar)(dr[xx][1]+(sr[xx][1]-dr[xx][1])*al);
+                                dr[xx][2]=(uchar)(dr[xx][2]+(sr[xx][2]-dr[xx][2])*al);
+                            }
+                        }
+                    }
+                }
+            } else if (mode == 15) {
+                /* MELTING FACE: your face drips downward, Dali-style;
+                 * each column sags by its own amount, breathing slowly. */
+                float ph = (0.5f + 0.5f * std::sin(T * 0.04f)) * amount;
+                if (ph > 1.4f) ph = 1.4f;
+                int reach = fh + fh/2;
+                int y_end = std::min(h - 1, y + reach);
+                for (int c = 0; c < fw; c++) {
+                    int X = x + c;
+                    if (X < 0 || X >= w) continue;
+                    float n = uhash(c / 5, 0, 0);
+                    int sag = (int)(ph * n * fh * 0.55f);
+                    if (sag < 2) continue;
+                    for (int Y = y_end; Y > y + sag; Y--) {
+                        int sy2 = y + (int)((float)(Y - y - sag) * (float)(y_end - y)
+                                            / (float)(y_end - y - sag + 1));
+                        sy2 = std::max(0, std::min(h - 1, sy2));
+                        img.at<cv::Vec3b>(Y, X) = img.at<cv::Vec3b>(sy2, X);
+                    }
                 }
             } else if (mode == 9) {
                 /* MIRROR FACE: left half of your face reflected right */
@@ -1060,7 +1350,7 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode)
                 cv::Point c3(x+fw/2,y+fh/2);
                 int R5=(int)(std::max(fw,fh)*0.75);
                 cv::Scalar g3(80,255,80);
-                float a3=(float)(g_face.counter%90)/90.0f*6.2832f;
+                float a3=std::fmod(T, 90.0f)/90.0f*6.2832f;
                 for(int k2=0;k2<4;k2++){
                     float aa=a3+k2*1.5708f;
                     cv::ellipse(img,c3,cv::Size(R5,R5),aa*57.3,0,60,g3,2);
@@ -1094,7 +1384,7 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode)
 }
 
 void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
-                  float edge, float smooth)
+                  float edge, float smooth, float size, float fx)
 {
     if (!data || w < 16 || h < 16) return;
     if (edge <= 0.0f) edge = 0.22f;          /* mask generosity: lower = more hair */
@@ -1103,6 +1393,13 @@ void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
     if (smooth <= 0.0f) smooth = 0.80f;      /* responsiveness: 1 = instant */
     if (smooth < 0.40f) smooth = 0.40f;
     if (smooth > 1.00f) smooth = 1.00f;
+    if (fx <= 0.0f) fx = 1.0f;               /* per-mode effect strength */
+    if (fx < 0.2f) fx = 0.2f;
+    if (fx > 3.0f) fx = 3.0f;
+    int size_w = (int)size;                  /* RVM refinement width */
+    if (size_w <= 0) size_w = 512;           /* 0 = default */
+    if (size_w < 256) size_w = 256;
+    if (size_w > 640) size_w = 640;
     try {
         std::lock_guard<std::mutex> lock(g_seg.mtx);
         cv::Mat img = wrap_bgr(data, w, h, stride);
@@ -1157,7 +1454,21 @@ void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
                     }
                 }
             }
-            cv::Mat m = rvm_infer(img);
+            /* ── adaptive pacing: measure inference cost and skip the
+             * right number of frames to stay realtime. The recurrent
+             * matte + EMA hide the skips; the picture stays smooth
+             * because only the MASK updates less often, never the
+             * video. 0 skips under ~24 ms, up to 3 when very slow. */
+            static int skip_left = 0;
+            static double ema_ms = 0.0;
+            if (skip_left > 0 && !g_seg.mask.empty() &&
+                g_seg.mask.size() == img.size()) {
+                skip_left--;
+                goto mask_ready;   /* reuse previous mask this frame */
+            }
+            {
+            auto t0 = std::chrono::steady_clock::now();
+            cv::Mat m = rvm_infer(img, size_w);
             if (!m.empty()) {
                 /* RVM alpha is already clean; light remap honors 'edge' */
                 m = (m - edge*0.5) * (1.0/(1.0 - edge*0.5));
@@ -1167,12 +1478,20 @@ void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
             } else {
                 return;   /* RVM just died and pphumanseg is absent */
             }
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+            ema_ms = (ema_ms <= 0.0) ? ms : 0.7*ema_ms + 0.3*ms;
+            skip_left = (ema_ms <= 24.0) ? 0
+                      : (ema_ms <= 48.0) ? 1
+                      : (ema_ms <= 80.0) ? 2 : 3;
             if (!m.empty()) {
                 if (!g_seg.mask.empty() && g_seg.mask.size() == m.size())
                     cv::addWeighted(m, smooth, g_seg.mask, 1.0 - smooth, 0.0, g_seg.mask);
                 else
                     m.copyTo(g_seg.mask);
             }
+            }              /* end of timed inference block */
+mask_ready: ;
         }
         if (g_seg.mask.empty() || g_seg.mask.size() != img.size()) return;
 
@@ -1265,6 +1584,1932 @@ void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
                     ip[x][2]=(uchar)(ip[x][2]+(tp[x][2]-ip[x][2])*a);
                 }
             }
+            return;
+        }
+        if (mode == 56) {
+            /* COLOR POP: the room falls to a cool, slightly dark
+             * monochrome; you stay in full — slightly enriched — color.
+             * The classic gallery look. fx = how muted the room goes. */
+            float mute = std::min(1.0f, 0.75f * fx);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    float lum = ip[x][0]*0.114f + ip[x][1]*0.587f + ip[x][2]*0.299f;
+                    if (a < 0.98f) {
+                        float k = (1.0f - a) * mute;
+                        float b2 = lum*0.92f + 8, g2 = lum*0.90f, r2 = lum*0.84f;
+                        ip[x][0]=(uchar)(ip[x][0]+(b2-ip[x][0])*k);
+                        ip[x][1]=(uchar)(ip[x][1]+(g2-ip[x][1])*k);
+                        ip[x][2]=(uchar)(ip[x][2]+(r2-ip[x][2])*k);
+                    }
+                    if (a > 0.02f) {                     /* enrich you a touch */
+                        float k = a * 0.18f;
+                        ip[x][0]=clamp_int_u8((int)(lum + (ip[x][0]-lum)*(1+k)));
+                        ip[x][1]=clamp_int_u8((int)(lum + (ip[x][1]-lum)*(1+k)));
+                        ip[x][2]=clamp_int_u8((int)(lum + (ip[x][2]-lum)*(1+k)));
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 57) {
+            /* CINEMA: 2.39:1 letterbox, teal-orange split-tone, gentle
+             * S-curve contrast, fine grain. The movie look, done with
+             * restraint. fx = grade strength. */
+            unsigned tk = g_seg.counter;
+            float G = 0.5f * std::min(1.6f, fx);
+            for (int y = 0; y < img.rows; y++) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    for (int c2 = 0; c2 < 3; c2++) {      /* S-curve */
+                        float v = ip[x][c2] / 255.0f;
+                        float sc = v*v*(3.0f - 2.0f*v);
+                        ip[x][c2] = (uchar)((v + (sc - v)*G*0.7f) * 255.0f);
+                    }
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    float sh = (1.0f - lum);              /* shadows -> teal */
+                    float hi = lum;                       /* highlights -> warm */
+                    ip[x][0]=clamp_int_u8(ip[x][0] + (int)((sh*14 - hi*6)*G*2));
+                    ip[x][1]=clamp_int_u8(ip[x][1] + (int)((sh*6)*G*2));
+                    ip[x][2]=clamp_int_u8(ip[x][2] + (int)((hi*16 - sh*8)*G*2));
+                    int gr = (int)((uhash(x, y, tk) - 0.5f) * 7 * G);
+                    ip[x][0]=clamp_int_u8(ip[x][0]+gr);
+                    ip[x][1]=clamp_int_u8(ip[x][1]+gr);
+                    ip[x][2]=clamp_int_u8(ip[x][2]+gr);
+                }
+            }
+            int barH = std::max(0, (int)((img.rows - img.cols / 2.39f) / 2));
+            if (barH > 0 && barH < img.rows/2) {
+                img.rowRange(0, barH) = cv::Scalar(0,0,0);
+                img.rowRange(img.rows - barH, img.rows) = cv::Scalar(0,0,0);
+            }
+            return;
+        }
+        if (mode == 58) {
+            /* BOKEH PRO: a real lens-style background — highlights
+             * bloom into soft discs instead of dissolving into gaussian
+             * mush; you stay tack sharp. fx = aperture. */
+            int QW = img.cols/4, QH = img.rows/4;
+            cv::Mat q, blur2, bright;
+            cv::resize(img, q, cv::Size(QW, QH), 0, 0, cv::INTER_AREA);
+            double sig = 2.5 + 2.5 * fx;
+            cv::GaussianBlur(q, blur2, cv::Size(0,0), sig);
+            /* highlight discs: threshold, disc-ish dilate, soften */
+            bright = q.clone();
+            for (int y = 0; y < QH; y++) {
+                cv::Vec3b *bp = bright.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < QW; x++) {
+                    int mx2 = std::max(bp[x][0], std::max(bp[x][1], bp[x][2]));
+                    if (mx2 < 200) bp[x] = cv::Vec3b(0,0,0);
+                }
+            }
+            int it = 2 + (int)fx;
+            cv::dilate(bright, bright, cv::Mat(), cv::Point(-1,-1), it);
+            cv::GaussianBlur(bright, bright, cv::Size(0,0), 1.5);
+            cv::Mat bg;
+            cv::addWeighted(blur2, 1.0, bright, 0.55, 0, bg);
+            cv::Mat bgf;
+            cv::resize(bg, bgf, img.size(), 0, 0, cv::INTER_LINEAR);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *bp = bgf.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float k = 1.0f - mm[x];
+                    if (k < 0.02f) continue;
+                    ip[x][0]=(uchar)(ip[x][0]+(bp[x][0]-ip[x][0])*k);
+                    ip[x][1]=(uchar)(ip[x][1]+(bp[x][1]-ip[x][1])*k);
+                    ip[x][2]=(uchar)(ip[x][2]+(bp[x][2]-ip[x][2])*k);
+                }
+            }
+            return;
+        }
+        if (mode == 59) {
+            /* STUDIO LIGHT: quiet three-point relighting — a warm key
+             * lift on you, a cool rim from the upper-left, the room
+             * eased down with a vignette. The "look better" button.
+             * fx = light strength. */
+            float K = 0.5f * fx;
+            cv::Mat gx2, gy2;
+            cv::Sobel(g_seg.mask, gx2, CV_32F, 1, 0, 3);
+            cv::Sobel(g_seg.mask, gy2, CV_32F, 0, 1, 3);
+            float vcx2 = img.cols/2.f, vcy2 = img.rows/2.f;
+            float vmax = vcx2*vcx2 + vcy2*vcy2;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const float *px2 = gx2.ptr<float>(y);
+                const float *py2 = gy2.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                float dy = y - vcy2;
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    if (a > 0.02f) {                      /* warm key */
+                        float k = a * 0.14f * K * 2;
+                        ip[x][0]=clamp_int_u8((int)(ip[x][0]*(1+k*0.7f)));
+                        ip[x][1]=clamp_int_u8((int)(ip[x][1]*(1+k*0.9f)));
+                        ip[x][2]=clamp_int_u8((int)(ip[x][2]*(1+k*1.15f)));
+                    }
+                    if (a > 0.04f && a < 0.96f) {         /* cool rim, up-left */
+                        float gl = std::sqrt(px2[x]*px2[x]+py2[x]*py2[x]);
+                        if (gl > 0.02f) {
+                            float rim = (px2[x]*0.7f + py2[x]*0.7f) / gl;
+                            if (rim > 0) {
+                                int r3 = (int)(rim*rim*130*K);
+                                ip[x][0]=clamp_int_u8(ip[x][0]+r3);
+                                ip[x][1]=clamp_int_u8(ip[x][1]+(int)(r3*0.9f));
+                                ip[x][2]=clamp_int_u8(ip[x][2]+(int)(r3*0.75f));
+                            }
+                        }
+                    }
+                    if (a < 0.9f) {                       /* eased room + vignette */
+                        float dx = x - vcx2;
+                        float vg = (dx*dx + dy*dy) / vmax;
+                        float dim = (1.0f - a) * (0.06f + vg*0.22f) * K * 2;
+                        ip[x][0]=(uchar)(ip[x][0]*(1-dim));
+                        ip[x][1]=(uchar)(ip[x][1]*(1-dim));
+                        ip[x][2]=(uchar)(ip[x][2]*(1-dim));
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 60) {
+            /* NIGHT BOOST: dark-room rescue — shadow lift + gentle
+             * denoise on YOU, while the room keeps its evening mood.
+             * fx = lift. */
+            cv::Mat soft;
+            cv::GaussianBlur(img, soft, cv::Size(0,0), 1.6);
+            float L = std::min(1.5f, fx);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *sp = soft.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    if (a < 0.03f) continue;
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    /* gamma lift, strongest in the shadows */
+                    float lifted = std::pow(lum, 1.0f/(1.0f + 0.55f*L));
+                    float gainv = lum > 0.004f ? lifted/lum : 1.0f;
+                    if (gainv > 3.5f) gainv = 3.5f;
+                    /* dark pixels borrow from the blur = cheap denoise */
+                    float dn = (1.0f - lum) * 0.45f * a;
+                    for (int c2 = 0; c2 < 3; c2++) {
+                        float v = ip[x][c2] + (sp[x][c2]-ip[x][c2])*dn;
+                        ip[x][c2] = clamp_int_u8((int)(v * (1 + (gainv-1)*a)));
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 61) {
+            /* GREEN SCREEN OUT: you, cleanly keyed over solid chroma —
+             * feed this straight into OBS/your compositor and key it
+             * there. fx < 1.5 = green, >= 1.5 = blue. */
+            cv::Vec3b chroma = (fx < 1.5f) ? cv::Vec3b(0, 255, 0)
+                                           : cv::Vec3b(255, 64, 0);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float k = 1.0f - mm[x];
+                    if (k < 0.02f) continue;
+                    ip[x][0]=(uchar)(ip[x][0]+(chroma[0]-ip[x][0])*k);
+                    ip[x][1]=(uchar)(ip[x][1]+(chroma[1]-ip[x][1])*k);
+                    ip[x][2]=(uchar)(ip[x][2]+(chroma[2]-ip[x][2])*k);
+                }
+            }
+            return;
+        }
+        if (mode == 62) {
+            /* BRB PRIVACY: step out of frame and after ~1.5 s the feed
+             * pixelates and dims with a BRB card; step back and it
+             * clears instantly. Nobody watches your empty chair. */
+            static int absent = 0;
+            double cover = 0;
+            for (int y = 0; y < img.rows; y += 12) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 12)
+                    if (mm[x] > 0.4f) cover += 1;
+            }
+            if (cover > 6) absent = 0; else absent++;
+            if (absent > 45) {
+                cv::Mat tiny;
+                cv::resize(img, tiny, cv::Size(img.cols/28, img.rows/28));
+                cv::resize(tiny, img, img.size(), 0, 0, cv::INTER_NEAREST);
+                img *= 0.55;
+                cv::putText(img, "BRB", cv::Point(img.cols/2-95, img.rows/2+25),
+                            cv::FONT_HERSHEY_TRIPLEX, 3.0, cv::Scalar(20,20,20), 12);
+                cv::putText(img, "BRB", cv::Point(img.cols/2-95, img.rows/2+25),
+                            cv::FONT_HERSHEY_TRIPLEX, 3.0, cv::Scalar(235,235,235), 4);
+            }
+            return;
+        }
+        if (mode == 63) {
+            /* POP-OUT: a soft contact shadow falls from you onto the
+             * real room, and you get a whisper of lift — suddenly the
+             * flat webcam image has depth. fx = shadow reach. */
+            cv::Mat mb;
+            cv::GaussianBlur(g_seg.mask, mb, cv::Size(0,0), 7.0);
+            int ox2 = (int)(14 * fx), oy2 = (int)(18 * fx);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const float *sb = (y >= oy2) ? mb.ptr<float>(y - oy2) : NULL;
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    if (a < 0.5f && sb && x >= ox2) {     /* the shadow */
+                        float sh = sb[x - ox2] * (1.0f - a) * 0.38f;
+                        if (sh > 0.02f) {
+                            ip[x][0]=(uchar)(ip[x][0]*(1-sh));
+                            ip[x][1]=(uchar)(ip[x][1]*(1-sh));
+                            ip[x][2]=(uchar)(ip[x][2]*(1-sh));
+                        }
+                    }
+                    if (a > 0.02f) {                      /* the lift */
+                        float k = a * 0.06f;
+                        ip[x][0]=clamp_int_u8((int)(ip[x][0]*(1+k)));
+                        ip[x][1]=clamp_int_u8((int)(ip[x][1]*(1+k)));
+                        ip[x][2]=clamp_int_u8((int)(ip[x][2]*(1+k)));
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 64) {
+            /* DOLLY ZOOM: the Hitchcock shot — the room slowly breathes
+             * in and out of scale around your head while you stay
+             * exactly the same size. Quietly unsettling. fx = depth. */
+            unsigned tk = g_seg.counter;
+            static float acx = -1, acy = -1;
+            double sx=0, sy=0, sw2=0;
+            for (int y = 0; y < img.rows/2; y += 6) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 6)
+                    if (mm[x] > 0.4f) { sx+=x; sy+=y; sw2++; }
+            }
+            float tx2 = sw2>4 ? (float)(sx/sw2) : img.cols/2.f;
+            float ty2 = sw2>4 ? (float)(sy/sw2) : img.rows/2.5f;
+            if (acx < 0) { acx=tx2; acy=ty2; }
+            acx += (tx2-acx)*0.04f; acy += (ty2-acy)*0.04f;
+            float sc2 = 1.0f + 0.06f * fx * std::sin(tk * 0.017f);
+            cv::Mat keep = img.clone();
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                float dy = (y - acy) / sc2;
+                for (int x = 0; x < img.cols; x++) {
+                    if (mm[x] > 0.5f) continue;           /* you stay put */
+                    int sx2 = (int)(acx + (x - acx) / sc2);
+                    int sy2 = (int)(acy + dy);
+                    if (sx2<0||sy2<0||sx2>=img.cols||sy2>=img.rows) continue;
+                    float a = mm[x];
+                    cv::Vec3b v = keep.at<cv::Vec3b>(sy2, sx2);
+                    ip[x][0]=(uchar)(v[0]+(ip[x][0]-v[0])*a);
+                    ip[x][1]=(uchar)(v[1]+(ip[x][1]-v[1])*a);
+                    ip[x][2]=(uchar)(v[2]+(ip[x][2]-v[2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 65) {
+            /* DUOTONE POSTER: the frame gradient-mapped to a curated
+             * two-color palette — Spotify-cover graphic design, with
+             * you lifted slightly out of the ink. fx = 1..4 picks:
+             * 1 navy/coral  2 plum/amber  3 forest/cream  4 noir. */
+            static const int PAL[4][2][3] = {   /* dark BGR, light BGR */
+                {{70,25,15},{110,160,255}}, {{60,15,45},{60,190,255}},
+                {{40,45,12},{200,235,240}}, {{18,16,16},{225,225,230}}};
+            int pi = std::min(3, std::max(0, (int)fx - 1));
+            const int *D = PAL[pi][0], *L2 = PAL[pi][1];
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    lum = std::min(1.0f, lum * (1.0f + mm[x]*0.22f));
+                    lum = lum*lum*(3.0f - 2.0f*lum);      /* punchy midtones */
+                    ip[x][0]=(uchar)(D[0]+(L2[0]-D[0])*lum);
+                    ip[x][1]=(uchar)(D[1]+(L2[1]-D[1])*lum);
+                    ip[x][2]=(uchar)(D[2]+(L2[2]-D[2])*lum);
+                }
+            }
+            return;
+        }
+        if (mode == 48) {
+            /* GOD RAYS: volumetric light streams past you — screen-space
+             * crepuscular rays, occluded by your silhouette. fx = ray
+             * strength. */
+            unsigned tk = g_seg.counter;
+            float lx2 = img.cols * (0.5f + 0.35f * std::sin(tk * 0.004f));
+            float ly2 = -img.rows * 0.15f;
+            int QW = img.cols/4, QH = img.rows/4;
+            cv::Mat qm, ql(QH, QW, CV_32F), rays(QH, QW, CV_32F, cv::Scalar(0));
+            cv::resize(g_seg.mask, qm, cv::Size(QW, QH));
+            {   /* light source map: bright sky, occluded by you */
+                cv::Mat qi; cv::resize(img, qi, cv::Size(QW, QH));
+                for (int y = 0; y < QH; y++) {
+                    const cv::Vec3b *ip = qi.ptr<cv::Vec3b>(y);
+                    const float *mm = qm.ptr<float>(y);
+                    float *lp = ql.ptr<float>(y);
+                    for (int x = 0; x < QW; x++) {
+                        float lum = (ip[x][0]+ip[x][1]+ip[x][2]) / (3.f*255);
+                        lp[x] = (0.35f + 0.65f*lum) * (1.0f - mm[x]);
+                    }
+                }
+            }
+            const int K = 22;
+            float qlx = lx2/4, qly = ly2/4;
+            for (int y = 0; y < QH; y++) {
+                float *rp = rays.ptr<float>(y);
+                for (int x = 0; x < QW; x++) {
+                    float dx = (qlx - x) / K, dy = (qly - y) / K;
+                    float acc = 0, sxp = (float)x, syp = (float)y, decay = 1.0f;
+                    for (int k2 = 0; k2 < K; k2++) {
+                        sxp += dx; syp += dy;
+                        int ix = (int)sxp, iy = (int)syp;
+                        if (ix < 0 || iy < 0 || ix >= QW || iy >= QH) break;
+                        acc += ql.at<float>(iy, ix) * decay;
+                        decay *= 0.93f;
+                    }
+                    rp[x] = acc / K;
+                }
+            }
+            cv::Mat rf; cv::resize(rays, rf, img.size(), 0, 0, cv::INTER_LINEAR);
+            float st = 220.0f * fx;
+            for (int y = 0; y < img.rows; y++) {
+                const float *rp = rf.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float v = rp[x]; if (v < 0.03f) continue;
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)(v*st*0.55f));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(v*st*0.85f));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(v*st));
+                }
+            }
+            return;
+        }
+        if (mode == 49) {
+            /* TRON TRACE: your outline as a glowing neon circuit with a
+             * bright pulse RACING around the perimeter. fx = glow. */
+            unsigned tk = g_seg.counter;
+            img *= 0.45;
+            cv::Mat keep2;
+            {   /* keep the person mildly lit */
+                for (int y = 0; y < img.rows; y++) {
+                    const float *mm = g_seg.mask.ptr<float>(y);
+                    cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                    for (int x = 0; x < img.cols; x++) {
+                        float a = mm[x] * 0.5f; if (a < 0.02f) continue;
+                        ip[x][0]=clamp_int_u8((int)(ip[x][0]*(1+a)));
+                        ip[x][1]=clamp_int_u8((int)(ip[x][1]*(1+a)));
+                        ip[x][2]=clamp_int_u8((int)(ip[x][2]*(1+a)));
+                    }
+                }
+            }
+            (void)keep2;
+            cv::Mat q, q8;
+            cv::resize(g_seg.mask, q, cv::Size(), 0.25, 0.25);
+            q8 = q > 0.5;
+            std::vector<std::vector<cv::Point>> ctrs;
+            cv::findContours(q8, ctrs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+            if (!ctrs.empty()) {
+                size_t big = 0;
+                for (size_t i = 1; i < ctrs.size(); i++)
+                    if (ctrs[i].size() > ctrs[big].size()) big = i;
+                std::vector<cv::Point> C2(ctrs[big].size());
+                for (size_t i = 0; i < C2.size(); i++)
+                    C2[i] = cv::Point(ctrs[big][i].x*4, ctrs[big][i].y*4);
+                int gw = std::max(2, (int)(6*fx));
+                cv::polylines(img, C2, true, cv::Scalar(120,60,10), gw+6, cv::LINE_AA);
+                cv::polylines(img, C2, true, cv::Scalar(255,160,40), gw, cv::LINE_AA);
+                cv::polylines(img, C2, true, cv::Scalar(255,240,200), 1, cv::LINE_AA);
+                /* the racing pulse: a bright arc of ~8% perimeter */
+                size_t N2 = C2.size();
+                if (N2 > 24) {
+                    size_t head2 = (size_t)(tk * 6) % N2;
+                    size_t seg2 = std::max((size_t)8, N2 / 12);
+                    for (size_t i = 0; i < seg2; i++) {
+                        size_t a2 = (head2 + i) % N2, b2 = (head2 + i + 1) % N2;
+                        float br = 1.0f - (float)i / seg2;
+                        cv::line(img, C2[a2], C2[b2],
+                                 cv::Scalar(255*br, 255*br, 255),
+                                 (int)(gw + 3*br), cv::LINE_AA);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 50) {
+            /* SHOCKWAVE: move fast and an expanding refraction ring
+             * bursts out of you. fx = ring power. */
+            static float rr2[3] = {-1,-1,-1};
+            static float rcx2[3], rcy2[3];
+            static float pcx2 = -1, pcy2 = -1;
+            unsigned tk = g_seg.counter;
+            double sx=0, sy=0, sw2=0;
+            for (int y = 0; y < img.rows; y += 8) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 8)
+                    if (mm[x] > 0.4f) { sx+=x; sy+=y; sw2++; }
+            }
+            if (sw2 > 4) {
+                float cx2=(float)(sx/sw2), cy2=(float)(sy/sw2);
+                if (pcx2 >= 0) {
+                    float v = std::sqrt((cx2-pcx2)*(cx2-pcx2)+(cy2-pcy2)*(cy2-pcy2));
+                    if (v > img.cols * 0.013f && (tk % 5) == 0) {
+                        for (int r3 = 0; r3 < 3; r3++) if (rr2[r3] < 0) {
+                            rr2[r3] = 10; rcx2[r3] = cx2; rcy2[r3] = cy2; break;
+                        }
+                    }
+                }
+                pcx2 = cx2; pcy2 = cy2;
+            }
+            cv::Mat keep = img.clone();
+            for (int r3 = 0; r3 < 3; r3++) {
+                if (rr2[r3] < 0) continue;
+                rr2[r3] += 16;
+                float R = rr2[r3];
+                float band = 26.0f;
+                if (R > img.cols) { rr2[r3] = -1; continue; }
+                int x0 = std::max(0, (int)(rcx2[r3]-R-band));
+                int x1 = std::min(img.cols-1, (int)(rcx2[r3]+R+band));
+                int y0 = std::max(0, (int)(rcy2[r3]-R-band));
+                int y1 = std::min(img.rows-1, (int)(rcy2[r3]+R+band));
+                float fade = 1.0f - R / img.cols;
+                for (int y = y0; y <= y1; y++) {
+                    cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                    float dy = y - rcy2[r3];
+                    for (int x = x0; x <= x1; x++) {
+                        float dx = x - rcx2[r3];
+                        float d = std::sqrt(dx*dx + dy*dy);
+                        float dd = d - R;
+                        if (std::fabs(dd) > band) continue;
+                        float k2 = (1.0f - std::fabs(dd)/band);
+                        float push = k2*k2 * 22.0f * fx * fade;
+                        int sx2 = (int)(x + dx/std::max(1.f,d)*push);
+                        int sy2 = (int)(y + dy/std::max(1.f,d)*push);
+                        if (sx2<0||sy2<0||sx2>=img.cols||sy2>=img.rows) continue;
+                        ip[x] = keep.at<cv::Vec3b>(sy2, sx2);
+                        int gl = (int)(k2 * 60 * fade);
+                        ip[x][0]=clamp_int_u8(ip[x][0]+gl);
+                        ip[x][1]=clamp_int_u8(ip[x][1]+gl);
+                        ip[x][2]=clamp_int_u8(ip[x][2]+gl);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 51) {
+            /* RAPTURE: a pillar of light takes you — you slowly levitate
+             * inside a golden beam while sparks rise. fx = lift. */
+            unsigned tk = g_seg.counter;
+            float phase = 0.5f - 0.5f * std::cos(tk * 0.02f);
+            int lift = (int)(phase * img.rows * 0.14f * fx);
+            double sx=0, sw2=0;
+            for (int y = 0; y < img.rows; y += 8) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 8)
+                    if (mm[x] > 0.4f) { sx+=x; sw2++; }
+            }
+            float ccx = sw2>4 ? (float)(sx/sw2) : img.cols/2.f;
+            cv::Mat out2; g_seg.bg_est.copyTo(out2);
+            for (int y = 0; y < img.rows; y++) {          /* lifted you */
+                int sy2 = y + lift;
+                if (sy2 >= img.rows) continue;
+                const float *mm = g_seg.mask.ptr<float>(sy2);
+                const cv::Vec3b *ip = img.ptr<cv::Vec3b>(sy2);
+                cv::Vec3b *op = out2.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    op[x][0]=(uchar)(op[x][0]+(ip[x][0]-op[x][0])*a);
+                    op[x][1]=(uchar)(op[x][1]+(ip[x][1]-op[x][1])*a);
+                    op[x][2]=(uchar)(op[x][2]+(ip[x][2]-op[x][2])*a);
+                }
+            }
+            float bw2 = img.cols * 0.11f;
+            for (int y = 0; y < img.rows; y++) {          /* the beam */
+                cv::Vec3b *op = out2.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float d = std::fabs(x - ccx) / bw2;
+                    if (d >= 1.0f) continue;
+                    float k2 = (1.0f - d)*(1.0f - d) * (0.55f + 0.1f*std::sin(tk*0.13f));
+                    op[x][0]=clamp_int_u8(op[x][0]+(int)(k2*120));
+                    op[x][1]=clamp_int_u8(op[x][1]+(int)(k2*190));
+                    op[x][2]=clamp_int_u8(op[x][2]+(int)(k2*235));
+                }
+            }
+            for (int i = 0; i < 40; i++) {                /* rising sparks */
+                float px2 = ccx + (uhash(i,5,0)-0.5f)*bw2*1.6f;
+                float py2 = (float)((int)(img.rows + uhash(i,9,0)*img.rows
+                            - tk*(2+3*uhash(i,3,0))) % (img.rows+40)) - 20;
+                int X=(int)px2, Y=(int)py2;
+                if (X<1||Y<1||X>=img.cols-1||Y>=img.rows-1) continue;
+                cv::circle(out2, {X,Y}, 1, cv::Scalar(200,240,255), cv::FILLED);
+            }
+            out2.copyTo(img);
+            return;
+        }
+        if (mode == 52) {
+            /* KALEIDO-BODY: your matted body folded into 8 radial
+             * mirror-wedges — a living mandala of flesh. fx unused. */
+            unsigned tk = g_seg.counter;
+            int QW = img.cols/2, QH = img.rows/2;
+            cv::Mat qi, qm, outq(QH, QW, CV_8UC3);
+            cv::resize(img, qi, cv::Size(QW, QH), 0, 0, cv::INTER_AREA);
+            cv::resize(g_seg.mask, qm, cv::Size(QW, QH));
+            float ccx = QW/2.f, ccy = QH/2.f;
+            const float WEDGE = 6.28318f / 8;
+            float rot = tk * 0.008f;
+            for (int y = 0; y < QH; y++) {
+                cv::Vec3b *op = outq.ptr<cv::Vec3b>(y);
+                float dy = y - ccy;
+                for (int x = 0; x < QW; x++) {
+                    float dx = x - ccx;
+                    float r = std::sqrt(dx*dx + dy*dy);
+                    float th = std::atan2(dy, dx) + rot;
+                    th = std::fmod(th + 12.566f, WEDGE);
+                    if (th > WEDGE/2) th = WEDGE - th;    /* mirror fold */
+                    int sx2 = (int)(ccx + std::cos(th)*r);
+                    int sy2 = (int)(ccy + std::sin(th)*r);
+                    if (sx2<0||sy2<0||sx2>=QW||sy2>=QH) { op[x]=cv::Vec3b(8,6,10); continue; }
+                    float a = qm.at<float>(sy2, sx2);
+                    cv::Vec3b v = qi.at<cv::Vec3b>(sy2, sx2);
+                    op[x] = cv::Vec3b((uchar)(v[0]*a + 8*(1-a)),
+                                      (uchar)(v[1]*a + 6*(1-a)),
+                                      (uchar)(v[2]*a + 10*(1-a)));
+                }
+            }
+            cv::resize(outq, img, img.size(), 0, 0, cv::INTER_LINEAR);
+            return;
+        }
+        if (mode == 53) {
+            /* LIQUID FLOOR: the bottom of the frame becomes rippling
+             * water reflecting the scene — you stand on a dark lake.
+             * fx = wave strength. */
+            unsigned tk = g_seg.counter;
+            int yline = (int)(img.rows * 0.68f);
+            cv::Mat keep = img.clone();
+            for (int y = yline; y < img.rows; y++) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                int depth = y - yline;
+                for (int x = 0; x < img.cols; x++) {
+                    float wob = std::sin(x*0.05f + tk*0.11f + depth*0.13f)
+                              * (2.0f + depth*0.10f) * fx;
+                    int ry2 = yline - depth - 1 + (int)wob;
+                    int rx2 = x + (int)(std::sin(depth*0.21f + tk*0.07f)*2.5f*fx);
+                    ry2 = std::max(0, std::min(img.rows-1, ry2));
+                    rx2 = std::max(0, std::min(img.cols-1, rx2));
+                    cv::Vec3b v = keep.at<cv::Vec3b>(ry2, rx2);
+                    float fade = 1.0f - (float)depth / (img.rows - yline);
+                    ip[x][0]=(uchar)(v[0]*0.45f*fade + 30);
+                    ip[x][1]=(uchar)(v[1]*0.42f*fade + 18);
+                    ip[x][2]=(uchar)(v[2]*0.38f*fade + 8);
+                }
+            }
+            /* waterline shimmer */
+            for (int x = 0; x < img.cols; x++) {
+                int yy = yline + (int)(std::sin(x*0.09f + tk*0.15f)*1.5f);
+                if (yy < 1 || yy >= img.rows-1) continue;
+                cv::Vec3b *p2 = img.ptr<cv::Vec3b>(yy) + x;
+                p2[0][0]=clamp_int_u8(p2[0][0]+70);
+                p2[0][1]=clamp_int_u8(p2[0][1]+70);
+                p2[0][2]=clamp_int_u8(p2[0][2]+70);
+            }
+            return;
+        }
+        if (mode == 54) {
+            /* ASTRAL SOUL: a translucent, cyan-shifted copy of you
+             * drifts out of your body in a slow orbit and sinks back.
+             * fx = how far the soul strays. */
+            unsigned tk = g_seg.counter;
+            float gx2 = std::sin(tk*0.013f) * img.cols * 0.055f * fx;
+            float gy2 = std::cos(tk*0.009f) * img.rows * 0.035f * fx
+                      - img.rows * 0.02f * fx;
+            int ox2 = (int)gx2, oy2 = (int)gy2;
+            cv::Mat keep = img.clone();
+            for (int y = 0; y < img.rows; y++) {
+                int sy2 = y - oy2;
+                if (sy2 < 0 || sy2 >= img.rows) continue;
+                const float *sm2 = g_seg.mask.ptr<float>(sy2);
+                const float *cm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *kp = keep.ptr<cv::Vec3b>(sy2);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    int sx2 = x - ox2;
+                    if (sx2 < 0 || sx2 >= img.cols) continue;
+                    float a = sm2[sx2] * 0.42f * (1.0f - cm[x]);
+                    if (a < 0.03f) continue;
+                    float lum = (kp[sx2][0]*0.114f+kp[sx2][1]*0.587f+kp[sx2][2]*0.299f);
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)(lum*1.2f*a));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(lum*1.05f*a));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(lum*0.45f*a));
+                }
+            }
+            return;
+        }
+        if (mode == 55) {
+            /* MYSTIC FOG: two layers of drifting procedural fog — one
+             * rolls BEHIND you, a thinner one in front of everything.
+             * Smoothed value noise, scrolling at different speeds.
+             * fx = density. */
+            unsigned tk = g_seg.counter;
+            auto vnoise = [&](float X, float Y, unsigned salt)->float{
+                int x0=(int)std::floor(X), y0=(int)std::floor(Y);
+                float tx2=X-x0, ty2=Y-y0;
+                float a2=uhash(x0,y0,salt),   b2=uhash(x0+1,y0,salt);
+                float c2=uhash(x0,y0+1,salt), d2=uhash(x0+1,y0+1,salt);
+                float u2=tx2*tx2*(3-2*tx2), v2=ty2*ty2*(3-2*ty2);
+                return a2+(b2-a2)*u2+(c2-a2)*v2+(a2-b2-c2+d2)*u2*v2;
+            };
+            int QW=img.cols/4, QH=img.rows/4;
+            cv::Mat fog1(QH,QW,CV_32F), fog2(QH,QW,CV_32F);
+            float t1=tk*0.010f, t2=tk*0.021f;
+            for(int y=0;y<QH;y++){
+                float*f1=fog1.ptr<float>(y);float*f2=fog2.ptr<float>(y);
+                for(int x=0;x<QW;x++){
+                    float v1=vnoise(x*0.045f+t1, y*0.09f, 11)*0.65f
+                            +vnoise(x*0.11f+t1*1.7f, y*0.2f, 12)*0.35f;
+                    float v2=vnoise(x*0.03f-t2, y*0.07f+t2*0.3f, 13)*0.7f
+                            +vnoise(x*0.09f-t2*1.5f, y*0.18f, 14)*0.3f;
+                    f1[x]=std::max(0.f,(v1-0.35f)*1.6f);
+                    f2[x]=std::max(0.f,(v2-0.45f)*1.8f);
+                }
+            }
+            cv::Mat F1,F2;
+            cv::resize(fog1,F1,img.size(),0,0,cv::INTER_LINEAR);
+            cv::resize(fog2,F2,img.size(),0,0,cv::INTER_LINEAR);
+            for(int y=0;y<img.rows;y++){
+                const float*a2=F1.ptr<float>(y);
+                const float*b2=F2.ptr<float>(y);
+                const float*mm=g_seg.mask.ptr<float>(y);
+                cv::Vec3b*ip=img.ptr<cv::Vec3b>(y);
+                for(int x=0;x<img.cols;x++){
+                    /* back fog only behind you; front fog over all */
+                    float k2=a2[x]*0.55f*fx*(1.0f-mm[x]) + b2[x]*0.28f*fx;
+                    if(k2<0.02f)continue;
+                    if(k2>0.85f)k2=0.85f;
+                    ip[x][0]=(uchar)(ip[x][0]+(190-ip[x][0])*k2);
+                    ip[x][1]=(uchar)(ip[x][1]+(185-ip[x][1])*k2);
+                    ip[x][2]=(uchar)(ip[x][2]+(175-ip[x][2])*k2);
+                }
+            }
+            return;
+        }
+        if (mode == 38) {
+            /* SNOWFALL: snow that ACCUMULATES on you — flakes land on
+             * the upward-facing surfaces of your silhouette (mask
+             * gradient says which way is 'up'), pile there, and tumble
+             * off when you move. */
+            static float fx2[200], fy2[200], fvx[200];
+            static float slx[600], sly[600];
+            static int sinit2 = 0, nset = 0;
+            unsigned tk = g_seg.counter;
+            if (!sinit2) {
+                for (int i=0;i<200;i++){fx2[i]=uhash(i,1,3)*img.cols;
+                    fy2[i]=-uhash(i,2,3)*img.rows;fvx[i]=(uhash(i,3,3)-0.5f)*0.8f;}
+                sinit2 = 1;
+            }
+            auto m_at = [&](int X,int Y)->float{
+                if(X<0||Y<0||X>=img.cols||Y>=img.rows)return 0.f;
+                return g_seg.mask.at<float>(Y,X);};
+            for (int i = 0; i < 200; i++) {               /* falling */
+                fx2[i]+=fvx[i]+std::sin((tk+i*7)*0.03f)*0.4f;
+                fy2[i]+=(1.2f+uhash(i,9,0)*0.8f)*fx;
+                int X=(int)fx2[i],Y=(int)fy2[i];
+                if(Y>=img.rows||X<0||X>=img.cols){
+                    fx2[i]=uhash(i,tk,4)*img.cols;fy2[i]=-8;continue;}
+                /* landing: entering the mask from above on an up-facing
+                 * surface -> settle */
+                if(m_at(X,Y+1)>0.5f && m_at(X,Y-3)<0.3f){
+                    if(nset<600){slx[nset]=fx2[i];sly[nset]=fy2[i];nset++;}
+                    fx2[i]=uhash(i,tk,5)*img.cols;fy2[i]=-8;continue;
+                }
+                if(Y>=0)cv::circle(img,{X,Y},1,cv::Scalar(250,250,255),cv::FILLED);
+            }
+            for (int i = 0; i < nset; i++) {              /* settled */
+                int X=(int)slx[i],Y=(int)sly[i];
+                if(m_at(X,Y+1)<0.4f){                     /* you moved: tumble */
+                    slx[i]=slx[nset-1];sly[i]=sly[nset-1];nset--;i--;continue;}
+                cv::circle(img,{X,Y},1,cv::Scalar(255,255,255),cv::FILLED);
+                cv::circle(img,{X,Y-1},1,cv::Scalar(235,240,255),cv::FILLED);
+            }
+            return;
+        }
+        if (mode == 39) {
+            /* FIRE SILHOUETTE: doom-fire seeded at your outline — real
+             * heat diffusion rises off your body. */
+            static cv::Mat heat;
+            unsigned tk = g_seg.counter; (void)tk;
+            int QW=img.cols/4, QH=img.rows/4;
+            if(heat.size()!=cv::Size(QW,QH))
+                heat=cv::Mat::zeros(QH,QW,CV_32F);
+            cv::Mat qm; cv::resize(g_seg.mask,qm,cv::Size(QW,QH));
+            for(int y=0;y<QH;y++){                        /* seed the edge */
+                const float*mm=qm.ptr<float>(y);float*hp=heat.ptr<float>(y);
+                for(int x=0;x<QW;x++)
+                    if(mm[x]>0.30f&&mm[x]<0.72f)hp[x]=std::min(1.0f,fx);
+            }
+            for(int y=0;y<QH-1;y++){                      /* rise + cool */
+                float*hp=heat.ptr<float>(y);
+                const float*hd=heat.ptr<float>(y+1);
+                for(int x=0;x<QW;x++){
+                    float a=hd[x];
+                    if(x>0)a+=hd[x-1];else a+=hd[x];
+                    if(x<QW-1)a+=hd[x+1];else a+=hd[x];
+                    float v=(a/3.0f)*0.93f - 0.004f;
+                    hp[x]=std::max(hp[x]*0.55f, std::max(0.0f,v));
+                }
+            }
+            cv::Mat hf; cv::resize(heat,hf,img.size(),0,0,cv::INTER_LINEAR);
+            for(int y=0;y<img.rows;y++){
+                const float*hp=hf.ptr<float>(y);
+                cv::Vec3b*ip=img.ptr<cv::Vec3b>(y);
+                for(int x=0;x<img.cols;x++){
+                    float v=hp[x]; if(v<0.06f)continue;
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)(v*v*v*220));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(v*v*200));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(v*255));
+                }
+            }
+            return;
+        }
+        if (mode == 40) {
+            /* BUBBLES: they drift up; touch one and it POPS into
+             * droplets. Your hands are the pin. */
+            static float bx2[24],by3[24],bph[24];
+            static float dxp[64],dyp[64],dvx2[64],dvy2[64],dl[64];
+            static int binit2=0;
+            unsigned tk=g_seg.counter;
+            if(!binit2){for(int i=0;i<24;i++){bx2[i]=uhash(i,5,1)*img.cols;
+                by3[i]=img.rows+uhash(i,6,1)*img.rows;bph[i]=uhash(i,7,1)*6.28f;}
+                for(int i=0;i<64;i++)dl[i]=0;
+                binit2=1;}
+            for(int i=0;i<24;i++){
+                by3[i]-=0.9f+0.4f*uhash(i,8,0);
+                bx2[i]+=std::sin(tk*0.03f+bph[i])*0.7f;
+                int X=(int)bx2[i],Y=(int)by3[i];
+                int R2=8+(int)(uhash(i,9,1)*10);
+                if(Y<-R2){by3[i]=img.rows+R2;bx2[i]=uhash(i,tk,2)*img.cols;continue;}
+                bool pop=false;
+                if(X>=0&&X<img.cols&&Y>=0&&Y<img.rows&&
+                   g_seg.mask.at<float>(Y,X)>0.45f)pop=true;
+                if(pop){
+                    for(int k2=0,sp=0;k2<64&&sp<8;k2++)if(dl[k2]<=0){
+                        dxp[k2]=(float)X;dyp[k2]=(float)Y;
+                        dvx2[k2]=(uhash(k2,tk,3)-0.5f)*5;
+                        dvy2[k2]=-uhash(k2,tk,4)*3;dl[k2]=1;sp++;}
+                    by3[i]=img.rows+R2;bx2[i]=uhash(i,tk,6)*img.cols;continue;
+                }
+                cv::circle(img,{X,Y},R2,cv::Scalar(255,230,200),1,cv::LINE_AA);
+                cv::ellipse(img,{X-R2/3,Y-R2/3},cv::Size(R2/3,R2/5),-40,0,180,
+                            cv::Scalar(255,255,255),1,cv::LINE_AA);
+            }
+            for(int i=0;i<64;i++){                        /* droplets */
+                if(dl[i]<=0)continue;
+                dvy2[i]+=0.3f;dxp[i]+=dvx2[i];dyp[i]+=dvy2[i];dl[i]-=0.05f;
+                int X=(int)dxp[i],Y=(int)dyp[i];
+                if(X<0||Y<0||X>=img.cols||Y>=img.rows){dl[i]=0;continue;}
+                cv::circle(img,{X,Y},1,cv::Scalar(255,240,210),cv::FILLED);
+            }
+            return;
+        }
+        if (mode == 41) {
+            /* THOR: lightning strikes your highest point — raise a hand
+             * and the sky answers. */
+            static int strike_t = -999; static unsigned strike_seed = 1;
+            unsigned tk = g_seg.counter;
+            int topx=-1, topy=-1;
+            for (int y = 0; y < img.rows && topx < 0; y += 3) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 3)
+                    if (mm[x] > 0.5f) { topx = x; topy = y; break; }
+            }
+            if (topx >= 0 && (int)tk - strike_t > 55 &&
+                uhash(tk, 3, 9) > 0.94f) {
+                strike_t = (int)tk; strike_seed = tk * 2654435761u + 1;
+            }
+            int since = (int)tk - strike_t;
+            if (topx >= 0 && since >= 0 && since < 7) {
+                unsigned sd = strike_seed;
+                float px2 = topx + (uhash(sd,1,0)-0.5f)*img.cols*0.3f;
+                float py2 = 0;
+                float lx2 = px2, ly2 = py2;
+                int flick = (since*strike_seed)%3;
+                while (ly2 < topy - 4) {
+                    sd = sd*1664525u+1013904223u;
+                    float nx2 = lx2 + ((float)(sd%1000)/1000.f-0.5f)*36
+                              + (topx-lx2)*0.16f;
+                    float ny2 = ly2 + 10 + (sd>>10)%14;
+                    if (flick != 2) {
+                        cv::line(img,{(int)lx2,(int)ly2},{(int)nx2,(int)ny2},
+                                 cv::Scalar(255,200,140),5,cv::LINE_AA);
+                        cv::line(img,{(int)lx2,(int)ly2},{(int)nx2,(int)ny2},
+                                 cv::Scalar(255,255,255),2,cv::LINE_AA);
+                    }
+                    lx2=nx2; ly2=ny2;
+                }
+                if (since < 2) img += cv::Scalar(40,40,55);   /* flash */
+                cv::circle(img,{topx,topy},10+since*3,
+                           cv::Scalar(255,230,180),2,cv::LINE_AA);
+            }
+            return;
+        }
+        if (mode == 42) {
+            /* FIREFLIES: thirty glowing agents wander the room but are
+             * drawn to your silhouette — they hover and drift around
+             * your outline, repelled if they cross inside. */
+            static float ax2[30],ay2[30],avx[30],avy[30],aph[30];
+            static int ainit=0;
+            unsigned tk=g_seg.counter;
+            if(!ainit){for(int i=0;i<30;i++){ax2[i]=uhash(i,4,2)*img.cols;
+                ay2[i]=uhash(i,5,2)*img.rows;avx[i]=avy[i]=0;
+                aph[i]=uhash(i,6,2)*6.28f;}ainit=1;}
+            /* centroid for gentle attraction */
+            double sx=0,sy=0,sw2=0;
+            for(int y=0;y<img.rows;y+=10){const float*mm=g_seg.mask.ptr<float>(y);
+                for(int x=0;x<img.cols;x+=10)if(mm[x]>0.4f){sx+=x;sy+=y;sw2++;}}
+            float ccx=sw2>2?(float)(sx/sw2):img.cols/2.f;
+            float ccy=sw2>2?(float)(sy/sw2):img.rows/2.f;
+            auto m_at=[&](int X,int Y)->float{
+                if(X<0||Y<0||X>=img.cols||Y>=img.rows)return 0.f;
+                return g_seg.mask.at<float>(Y,X);};
+            for(int i=0;i<30;i++){
+                avx[i]+=(uhash(i,tk,7)-0.5f)*0.5f+(ccx-ax2[i])*0.0012f;
+                avy[i]+=(uhash(i,tk,8)-0.5f)*0.5f+(ccy-ay2[i])*0.0012f;
+                float m2=m_at((int)ax2[i],(int)ay2[i]);
+                if(m2>0.4f){                              /* inside: push out */
+                    float gx2=m_at((int)ax2[i]+4,(int)ay2[i])-m_at((int)ax2[i]-4,(int)ay2[i]);
+                    float gy2=m_at((int)ax2[i],(int)ay2[i]+4)-m_at((int)ax2[i],(int)ay2[i]-4);
+                    avx[i]-=gx2*4; avy[i]-=gy2*4;
+                }
+                avx[i]*=0.92f;avy[i]*=0.92f;
+                ax2[i]+=avx[i];ay2[i]+=avy[i];
+                if(ax2[i]<0)ax2[i]=0;
+                if(ax2[i]>img.cols-1)ax2[i]=(float)img.cols-1;
+                if(ay2[i]<0)ay2[i]=0;
+                if(ay2[i]>img.rows-1)ay2[i]=(float)img.rows-1;
+                float glow=0.55f+0.45f*std::sin(tk*0.11f+aph[i]);
+                int X=(int)ax2[i],Y=(int)ay2[i];
+                cv::circle(img,{X,Y},4,cv::Scalar(20,90*glow,90*glow),cv::FILLED,cv::LINE_AA);
+                cv::circle(img,{X,Y},2,cv::Scalar(120*glow,255*glow,255*glow),cv::FILLED,cv::LINE_AA);
+            }
+            return;
+        }
+        if (mode == 43) {
+            /* STARDUST: your moving edges shed glitter — wherever the
+             * matte CHANGED since last frame, sparkles are born. */
+            static cv::Mat prevq;
+            static float gx3[220],gy3[220],gl2[220],gph[220];
+            static int ginit=0;
+            unsigned tk=g_seg.counter;
+            if(!ginit){for(int i=0;i<220;i++)gl2[i]=0;ginit=1;}
+            int QW=img.cols/4,QH=img.rows/4;
+            cv::Mat qm;cv::resize(g_seg.mask,qm,cv::Size(QW,QH));
+            if(!prevq.empty()&&prevq.size()==qm.size()){
+                int spawned=0;
+                for(int y=0;y<QH&&spawned<10;y+=2){
+                    const float*a2=qm.ptr<float>(y);
+                    const float*b2=prevq.ptr<float>(y);
+                    for(int x=0;x<QW&&spawned<10;x+=2){
+                        if(std::fabs(a2[x]-b2[x])>0.30f&&uhash(x,y,tk)>0.85f){
+                            for(int e=0;e<220;e++)if(gl2[e]<=0){
+                                gx3[e]=x*4.f;gy3[e]=y*4.f;gl2[e]=1;
+                                gph[e]=uhash(e,tk,1)*6.28f;spawned++;break;}
+                        }
+                    }
+                }
+            }
+            qm.copyTo(prevq);
+            for(int i=0;i<220;i++){
+                if(gl2[i]<=0)continue;
+                gx3[i]+=(uhash(i,tk,2)-0.5f)*1.6f;
+                gy3[i]-=0.4f; gl2[i]-=0.014f;
+                int X=(int)gx3[i],Y=(int)gy3[i];
+                if(X<1||Y<1||X>=img.cols-1||Y>=img.rows-1){gl2[i]=0;continue;}
+                float tw=(0.5f+0.5f*std::sin(tk*0.4f+gph[i]))*gl2[i];
+                int br=(int)(tw*255);
+                cv::Vec3b*p2=img.ptr<cv::Vec3b>(Y)+X;
+                p2[0][0]=clamp_int_u8(p2[0][0]+br);
+                p2[0][1]=clamp_int_u8(p2[0][1]+br);
+                p2[0][2]=clamp_int_u8(p2[0][2]+(int)(br*0.85f));
+            }
+            return;
+        }
+        if (mode == 44) {
+            /* MATRIX YOU: digital rain falls INSIDE your silhouette —
+             * you are the code. */
+            static float head[240]; static float spd2[240];
+            static int minit=0;
+            unsigned tk=g_seg.counter;
+            const int CW=10, CH=14;
+            int ncol=std::min(240,img.cols/CW);
+            if(!minit){for(int i=0;i<240;i++){head[i]=uhash(i,3,5)*60;
+                spd2[i]=0.4f+uhash(i,4,5)*0.8f;}minit=1;}
+            /* darken the body slightly so the rain reads */
+            for(int y=0;y<img.rows;y++){
+                const float*mm=g_seg.mask.ptr<float>(y);
+                cv::Vec3b*ip=img.ptr<cv::Vec3b>(y);
+                for(int x=0;x<img.cols;x++){
+                    float a=mm[x];if(a<0.05f)continue;
+                    ip[x][0]=(uchar)(ip[x][0]*(1-0.75f*a));
+                    ip[x][1]=(uchar)(ip[x][1]*(1-0.55f*a));
+                    ip[x][2]=(uchar)(ip[x][2]*(1-0.75f*a));
+                }
+            }
+            for(int c2=0;c2<ncol;c2++){
+                head[c2]+=spd2[c2]*fx;
+                int rows2=img.rows/CH;
+                if((int)head[c2]>rows2+8){head[c2]=0;spd2[c2]=0.4f+uhash(c2,tk,6)*0.8f;}
+                for(int r2=0;r2<rows2;r2++){
+                    float d=head[c2]-r2;
+                    if(d<0||d>9)continue;
+                    int X=c2*CW+2,Y=r2*CH+2;
+                    if(g_seg.mask.at<float>(std::min(img.rows-1,Y+CH/2),
+                                            std::min(img.cols-1,X+CW/2))<0.5f)continue;
+                    int g2=d<1?255:(int)(220*(1.0f-d/9));
+                    cv::Scalar col=d<1?cv::Scalar(200,255,200):cv::Scalar(0,g2,0);
+                    if(uhash(c2,r2,tk/6)>0.5f)
+                        cv::rectangle(img,cv::Rect(X,Y,CW-4,CH-5),col,cv::FILLED);
+                    else
+                        cv::rectangle(img,cv::Rect(X,Y+CH/3,CW-4,CH/2-3),col,cv::FILLED);
+                }
+            }
+            return;
+        }
+        if (mode == 45) {
+            /* BLACK HOLE YOU: the room is sucked toward you — radial
+             * inward stretch with an accretion glow; you stay solid. */
+            unsigned tk=g_seg.counter;
+            static float hcx=-1,hcy=-1;
+            double sx=0,sy=0,sw2=0;
+            for(int y=0;y<img.rows;y+=8){const float*mm=g_seg.mask.ptr<float>(y);
+                for(int x=0;x<img.cols;x+=8)if(mm[x]>0.4f){sx+=x;sy+=y;sw2++;}}
+            float tx2=sw2>4?(float)(sx/sw2):img.cols/2.f;
+            float ty2=sw2>4?(float)(sy/sw2):img.rows/2.f;
+            if(hcx<0){hcx=tx2;hcy=ty2;}
+            hcx+=(tx2-hcx)*0.05f;hcy+=(ty2-hcy)*0.05f;
+            static cv::Mat hpx,hpy;
+            if(hpx.size()!=img.size()){hpx.create(img.size(),CV_32F);
+                hpy.create(img.size(),CV_32F);}
+            float rmax=std::sqrt((float)(img.cols*img.cols+img.rows*img.rows))*0.5f;
+            for(int y=0;y<img.rows;y++){
+                float*axp=hpx.ptr<float>(y);float*ayp=hpy.ptr<float>(y);
+                float dy=y-hcy;
+                for(int x=0;x<img.cols;x++){
+                    float dx=x-hcx;
+                    float r=std::sqrt(dx*dx+dy*dy)+1e-3f;
+                    float pull=(1.0f-r/rmax);
+                    float rr=r+pull*pull*110.0f*fx;       /* sample further out */
+                    axp[x]=hcx+dx/r*rr; ayp[x]=hcy+dy/r*rr;
+                }
+            }
+            cv::Mat keep=img.clone(),warped;
+            cv::remap(img,warped,hpx,hpy,cv::INTER_LINEAR,cv::BORDER_REFLECT);
+            warped.copyTo(img);
+            for(int y=0;y<img.rows;y++){                  /* you stay solid */
+                const float*mm=g_seg.mask.ptr<float>(y);
+                const cv::Vec3b*kp=keep.ptr<cv::Vec3b>(y);
+                cv::Vec3b*ip=img.ptr<cv::Vec3b>(y);
+                float dy=y-hcy;
+                for(int x=0;x<img.cols;x++){
+                    float a=mm[x];
+                    if(a>0.05f){
+                        ip[x][0]=(uchar)(ip[x][0]+(kp[x][0]-ip[x][0])*a);
+                        ip[x][1]=(uchar)(ip[x][1]+(kp[x][1]-ip[x][1])*a);
+                        ip[x][2]=(uchar)(ip[x][2]+(kp[x][2]-ip[x][2])*a);
+                        continue;
+                    }
+                    float dx=x-hcx;
+                    float r=std::sqrt(dx*dx+dy*dy);
+                    float ring=std::exp(-std::fabs(r-rmax*0.32f
+                                 -10*std::sin(tk*0.05f))*0.06f);
+                    if(ring>0.1f){
+                        ip[x][0]=clamp_int_u8(ip[x][0]+(int)(ring*60));
+                        ip[x][1]=clamp_int_u8(ip[x][1]+(int)(ring*110));
+                        ip[x][2]=clamp_int_u8(ip[x][2]+(int)(ring*200));
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 46) {
+            /* PET MOONS: two tiny LIVE copies of you orbit your head —
+             * they mimic you in real time, because they ARE you. */
+            unsigned tk=g_seg.counter;
+            double sx=0,sy=0,sw2=0;
+            for(int y=0;y<img.rows/2;y+=6){const float*mm=g_seg.mask.ptr<float>(y);
+                for(int x=0;x<img.cols;x+=6)if(mm[x]>0.4f){sx+=x;sy+=y;sw2++;}}
+            float ccx=sw2>4?(float)(sx/sw2):img.cols/2.f;
+            float ccy=sw2>4?(float)(sy/sw2):img.rows/3.f;
+            int mw2=img.cols/6,mh3=img.rows/6;
+            cv::Mat mini,minia;
+            cv::resize(img,mini,cv::Size(mw2,mh3),0,0,cv::INTER_AREA);
+            cv::resize(g_seg.mask,minia,cv::Size(mw2,mh3));
+            float rad=img.cols*0.22f*fx;
+            for(int k2=0;k2<2;k2++){
+                float aa=tk*0.025f+k2*3.1416f;
+                int px2=(int)(ccx+std::cos(aa)*rad)-mw2/2;
+                int py2=(int)(ccy+std::sin(aa)*rad*0.45f)-mh3/2;
+                for(int yy=0;yy<mh3;yy++){
+                    int Y=py2+yy; if(Y<0||Y>=img.rows)continue;
+                    const float*am=minia.ptr<float>(yy);
+                    const cv::Vec3b*sp=mini.ptr<cv::Vec3b>(yy);
+                    cv::Vec3b*ip=img.ptr<cv::Vec3b>(Y);
+                    for(int xx=0;xx<mw2;xx++){
+                        int X=px2+xx; if(X<0||X>=img.cols)continue;
+                        float a=am[xx]; if(a<0.08f)continue;
+                        ip[X][0]=(uchar)(ip[X][0]+(sp[xx][0]-ip[X][0])*a);
+                        ip[X][1]=(uchar)(ip[X][1]+(sp[xx][1]-ip[X][1])*a);
+                        ip[X][2]=(uchar)(ip[X][2]+(sp[xx][2]-ip[X][2])*a);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 47) {
+            /* PORTALS: a blue ring and an orange ring — whatever part
+             * of you enters the blue portal steps out of the orange
+             * one, live. */
+            unsigned tk=g_seg.counter;
+            float Ax=img.cols*0.20f, Ay=img.rows*0.55f;
+            float Bx=img.cols*0.80f, By=img.rows*0.55f;
+            float rx2=img.cols*0.105f, ry2=img.rows*0.30f;
+            for(int y=0;y<img.rows;y++){
+                cv::Vec3b*ip=img.ptr<cv::Vec3b>(y);
+                float ndy=(y-By)/ry2;
+                for(int x=0;x<img.cols;x++){
+                    float ndx=(x-Bx)/rx2;
+                    if(ndx*ndx+ndy*ndy>=1.0f)continue;
+                    int sx2=(int)(x-Bx+Ax), sy2=(int)(y-By+Ay);
+                    if(sx2<0||sy2<0||sx2>=img.cols||sy2>=img.rows)continue;
+                    float a=g_seg.mask.at<float>(sy2,sx2);
+                    if(a<0.05f){                          /* empty: void glow */
+                        ip[x][0]=(uchar)(ip[x][0]*0.35f);
+                        ip[x][1]=(uchar)(ip[x][1]*0.30f+15);
+                        ip[x][2]=(uchar)(ip[x][2]*0.35f+25);
+                        continue;
+                    }
+                    cv::Vec3b v=img.at<cv::Vec3b>(sy2,sx2);
+                    ip[x][0]=(uchar)(ip[x][0]+(v[0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(v[1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(v[2]-ip[x][2])*a);
+                }
+            }
+            float puls=2.0f+std::sin(tk*0.1f)*1.2f;
+            cv::ellipse(img,{(int)Ax,(int)Ay},cv::Size((int)rx2,(int)ry2),0,0,360,
+                        cv::Scalar(255,140,30),(int)(4+puls),cv::LINE_AA);
+            cv::ellipse(img,{(int)Ax,(int)Ay},cv::Size((int)(rx2*1.06f),(int)(ry2*1.06f)),
+                        0,0,360,cv::Scalar(200,80,10),2,cv::LINE_AA);
+            cv::ellipse(img,{(int)Bx,(int)By},cv::Size((int)rx2,(int)ry2),0,0,360,
+                        cv::Scalar(30,140,255),(int)(4+puls),cv::LINE_AA);
+            cv::ellipse(img,{(int)Bx,(int)By},cv::Size((int)(rx2*1.06f),(int)(ry2*1.06f)),
+                        0,0,360,cv::Scalar(10,80,200),2,cv::LINE_AA);
+            return;
+        }
+        if (mode == 31) {
+            /* MANDALA YOU: your silhouette's contour, kaleidoscoped —
+             * N rotated neon copies of your outline spin around your
+             * centroid while you stay real in the middle. findContours
+             * meets rotation matrices. */
+            unsigned tk = g_seg.counter;
+            cv::Mat keep = img.clone();
+            img *= 0.30;                                   /* dim the room */
+            /* restore the real you */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *kp = keep.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    ip[x][0]=(uchar)(ip[x][0]+(kp[x][0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(kp[x][1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(kp[x][2]-ip[x][2])*a);
+                }
+            }
+            cv::Mat q, q8;
+            cv::resize(g_seg.mask, q, cv::Size(), 0.25, 0.25);
+            q8 = q > 0.5;
+            std::vector<std::vector<cv::Point>> ctrs;
+            cv::findContours(q8, ctrs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            if (!ctrs.empty()) {
+                size_t big = 0;
+                for (size_t i = 1; i < ctrs.size(); i++)
+                    if (ctrs[i].size() > ctrs[big].size()) big = i;
+                /* centroid at full res */
+                double mx2=0,my2=0;
+                for (auto &p : ctrs[big]) { mx2+=p.x; my2+=p.y; }
+                float ccx=(float)(mx2/ctrs[big].size())*4, ccy=(float)(my2/ctrs[big].size())*4;
+                const int NSYM = 6;
+                for (int k2 = 0; k2 < NSYM; k2++) {
+                    float ang = k2 * 6.2832f/NSYM + tk * 0.012f;
+                    float ca=std::cos(ang), sa=std::sin(ang);
+                    float hue = tk*0.03f + k2*1.05f;
+                    cv::Scalar col((std::sin(hue+4.19f)*.5f+.5f)*255,
+                                   (std::sin(hue+2.09f)*.5f+.5f)*255,
+                                   (std::sin(hue)*.5f+.5f)*255);
+                    std::vector<cv::Point> rp(ctrs[big].size());
+                    for (size_t i = 0; i < ctrs[big].size(); i++) {
+                        float px2 = ctrs[big][i].x*4 - ccx;
+                        float py2 = ctrs[big][i].y*4 - ccy;
+                        rp[i] = cv::Point((int)(ccx + px2*ca - py2*sa),
+                                          (int)(ccy + px2*sa + py2*ca));
+                    }
+                    cv::polylines(img, rp, true, col, 2, cv::LINE_AA);
+                }
+            }
+            return;
+        }
+        if (mode == 32) {
+            /* TOPO AURA: animated topographic contour rings radiate
+             * outward from your body — distanceTransform turned into a
+             * living radar map. */
+            unsigned tk = g_seg.counter;
+            /* two-pass chamfer distance transform (3-4 weights), done by
+             * hand: cv::distanceTransform's DIST_L2 constant moved in
+             * the OpenCV 5 module split, and 20 lines of classic code
+             * beat chasing headers across versions. */
+            cv::Mat q;
+            cv::resize(g_seg.mask, q, cv::Size(), 0.25, 0.25);
+            cv::Mat dist(q.size(), CV_32F);
+            const float INF2 = 1e9f, W1 = 1.0f, W2 = 1.4142f;
+            for (int y = 0; y < q.rows; y++) {
+                const float *mm = q.ptr<float>(y);
+                float *dp = dist.ptr<float>(y);
+                for (int x = 0; x < q.cols; x++)
+                    dp[x] = mm[x] > 0.4f ? 0.0f : INF2;
+            }
+            for (int y = 0; y < q.rows; y++) {            /* forward pass */
+                float *dp = dist.ptr<float>(y);
+                const float *up = y > 0 ? dist.ptr<float>(y-1) : NULL;
+                for (int x = 0; x < q.cols; x++) {
+                    float d = dp[x];
+                    if (x > 0)        d = std::min(d, dp[x-1] + W1);
+                    if (up) {
+                        d = std::min(d, up[x] + W1);
+                        if (x > 0)          d = std::min(d, up[x-1] + W2);
+                        if (x < q.cols - 1) d = std::min(d, up[x+1] + W2);
+                    }
+                    dp[x] = d;
+                }
+            }
+            for (int y = q.rows - 1; y >= 0; y--) {       /* backward pass */
+                float *dp = dist.ptr<float>(y);
+                const float *dn = y < q.rows-1 ? dist.ptr<float>(y+1) : NULL;
+                for (int x = q.cols - 1; x >= 0; x--) {
+                    float d = dp[x];
+                    if (x < q.cols - 1) d = std::min(d, dp[x+1] + W1);
+                    if (dn) {
+                        d = std::min(d, dn[x] + W1);
+                        if (x < q.cols - 1) d = std::min(d, dn[x+1] + W2);
+                        if (x > 0)          d = std::min(d, dn[x-1] + W2);
+                    }
+                    dp[x] = d;
+                }
+            }
+            cv::Mat dfull;
+            cv::resize(dist, dfull, img.size());
+            for (int y = 0; y < img.rows; y++) {
+                const float *dd = dfull.ptr<float>(y);
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    if (mm[x] > 0.3f) continue;
+                    float d = dd[x] * 4.0f;
+                    float band = std::sin(d * 0.16f - tk * 0.14f);
+                    if (band < 0.86f) continue;
+                    float hue = d * 0.02f;
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)((std::sin(hue+4.19f)*.5f+.5f)*150));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)((std::sin(hue+2.09f)*.5f+.5f)*150));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)((std::sin(hue)*.5f+.5f)*150));
+                }
+            }
+            return;
+        }
+        if (mode == 33) {
+            /* BALL PIT: physics balls rain down and BOUNCE OFF YOUR
+             * BODY — the matte is the collider, its gradient the
+             * surface normal. Bat them with your hands. */
+            static float bx[90], by2[90], bvx[90], bvy[90];
+            static int bc[90], binit = 0;
+            unsigned tk = g_seg.counter;
+            if (!binit) {
+                for (int i = 0; i < 90; i++) {
+                    bx[i]=uhash(i,1,7)* (img.cols-20)+10;
+                    by2[i]=-uhash(i,2,7)*img.rows*2;
+                    bvx[i]=(uhash(i,3,7)-0.5f)*3; bvy[i]=0;
+                    bc[i]=i%6;
+                }
+                binit = 1;
+            }
+            static const int BC[6][3]={{60,60,235},{60,200,255},{80,220,80},
+                {235,180,60},{230,90,200},{250,250,250}};
+            auto mask_at = [&](float X, float Y)->float{
+                int xi=(int)X, yi=(int)Y;
+                if (xi<0||yi<0||xi>=img.cols||yi>=img.rows) return 0.f;
+                return g_seg.mask.at<float>(yi,xi);
+            };
+            const int R = std::max(6, img.cols/90);
+            for (int i = 0; i < 90; i++) {
+                bvy[i] += 0.32f * fx;                     /* gravity */
+                bvx[i] *= 0.999f;
+                float nx2 = bx[i]+bvx[i], ny2 = by2[i]+bvy[i];
+                if (nx2 < R)            { nx2=(float)R; bvx[i]=std::fabs(bvx[i])*0.8f; }
+                if (nx2 > img.cols-R)   { nx2=(float)(img.cols-R); bvx[i]=-std::fabs(bvx[i])*0.8f; }
+                if (ny2 > img.rows+R*4) {                 /* fell out: respawn */
+                    nx2=uhash(i,tk,1)*(img.cols-20)+10; ny2=-(float)R*2;
+                    bvx[i]=(uhash(i,tk,2)-0.5f)*3; bvy[i]=0;
+                }
+                if (mask_at(nx2, ny2+R) > 0.5f) {         /* hit YOU */
+                    /* surface normal from mask gradient */
+                    float gx2 = mask_at(nx2+4,ny2) - mask_at(nx2-4,ny2);
+                    float gy2 = mask_at(nx2,ny2+4) - mask_at(nx2,ny2-4);
+                    float gl = std::sqrt(gx2*gx2+gy2*gy2);
+                    float nxn = gl>1e-4f ? -gx2/gl : 0.f;
+                    float nyn = gl>1e-4f ? -gy2/gl : -1.f;
+                    float dot2 = bvx[i]*nxn + bvy[i]*nyn;
+                    bvx[i] = (bvx[i] - 2*dot2*nxn) * 0.72f;
+                    bvy[i] = (bvy[i] - 2*dot2*nyn) * 0.72f - 0.2f;
+                    for (int st = 0; st < 8 && mask_at(nx2, ny2+R) > 0.5f; st++) {
+                        nx2 += nxn*3; ny2 += nyn*3;
+                    }
+                }
+                bx[i]=nx2; by2[i]=ny2;
+                int X=(int)bx[i], Y=(int)by2[i];
+                if (Y < -R || Y >= img.rows+R) continue;
+                const int *cc = BC[bc[i]];
+                cv::circle(img, {X,Y}, R, cv::Scalar(cc[0],cc[1],cc[2]), cv::FILLED);
+                cv::circle(img, {X,Y}, R, cv::Scalar(cc[0]/2,cc[1]/2,cc[2]/2), 1);
+                cv::circle(img, {X-R/3,Y-R/3}, std::max(1,R/3),
+                           cv::Scalar(255,255,255), cv::FILLED);
+            }
+            return;
+        }
+        if (mode == 34) {
+            /* ORBIT RIM LIGHT: a virtual studio light circles you —
+             * your silhouette's edge catches it exactly where physics
+             * says it should (mask gradient = surface normal). */
+            unsigned tk = g_seg.counter;
+            float la = tk * 0.03f;
+            float ldx = std::cos(la), ldy = std::sin(la) * 0.5f;
+            cv::Mat gx2, gy2;
+            cv::Sobel(g_seg.mask, gx2, CV_32F, 1, 0, 3);
+            cv::Sobel(g_seg.mask, gy2, CV_32F, 0, 1, 3);
+            /* light color drifts warm<->cool with the orbit */
+            float lr = 200 + 55*std::cos(la), lg = 180, lb = 200 - 55*std::cos(la);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const float *px2 = gx2.ptr<float>(y);
+                const float *py2 = gy2.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float m2 = mm[x];
+                    if (m2 < 0.04f || m2 > 0.97f) continue;   /* edge band only */
+                    float gl = std::sqrt(px2[x]*px2[x] + py2[x]*py2[x]);
+                    if (gl < 0.02f) continue;
+                    float rim = (-px2[x]*ldx - py2[x]*ldy) / gl;  /* facing the light */
+                    if (rim <= 0) continue;
+                    float k = rim * rim * 0.9f;
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)(lb*k));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(lg*k));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(lr*k));
+                }
+            }
+            return;
+        }
+        if (mode == 35) {
+            /* MIND VORTEX: the room spirals into your head — a polar
+             * swirl remap warps everything EXCEPT you. */
+            unsigned tk = g_seg.counter;
+            /* head anchor: topmost band of the matte's centroid */
+            static float vcx = -1, vcy = -1;
+            double sx=0, sy=0, sw2=0;
+            for (int y = 0; y < img.rows/2; y += 6) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 6)
+                    if (mm[x] > 0.4f) { sx+=x; sy+=y; sw2+=1; }
+            }
+            float tx2 = sw2>4 ? (float)(sx/sw2) : img.cols/2.f;
+            float ty2 = sw2>4 ? (float)(sy/sw2) : img.rows/3.f;
+            if (vcx < 0) { vcx=tx2; vcy=ty2; }
+            vcx += (tx2-vcx)*0.05f; vcy += (ty2-vcy)*0.05f;
+            static cv::Mat mpx, mpy;
+            if (mpx.size() != img.size()) {
+                mpx.create(img.size(), CV_32F);
+                mpy.create(img.size(), CV_32F);
+            }
+            float rmax = std::sqrt((float)(img.cols*img.cols+img.rows*img.rows))*0.5f;
+            for (int y = 0; y < img.rows; y++) {
+                float *ax = mpx.ptr<float>(y);
+                float *ay = mpy.ptr<float>(y);
+                float dy = y - vcy;
+                for (int x = 0; x < img.cols; x++) {
+                    float dx = x - vcx;
+                    float r = std::sqrt(dx*dx + dy*dy);
+                    float sw3 = (1.0f - r/rmax);
+                    float ang = sw3*sw3 * 2.4f + tk*0.008f;
+                    float ca = std::cos(ang), sa = std::sin(ang);
+                    ax[x] = vcx + dx*ca - dy*sa;
+                    ay[x] = vcy + dx*sa + dy*ca;
+                }
+            }
+            cv::Mat keep = img.clone(), warped;
+            cv::remap(img, warped, mpx, mpy, cv::INTER_LINEAR, cv::BORDER_REFLECT);
+            warped.copyTo(img);
+            for (int y = 0; y < img.rows; y++) {          /* you stay solid */
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *kp = keep.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    ip[x][0]=(uchar)(ip[x][0]+(kp[x][0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(kp[x][1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(kp[x][2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 36) {
+            /* STAINED GLASS: the frame becomes a leaded glass window —
+             * Voronoi facets (Subdiv2D), denser and brighter where you
+             * are, with dark lead lines between panes. */
+            /* jittered-grid Voronoi, hand-rolled: cv::Subdiv2D moved in
+             * the OpenCV 5 module split. One seed per grid cell means a
+             * pixel's nearest seed is always within its 3x3 cell
+             * neighborhood — exact Voronoi, no library, and faster. */
+            const int GX = 22, GY = 13;
+            float sxp[GY][GX], syp[GY][GX];
+            uchar scol[GY][GX][3];
+            float cw2 = (float)img.cols / GX, ch2 = (float)img.rows / GY;
+            for (int gy = 0; gy < GY; gy++)
+                for (int gx = 0; gx < GX; gx++) {
+                    sxp[gy][gx] = (gx + 0.2f + 0.6f*uhash(gx, gy, 11)) * cw2;
+                    syp[gy][gx] = (gy + 0.2f + 0.6f*uhash(gx, gy, 47)) * ch2;
+                    int px2 = std::min(img.cols-1, (int)sxp[gy][gx]);
+                    int py2 = std::min(img.rows-1, (int)syp[gy][gx]);
+                    cv::Vec3b c = img.at<cv::Vec3b>(py2, px2);
+                    float onp = g_seg.mask.at<float>(py2, px2);
+                    float sat = 1.15f + 0.35f * onp;      /* person glows more */
+                    scol[gy][gx][0]=(uchar)std::min(255.f, c[0]*sat);
+                    scol[gy][gx][1]=(uchar)std::min(255.f, c[1]*sat);
+                    scol[gy][gx][2]=(uchar)std::min(255.f, c[2]*sat);
+                }
+            /* ownership at quarter res, then paint full res with lead
+             * lines where the owner changes */
+            int QW = img.cols/2, QH = img.rows/2;
+            cv::Mat own(QH, QW, CV_16U);
+            for (int y = 0; y < QH; y++) {
+                unsigned short *op = own.ptr<unsigned short>(y);
+                float fy = y * 2.0f;
+                int gy0 = std::min(GY-1, (int)(fy / ch2));
+                for (int x = 0; x < QW; x++) {
+                    float fx = x * 2.0f;
+                    int gx0 = std::min(GX-1, (int)(fx / cw2));
+                    float bd = 1e18f; int best = 0;
+                    for (int dy2 = -1; dy2 <= 1; dy2++)
+                        for (int dx2 = -1; dx2 <= 1; dx2++) {
+                            int gy2 = gy0+dy2, gx2 = gx0+dx2;
+                            if (gy2 < 0 || gy2 >= GY || gx2 < 0 || gx2 >= GX) continue;
+                            float ddx = fx - sxp[gy2][gx2];
+                            float ddy = fy - syp[gy2][gx2];
+                            float d2 = ddx*ddx + ddy*ddy;
+                            if (d2 < bd) { bd = d2; best = gy2*GX + gx2; }
+                        }
+                    op[x] = (unsigned short)best;
+                }
+            }
+            for (int y = 0; y < img.rows; y++) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                int qy = std::min(QH-1, y/2);
+                const unsigned short *op = own.ptr<unsigned short>(qy);
+                const unsigned short *od = own.ptr<unsigned short>(std::min(QH-1, qy+1));
+                for (int x = 0; x < img.cols; x++) {
+                    int qx = std::min(QW-1, x/2);
+                    unsigned short o = op[qx];
+                    /* lead line where the pane changes */
+                    if ((qx+1 < QW && op[qx+1] != o) || od[qx] != o) {
+                        ip[x] = cv::Vec3b(25, 20, 20);
+                        continue;
+                    }
+                    ip[x] = cv::Vec3b(scol[o/GX][o%GX][0],
+                                      scol[o/GX][o%GX][1],
+                                      scol[o/GX][o%GX][2]);
+                }
+            }
+            return;
+        }
+        if (mode == 37) {
+            /* UPSIDE-DOWN ROOM: the entire world flips; you don't. */
+            cv::Mat keep = img.clone();
+            cv::flip(keep, img, 0);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *kp = keep.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    ip[x][0]=(uchar)(ip[x][0]+(kp[x][0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(kp[x][1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(kp[x][2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 25) {
+            /* STAGE SPOTLIGHT: a theater beam follows you from above;
+             * the rest of the room falls dark; dust motes drift in the
+             * light. */
+            unsigned tk = g_seg.counter;
+            /* track your centroid cheaply (coarse mask scan) */
+            static float scx = -1;
+            double sx = 0, sw2 = 0;
+            for (int y = 0; y < img.rows; y += 8) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 8)
+                    if (mm[x] > 0.4f) { sx += x; sw2 += 1; }
+            }
+            float tcx = sw2 > 4 ? (float)(sx / sw2) : img.cols / 2.f;
+            if (scx < 0) scx = tcx;
+            scx += (tcx - scx) * 0.06f;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                float half = img.cols * 0.05f + y * 0.22f;   /* cone widens */
+                for (int x = 0; x < img.cols; x++) {
+                    float d = std::fabs(x - scx) / half;      /* 0 center */
+                    float lit = d < 0.8f ? 1.0f : d < 1.15f ? (1.15f - d)/0.35f : 0.0f;
+                    float k = std::max(lit, std::min(1.0f, mm[x] * 1.2f));
+                    float dim = 0.10f + 0.90f * k;
+                    ip[x][0]=(uchar)(ip[x][0]*dim);
+                    ip[x][1]=(uchar)(ip[x][1]*dim);
+                    ip[x][2]=(uchar)std::min(255.f, ip[x][2]*dim*(1.0f+0.08f*lit));
+                    if (lit > 0.4f && mm[x] < 0.2f &&
+                        uhash(x/2, y/2, tk/2) > 0.9975f) {   /* dust motes */
+                        ip[x][0]=clamp_int_u8(ip[x][0]+110);
+                        ip[x][1]=clamp_int_u8(ip[x][1]+110);
+                        ip[x][2]=clamp_int_u8(ip[x][2]+110);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 26) {
+            /* HAUNTED SHADOW: your shadow on the wall — but it's your
+             * silhouette from a second AGO, sheared sideways. It lags
+             * you, catches up, and feels deeply wrong. */
+            static cv::Mat mring[32];
+            static int mri = 0, mqw = 0, mqh = 0;
+            int QW = img.cols/4, QH = img.rows/4;
+            if (mqw != QW || mqh != QH) {
+                for (int i = 0; i < 32; i++) mring[i].release();
+                mqw = QW; mqh = QH; mri = 0;
+            }
+            cv::Mat qm;
+            cv::resize(g_seg.mask, qm, cv::Size(QW, QH));
+            qm.copyTo(mring[mri]);
+            int gi = (mri - 28 + 32) % 32;                /* ~1 s ago */
+            mri = (mri + 1) % 32;
+            if (!mring[gi].empty()) {
+                cv::Mat old;
+                cv::resize(mring[gi], old, img.size());
+                for (int y = 0; y < img.rows; y++) {
+                    const float *cm = g_seg.mask.ptr<float>(y);
+                    cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                    for (int x = 0; x < img.cols; x++) {
+                        if (cm[x] > 0.25f) continue;       /* not on you */
+                        int sx2 = x + (int)((img.rows - y) * 0.30f) - img.cols/12;
+                        if (sx2 < 0 || sx2 >= img.cols) continue;
+                        float a = old.at<float>(y, sx2);
+                        if (a < 0.25f) continue;
+                        float k = 0.72f * std::min(1.0f, a);
+                        ip[x][0]=(uchar)(ip[x][0]*(1-k));
+                        ip[x][1]=(uchar)(ip[x][1]*(1-k));
+                        ip[x][2]=(uchar)(ip[x][2]*(1-k));
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 27) {
+            /* COSMIC YOU: your silhouette becomes a window into deep
+             * space — an animated starfield lives inside your body. */
+            static float stx[220], sty[220], stz[220];
+            static int sinit = 0;
+            if (!sinit) {
+                for (int i = 0; i < 220; i++) {
+                    stx[i]=uhash(i,1,0); sty[i]=uhash(i,2,0);
+                    stz[i]=0.2f+uhash(i,3,0)*0.8f;
+                }
+                sinit = 1;
+            }
+            for (int y = 0; y < img.rows; y++) {          /* body -> space */
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    if (a < 0.05f) continue;
+                    cv::Vec3b space(40 + (y*20/img.rows), 8, 18);
+                    ip[x][0]=(uchar)(ip[x][0]+(space[0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(space[1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(space[2]-ip[x][2])*a);
+                }
+            }
+            for (int i = 0; i < 220; i++) {               /* stars drift */
+                stx[i] += 0.0016f * stz[i];
+                if (stx[i] > 1.0f) stx[i] -= 1.0f;
+                int X = (int)(stx[i]*img.cols), Y = (int)(sty[i]*img.rows);
+                if (X < 1 || X >= img.cols-1 || Y < 1 || Y >= img.rows-1) continue;
+                if (g_seg.mask.at<float>(Y, X) < 0.5f) continue;
+                int br = (int)(120 + stz[i]*135);
+                cv::Vec3b *p2 = img.ptr<cv::Vec3b>(Y) + X;
+                p2[0][0]=clamp_int_u8(br); p2[0][1]=clamp_int_u8(br);
+                p2[0][2]=clamp_int_u8(br - 20);
+            }
+            return;
+        }
+        if (mode == 28) {
+            /* PAPER STICKER: thick white cut-out border around you plus
+             * a drop shadow — you become a stop-motion sticker. */
+            cv::Mat m8, dil, dil2;
+            g_seg.mask.convertTo(m8, CV_8U, 255.0);
+            cv::dilate(m8, dil,  cv::Mat(), cv::Point(-1,-1), 4);
+            cv::dilate(m8, dil2, cv::Mat(), cv::Point(-1,-1), 8);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const uchar *d1 = dil.ptr<uchar>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    if (mm[x] > 0.5f) continue;
+                    if (d1[x] > 128) {                    /* sticker border */
+                        ip[x] = cv::Vec3b(245, 245, 245);
+                    } else {
+                        /* drop shadow: border mask sampled up-left */
+                        int sx2 = x - 10, sy2 = y - 10;
+                        if (sx2 >= 0 && sy2 >= 0 &&
+                            dil2.at<uchar>(sy2, sx2) > 128) {
+                            ip[x][0]=(uchar)(ip[x][0]*0.55f);
+                            ip[x][1]=(uchar)(ip[x][1]*0.55f);
+                            ip[x][2]=(uchar)(ip[x][2]*0.55f);
+                        } else {                          /* calm room */
+                            ip[x][0]=(uchar)(ip[x][0]*0.9f + 12);
+                            ip[x][1]=(uchar)(ip[x][1]*0.9f + 12);
+                            ip[x][2]=(uchar)(ip[x][2]*0.9f + 12);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 29) {
+            /* HEAT SIGNATURE: predator-cam, but honest — only YOU emit
+             * heat (luma -> thermal palette); the room is cold steel. */
+            static const int TP[6][3] = {   /* B,G,R stops cold->hot */
+                {80,10,0},{160,40,0},{120,160,0},{40,220,255},{20,120,255},{240,255,255}};
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float lum=(ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    float a = mm[x];
+                    if (a < 0.05f) {                      /* cold room */
+                        uchar v=(uchar)(lum*70);
+                        ip[x]=cv::Vec3b((uchar)(v+25),v,(uchar)(v*0.8f));
+                        continue;
+                    }
+                    float t2 = std::min(0.999f, lum) * 5.0f;
+                    int i0 = (int)t2; float fr = t2 - i0;
+                    cv::Vec3b hot(
+                        (uchar)(TP[i0][0]+(TP[i0+1][0]-TP[i0][0])*fr),
+                        (uchar)(TP[i0][1]+(TP[i0+1][1]-TP[i0][1])*fr),
+                        (uchar)(TP[i0][2]+(TP[i0+1][2]-TP[i0][2])*fr));
+                    ip[x][0]=(uchar)(ip[x][0]+(hot[0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(hot[1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(hot[2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 30) {
+            /* AFTERIMAGE BURST: move fast and sharp snapshots of you
+             * freeze in the air where you were, fading out. Triggered
+             * by your own centroid velocity — dodge like an anime
+             * character. */
+            static cv::Mat snap_rgb[3], snap_a[3];
+            static float snap_life[3] = {0,0,0};
+            static float pcx = -1, pcy = -1;
+            unsigned tk = g_seg.counter;
+            double sx=0, sy=0, sw2=0;
+            for (int y = 0; y < img.rows; y += 8) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 8)
+                    if (mm[x] > 0.4f) { sx += x; sy += y; sw2 += 1; }
+            }
+            if (sw2 > 4) {
+                float cx2=(float)(sx/sw2), cy2=(float)(sy/sw2);
+                if (pcx >= 0) {
+                    float v = std::sqrt((cx2-pcx)*(cx2-pcx)+(cy2-pcy)*(cy2-pcy));
+                    if (v > img.cols * 0.012f && (tk % 4) == 0) {
+                        /* fast! freeze a snapshot into the oldest slot */
+                        int slot = 0;
+                        for (int i2=1;i2<3;i2++) if (snap_life[i2]<snap_life[slot]) slot=i2;
+                        cv::resize(img, snap_rgb[slot],
+                                   cv::Size(img.cols/2, img.rows/2), 0,0, cv::INTER_AREA);
+                        cv::resize(g_seg.mask, snap_a[slot],
+                                   cv::Size(img.cols/2, img.rows/2));
+                        snap_life[slot] = 1.0f;
+                    }
+                }
+                pcx = cx2; pcy = cy2;
+            }
+            for (int s2 = 0; s2 < 3; s2++) {
+                if (snap_life[s2] <= 0) continue;
+                snap_life[s2] -= 0.03f;
+                cv::Mat gr, ga;
+                cv::resize(snap_rgb[s2], gr, img.size(), 0,0, cv::INTER_LINEAR);
+                cv::resize(snap_a[s2],  ga, img.size(), 0,0, cv::INTER_LINEAR);
+                float li = snap_life[s2] * 0.6f;
+                for (int y = 0; y < img.rows; y++) {
+                    const float *cm = g_seg.mask.ptr<float>(y);
+                    const float *am = ga.ptr<float>(y);
+                    const cv::Vec3b *gp = gr.ptr<cv::Vec3b>(y);
+                    cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                    for (int x = 0; x < img.cols; x++) {
+                        float a = am[x] * li * (1.0f - cm[x]);
+                        if (a < 0.04f) continue;
+                        ip[x][0]=(uchar)(ip[x][0]+(gp[x][0]-ip[x][0])*a);
+                        ip[x][1]=(uchar)(ip[x][1]+(gp[x][1]-ip[x][1])*a);
+                        ip[x][2]=(uchar)(ip[x][2]+(gp[x][2]-ip[x][2])*a);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 17) {
+            /* GLITCH BODY: only YOU get datamoshed — per-band horizontal
+             * tearing + RGB channel split; the room stays pristine. */
+            unsigned tk = g_seg.counter;
+            cv::Mat srcimg = img.clone();
+            for (int y = 0; y < img.rows; y++) {
+                int band = y / 6;
+                float n = uhash(band, 0, tk / 3);
+                int off = (n < 0.75f) ? 0 : (int)((n - 0.75f) * 4 * 30 * fx) - (int)(15*fx);
+                int coff = 2 + (int)(uhash(band, 7, tk / 3) * 4);
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *sp = srcimg.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    int sx = x - off;
+                    if (sx < 0 || sx >= img.cols) continue;
+                    float a = mm[sx];
+                    if (a < 0.05f) continue;
+                    int xr = std::min(img.cols - 1, sx + coff);
+                    int xb = std::max(0, sx - coff);
+                    cv::Vec3b v(sp[xb][0], sp[sx][1], sp[xr][2]);
+                    ip[x][0] = (uchar)(ip[x][0] + (v[0] - ip[x][0]) * a);
+                    ip[x][1] = (uchar)(ip[x][1] + (v[1] - ip[x][1]) * a);
+                    ip[x][2] = (uchar)(ip[x][2] + (v[2] - ip[x][2]) * a);
+                }
+            }
+            return;
+        }
+        if (mode == 18) {
+            /* SLICED PORTRAIT: you split into horizontal slabs that
+             * slide apart in alternating directions, gallery-art style,
+             * over the learned room. */
+            unsigned tk = g_seg.counter;
+            cv::Mat out2; g_seg.bg_est.copyTo(out2);
+            int nsl = 9, sh2 = (img.rows + nsl - 1) / nsl;
+            for (int y = 0; y < img.rows; y++) {
+                int sl = y / sh2;
+                float ph = std::sin(tk * 0.045f + sl * 1.7f);
+                int off = (int)(ph * img.cols * 0.06f) * ((sl & 1) ? -1 : 1);
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                cv::Vec3b *op = out2.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    int sx = x - off;
+                    if (sx < 0 || sx >= img.cols) continue;
+                    float a = mm[sx];
+                    if (a < 0.05f) continue;
+                    op[x][0]=(uchar)(op[x][0]+(ip[sx][0]-op[x][0])*a);
+                    op[x][1]=(uchar)(op[x][1]+(ip[sx][1]-op[x][1])*a);
+                    op[x][2]=(uchar)(op[x][2]+(ip[sx][2]-op[x][2])*a);
+                }
+            }
+            out2.copyTo(img);
+            return;
+        }
+        if (mode == 19) {
+            /* DISINTEGRATION: you dissolve into drifting embers and
+             * re-form, on a slow loop. Noise decides which pixels go
+             * first; freed pixels reveal the learned room; embers spawn
+             * at the dissolve frontier and drift up. */
+            static float epx[160], epy[160], evx[160], evy[160], elife[160];
+            static int einit = 0;
+            if (!einit) { for (int i=0;i<160;i++) elife[i]=0; einit=1; }
+            unsigned tk = g_seg.counter;
+            float phase = 0.5f + 0.5f * std::sin(tk * 0.016f);   /* 0..1 loop */
+            int spawned = 0;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *bp = g_seg.bg_est.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    if (a < 0.05f) continue;
+                    float n = uhash(x / 3, y / 3, 0);      /* static pattern */
+                    float d = (phase - n) * 8.0f * fx;     /* dissolve depth */
+                    if (d <= 0) continue;                  /* still solid */
+                    float k = std::min(1.0f, d) * a;
+                    /* at the frontier: spawn an ember occasionally */
+                    if (d < 0.6f && spawned < 6 && uhash(x, y, tk) > 0.995f) {
+                        for (int e = 0; e < 160; e++) if (elife[e] <= 0) {
+                            epx[e]=(float)x; epy[e]=(float)y;
+                            evx[e]=(uhash(x,y,tk+1)-0.5f)*2.0f;
+                            evy[e]=-1.0f-uhash(x,y,tk+2)*2.0f;
+                            elife[e]=1.0f; spawned++; break;
+                        }
+                    }
+                    ip[x][0]=(uchar)(ip[x][0]+(bp[x][0]-ip[x][0])*k);
+                    ip[x][1]=(uchar)(ip[x][1]+(bp[x][1]-ip[x][1])*k);
+                    ip[x][2]=(uchar)(ip[x][2]+(bp[x][2]-ip[x][2])*k);
+                }
+            }
+            for (int e = 0; e < 160; e++) {                /* embers */
+                if (elife[e] <= 0) continue;
+                epx[e]+=evx[e]; epy[e]+=evy[e]; elife[e]-=0.02f;
+                int X=(int)epx[e], Y=(int)epy[e];
+                if (X<1||X>=img.cols-2||Y<1||Y>=img.rows-2){elife[e]=0;continue;}
+                int br=(int)(elife[e]*255);
+                for(int yy=0;yy<2;yy++){uchar*p=data+(Y+yy)*stride+X*3;
+                    for(int xx=0;xx<2;xx++){
+                        p[xx*3+0]=clamp_int_u8(p[xx*3+0]+br/3);
+                        p[xx*3+1]=clamp_int_u8(p[xx*3+1]+br*2/3);
+                        p[xx*3+2]=clamp_int_u8(p[xx*3+2]+br);}}
+            }
+            return;
+        }
+        if (mode == 20) {
+            /* LIGHT-PAINT SILHOUETTE: your outline writes glowing,
+             * hue-cycling light trails that linger like a long-exposure
+             * photograph. Move to paint; hold still to let it fade. */
+            static cv::Mat trail;
+            if (trail.empty() || trail.size() != img.size())
+                trail = cv::Mat::zeros(img.size(), CV_32FC3);
+            trail *= 0.94;
+            unsigned tk = g_seg.counter;
+            cv::Mat m8, d1, e1;
+            g_seg.mask.convertTo(m8, CV_8U, 255.0);
+            cv::dilate(m8, d1, cv::Mat(), cv::Point(-1,-1), 2);
+            cv::erode (m8, e1, cv::Mat(), cv::Point(-1,-1), 1);
+            float hue = tk * 0.05f;
+            float cb2=(std::sin(hue+4.19f)*0.5f+0.5f)*255;
+            float cg2=(std::sin(hue+2.09f)*0.5f+0.5f)*255;
+            float cr2=(std::sin(hue)*0.5f+0.5f)*255;
+            for (int y = 0; y < img.rows; y++) {
+                const uchar *da=d1.ptr<uchar>(y), *ea=e1.ptr<uchar>(y);
+                cv::Vec3f *tp = trail.ptr<cv::Vec3f>(y);
+                for (int x = 0; x < img.cols; x++)
+                    if (da[x] > 128 && ea[x] < 128) {
+                        tp[x][0]=std::max(tp[x][0],cb2);
+                        tp[x][1]=std::max(tp[x][1],cg2);
+                        tp[x][2]=std::max(tp[x][2],cr2);
+                    }
+            }
+            for (int y = 0; y < img.rows; y++) {
+                const cv::Vec3f *tp = trail.ptr<cv::Vec3f>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    if (tp[x][0]+tp[x][1]+tp[x][2] < 12) continue;
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)tp[x][0]);
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)tp[x][1]);
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)tp[x][2]);
+                }
+            }
+            return;
+        }
+        if (mode == 21) {
+            /* MIRROR TWIN: you and your horizontally-flipped double,
+             * side by side in the learned room. Wave — it waves back
+             * with the other hand. */
+            cv::Mat out2; g_seg.bg_est.copyTo(out2);
+            int dx = (int)(img.cols / 5 * fx);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                cv::Vec3b *op = out2.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    /* original, shifted left */
+                    int sx = x + dx;
+                    if (sx >= 0 && sx < img.cols && mm[sx] > 0.05f) {
+                        float a = mm[sx];
+                        op[x][0]=(uchar)(op[x][0]+(ip[sx][0]-op[x][0])*a);
+                        op[x][1]=(uchar)(op[x][1]+(ip[sx][1]-op[x][1])*a);
+                        op[x][2]=(uchar)(op[x][2]+(ip[sx][2]-op[x][2])*a);
+                    }
+                    /* mirrored twin, shifted right */
+                    int mx = (img.cols - 1 - x) + dx;
+                    if (mx >= 0 && mx < img.cols && mm[mx] > 0.05f) {
+                        float a = mm[mx] * 0.97f;
+                        op[x][0]=(uchar)(op[x][0]+(ip[mx][0]-op[x][0])*a);
+                        op[x][1]=(uchar)(op[x][1]+(ip[mx][1]-op[x][1])*a);
+                        op[x][2]=(uchar)(op[x][2]+(ip[mx][2]-op[x][2])*a);
+                    }
+                }
+            }
+            out2.copyTo(img);
+            return;
+        }
+        if (mode == 22) {
+            /* CRYSTAL YOU: your body rendered as a low-poly triangle
+             * mesh (each cell split into two flat-shaded triangles);
+             * the room stays photographic. */
+            const int C = std::max(16, img.cols / 40);
+            for (int cy = 0; cy < img.rows - 1; cy += C) {
+                for (int cx = 0; cx < img.cols - 1; cx += C) {
+                    int x1 = std::min(img.cols - 1, cx + C);
+                    int y1 = std::min(img.rows - 1, cy + C);
+                    /* cell person coverage */
+                    float acc = g_seg.mask.at<float>(cy, cx)
+                              + g_seg.mask.at<float>(cy, x1)
+                              + g_seg.mask.at<float>(y1, cx)
+                              + g_seg.mask.at<float>(y1, x1);
+                    if (acc < 0.8f) continue;
+                    cv::Vec3b ca = img.at<cv::Vec3b>((cy+y1)/2, (cx*2+x1)/3);
+                    cv::Vec3b cb = img.at<cv::Vec3b>((cy+y1)/2, (cx+x1*2)/3);
+                    cv::Point t1[3] = {{cx,cy},{x1,cy},{cx,y1}};
+                    cv::Point t2[3] = {{x1,cy},{x1,y1},{cx,y1}};
+                    cv::fillConvexPoly(img, t1, 3, cv::Scalar(ca[0],ca[1],ca[2]));
+                    cv::fillConvexPoly(img, t2, 3, cv::Scalar(cb[0],cb[1],cb[2]));
+                    cv::line(img, t1[1], t1[2], cv::Scalar(255,255,255), 1);
+                }
+            }
+            return;
+        }
+        if (mode == 23) {
+            /* X-RAY SCANNER: a bright bar sweeps down; behind it your
+             * body shows in inverted blue x-ray while the room dims. */
+            unsigned tk = g_seg.counter;
+            int bar = (int)((tk * 5) % (unsigned)(img.rows + 120)) - 60;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                if (y > bar - 4 && y < bar + 4) {          /* the sweep bar */
+                    for (int x = 0; x < img.cols; x++) {
+                        ip[x][0]=clamp_int_u8(ip[x][0]+180);
+                        ip[x][1]=clamp_int_u8(ip[x][1]+200);
+                        ip[x][2]=clamp_int_u8(ip[x][2]+120);
+                    }
+                } else if (y < bar) {                       /* scanned zone */
+                    for (int x = 0; x < img.cols; x++) {
+                        float a = mm[x];
+                        if (a < 0.05f) {                    /* room dims */
+                            ip[x][0]=(uchar)(ip[x][0]*0.45f);
+                            ip[x][1]=(uchar)(ip[x][1]*0.40f);
+                            ip[x][2]=(uchar)(ip[x][2]*0.35f);
+                            continue;
+                        }
+                        float lum=(ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f);
+                        float inv2=255.0f-lum;
+                        float b2=std::min(255.f,inv2*1.25f), gg=inv2*0.9f, r2=inv2*0.45f;
+                        ip[x][0]=(uchar)(ip[x][0]+(b2-ip[x][0])*a);
+                        ip[x][1]=(uchar)(ip[x][1]+(gg-ip[x][1])*a);
+                        ip[x][2]=(uchar)(ip[x][2]+(r2-ip[x][2])*a);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 24) {
+            /* WANTED POSTER: sepia room, you in gritty halftone,
+             * WANTED above your head and the bounty below. */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float lum=(ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f);
+                    float a = mm[x];
+                    if (a > 0.5f) {                        /* halftone person */
+                        float cell = ((x % 4) < 2) ^ ((y % 4) < 2) ? 30.f : 0.f;
+                        float v = (lum > 128 + cell - 15) ? 225.f : 35.f;
+                        ip[x] = cv::Vec3b((uchar)(v*0.55f),(uchar)(v*0.75f),(uchar)v);
+                    } else {                               /* sepia room */
+                        ip[x][0]=(uchar)std::min(255.f,lum*0.55f+20);
+                        ip[x][1]=(uchar)std::min(255.f,lum*0.78f+22);
+                        ip[x][2]=(uchar)std::min(255.f,lum*0.95f+30);
+                    }
+                }
+            }
+            cv::putText(img, "WANTED", cv::Point(img.cols/2-170, 70),
+                        cv::FONT_HERSHEY_TRIPLEX, 2.2, cv::Scalar(15,40,80), 8);
+            cv::putText(img, "WANTED", cv::Point(img.cols/2-170, 70),
+                        cv::FONT_HERSHEY_TRIPLEX, 2.2, cv::Scalar(60,120,200), 3);
+            cv::putText(img, "REWARD  $5000", cv::Point(img.cols/2-150, img.rows-30),
+                        cv::FONT_HERSHEY_TRIPLEX, 1.2, cv::Scalar(15,40,80), 5);
+            cv::putText(img, "REWARD  $5000", cv::Point(img.cols/2-150, img.rows-30),
+                        cv::FONT_HERSHEY_TRIPLEX, 1.2, cv::Scalar(60,120,200), 2);
             return;
         }
         if (mode == 15) {
@@ -1691,11 +3936,15 @@ void cv_fx_style(unsigned char *data, int w, int h, int stride,
 }
 
 void cv_fx_mood(unsigned char *data, int w, int h, int stride,
-                int mode, float gain)
+                int mode, float gain, float extra)
 {
     if (!data || w < 32 || h < 32) return;
+    if (extra <= 0.0f) extra = 1.0f;         /* mode-specific: party density /
+                                              * border thickness */
+    if (extra < 0.3f) extra = 0.3f;
+    if (extra > 3.0f) extra = 3.0f;
     if (mode < 0) mode = 0;
-    if (mode > 5) mode = 5;
+    if (mode > 7) mode = 7;
     if (gain <= 0.0f || gain > 2.0f) gain = 1.0f;
     try {
         cv::Mat img = wrap_bgr(data, w, h, stride);
@@ -1827,6 +4076,65 @@ void cv_fx_mood(unsigned char *data, int w, int h, int stride,
                         cv::FONT_HERSHEY_SIMPLEX, 0.7, col, 2);
             int bw = (int)(roi.width * conf);
             cv::rectangle(img, cv::Rect(roi.x, ty + 6, bw, 5), col, cv::FILLED);
+        } else if (mode == 7) {
+            /* EMOTION FOUNTAIN: particles pour from behind your head,
+             * their motion written by your mood — happy erupts golden
+             * upward, sad drips slowly, angry bursts radial sparks,
+             * surprised rings outward. extra = flow rate. */
+            static float qx2[110], qy3[110], qvx[110], qvy[110], ql2[110];
+            static int qc2[110], qinit = 0;
+            if (!qinit) { for (int i=0;i<110;i++) ql2[i]=0; qinit=1; }
+            float ex2 = roi.x + roi.width/2.f, ey2 = (float)roi.y;
+            int rate = (int)(conf * 6 * extra);
+            for (int i = 0; i < 110 && rate > 0; i++) {
+                if (ql2[i] > 0) continue;
+                ql2[i] = 1.0f; qc2[i] = emo;
+                qx2[i] = ex2 + ((rand()%100)-50) * roi.width / 130.0f;
+                qy3[i] = ey2;
+                if (emo == 3) {          /* happy: up fountain */
+                    qvx[i]=((rand()%100)-50)/22.0f; qvy[i]=-4.0f-(rand()%100)/33.0f;
+                } else if (emo == 5) {   /* sad: slow drip */
+                    qvx[i]=((rand()%100)-50)/90.0f; qvy[i]=0.6f+(rand()%100)/160.0f;
+                } else if (emo == 0) {   /* angry: radial burst */
+                    float aa=(rand()%628)/100.0f;
+                    qvx[i]=std::cos(aa)*4.5f; qvy[i]=std::sin(aa)*4.5f;
+                } else if (emo == 6) {   /* surprised: outward ring */
+                    float aa=(rand()%628)/100.0f;
+                    qvx[i]=std::cos(aa)*2.6f; qvy[i]=std::sin(aa)*2.6f - 1.0f;
+                } else {                 /* neutral-ish wisps */
+                    qvx[i]=((rand()%100)-50)/60.0f; qvy[i]=-0.7f;
+                }
+                rate--;
+            }
+            for (int i = 0; i < 110; i++) {
+                if (ql2[i] <= 0) continue;
+                if (qc2[i] == 3) qvy[i] += 0.14f;         /* fountain falls back */
+                qx2[i]+=qvx[i]; qy3[i]+=qvy[i]; ql2[i]-=0.018f;
+                int X=(int)qx2[i], Y=(int)qy3[i];
+                if (X<2||Y<2||X>=w-2||Y>=h-2) { ql2[i]=0; continue; }
+                const int *cc = EMO_COL[qc2[i]];
+                float li = ql2[i];
+                cv::circle(img, {X,Y}, 2,
+                           cv::Scalar(cc[0]*li, cc[1]*li, cc[2]*li), cv::FILLED);
+            }
+        } else if (mode == 6) {
+            /* MOOD RING: a breathing colored border frames the call in
+             * your current emotion; thickness pulses with confidence. */
+            int th = (int)((10 + (int)(conf * 26)) * extra)
+                   + (int)(4 * std::sin((float)g_mood.counter * 0.1f));
+            for (int y = 0; y < h; y++) {
+                uchar *row = data + y * stride;
+                for (int x = 0; x < w; x++) {
+                    int db = std::min(std::min(x, w-1-x), std::min(y, h-1-y));
+                    if (db >= th) { if (x > th && x < w-1-th) { x = w-1-th; } continue; }
+                    float k = 1.0f - (float)db / th;
+                    k = k * k * (0.35f + conf * 0.65f);
+                    uchar *p2 = row + x * 3;
+                    p2[0]=(uchar)(p2[0]+(C[0]-p2[0])*k);
+                    p2[1]=(uchar)(p2[1]+(C[1]-p2[1])*k);
+                    p2[2]=(uchar)(p2[2]+(C[2]-p2[2])*k);
+                }
+            }
         } else if (mode == 5) {
             /* AUTO-GRADE: cinematic color grade steered by emotion.
              * happy=warm lift, sad=cool desat, angry=hot contrast,
@@ -1909,7 +4217,7 @@ void cv_fx_mood(unsigned char *data, int w, int h, int stride,
             }
             if (emo == 3 && conf > 0.18f) {         /* confetti */
                 for (int i = 0; i < 96; i++) {
-                    if (g_mood.pl[i] <= 0 && (rand() % 100) < (int)(conf*25)) {
+                    if (g_mood.pl[i] <= 0 && (rand() % 100) < (int)(conf*25*extra)) {
                         g_mood.px[i] = (float)(rand() % w);
                         g_mood.py[i] = -(float)(rand() % 40);
                         g_mood.pvx[i] = ((rand()%100)-50) / 40.0f;

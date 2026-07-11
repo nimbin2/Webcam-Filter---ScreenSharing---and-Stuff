@@ -55,11 +55,15 @@ int ort_rvm_init(const char *model_path);
 /* Run one frame of RVM.
  *   src_chw : float32 RGB, values 0..1, planar CHW (3 * ih * iw floats)
  *   iw, ih  : the frame's width/height (any size; /16-aligned is best)
+ *   ds      : RVM's downsample_ratio (0..1]. The encoder runs at
+ *             iw*ds x ih*ds while refinement stays at full input res —
+ *             THE speed lever. ~256/iw is a good value; <=0 -> 1.0.
  *   pha_out : caller buffer for the alpha matte, ih*iw floats, 0..1
  * The recurrent state is carried between calls internally (that's what
  * makes RVM temporally stable) and re-initialized automatically if the
- * frame size changes. Returns 1 on success, 0 on failure. */
-int ort_rvm_infer(const float *src_chw, int iw, int ih, float *pha_out);
+ * frame size or ds changes. Returns 1 on success, 0 on failure. */
+int ort_rvm_infer(const float *src_chw, int iw, int ih, float ds,
+                  float *pha_out);
 
 /* Zero the recurrent state (e.g. on a scene cut). Cheap; optional. */
 void ort_rvm_reset(void);
