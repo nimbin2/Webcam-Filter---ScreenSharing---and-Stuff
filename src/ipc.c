@@ -155,7 +155,14 @@ static const char *PERSONFX_MODES[] = {
     "contour-stripes","static-you","golden-statue","comic-ink","venetian",
     "burning-edge","glass-body","blueprint","brick-tiles","shadow-caller",
     "glow-in-dark","graphite","pop-poster","riso-outlines","heat-haze",
-    "security-cam","negative-you",
+    "security-cam","negative-you","vaporwave","emboss-relief","pixel-drip",
+    "anaglyph-3d","chalk-outline","scan-bar","test-pattern","dither-1bit",
+    "frost-edge","hollow-man","searchlight","pixel-sort","laser-grid",
+    "oil-slick","neon-sign","rain-shadow","mirror-shatter","magnet-field",
+    "presence-heat","grand-finale","keepy-uppy","bubble-pop","punching-bag",
+    "goalkeeper","motion-paint","force-field","smoke-flow","ripple-pool",
+    "cloth-net","swarm","sand-fall","bouncy-balls","liquid-pool","slime",
+    "leaf-storm","iron-filings",
 };
 static const char *FACEFX_MODES[] = {
     "pixelate","ring-dots","googly-eyes","bighead","deal-with-it","laser-eyes",
@@ -401,7 +408,28 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK                                    71=CONTOUR-STRIPES 72=STATIC-YOU (signal lost) 73=GOLDEN-STATUE 74=COMIC-INK");
             send_line(client_fd, "OK                                    75=VENETIAN 76=BURNING-EDGE 77=GLASS-BODY 78=BLUEPRINT 79=BRICK-TILES");
             send_line(client_fd, "OK                                    80=SHADOW-CALLER 81=GLOW-IN-DARK 82=GRAPHITE 83=POP-POSTER 84=RISO-OUTLINES");
-            send_line(client_fd, "OK                                    85=HEAT-HAZE 86=SECURITY-CAM 87=NEGATIVE-YOU");
+            send_line(client_fd, "OK                                    85=HEAT-HAZE 86=SECURITY-CAM 87=NEGATIVE-YOU 88=VAPORWAVE 89=EMBOSS-RELIEF");
+            send_line(client_fd, "OK                                    90=PIXEL-DRIP 91=ANAGLYPH-3D 92=CHALK-OUTLINE 93=SCAN-BAR 94=TEST-PATTERN");
+            send_line(client_fd, "OK                                    95=DITHER-1BIT 96=FROST-EDGE 97=HOLLOW-MAN 98=SEARCHLIGHT (hunts you)");
+            send_line(client_fd, "OK                                    99=PIXEL-SORT 100=LASER-GRID 101=OIL-SLICK 102=NEON-SIGN 103=RAIN-SHADOW");
+            send_line(client_fd, "OK                                    104=MIRROR-SHATTER 105=MAGNET-FIELD 106=PRESENCE-HEAT 107=GRAND-FINALE");
+            send_line(client_fd, "OK   -- INTERACTIVE (your body is the collider, your motion is the force) --");
+            send_line(client_fd, "OK                                    108=KEEPY-UPPY: head/hand the ball, keep it up (fx=gravity)");
+            send_line(client_fd, "OK                                    109=BUBBLE-POP: pop rising bubbles, chain combos (fx=rate)");
+            send_line(client_fd, "OK                                    110=PUNCHING-BAG: punch it, it swings; POWER meter (fx=bag weight)");
+            send_line(client_fd, "OK                                    111=GOALKEEPER: block incoming shots with your body (fx=shot rate)");
+            send_line(client_fd, "OK                                    112=MOTION-PAINT: your movement paints the room (fx=drying)");
+            send_line(client_fd, "OK                                    113=FORCE-FIELD: shove a particle field around (fx=strength)");
+            send_line(client_fd, "OK                                    114=SMOKE-FLOW: real fluid sim — stir currents with your hands");
+            send_line(client_fd, "OK                                    115=RIPPLE-POOL: wave equation — your moves drop ripples that refract the room");
+            send_line(client_fd, "OK                                    116=CLOTH-NET: a Verlet spring net you push, stretch and wobble");
+            send_line(client_fd, "OK                                    117=SWARM: boids that flock, and scatter from your hands");
+            send_line(client_fd, "OK                                    118=SAND-FALL: grains pile on your shoulders — shake them off");
+            send_line(client_fd, "OK                                    119=BOUNCY-BALLS: 64 balls, real ball-to-ball collisions, bat them around");
+            send_line(client_fd, "OK                                    120=LIQUID-POOL: liquid that pools, sloshes and splashes — scoop it");
+            send_line(client_fd, "OK                                    121=SLIME: sticky goo clings to you, sags in strands, flings off when you move");
+            send_line(client_fd, "OK                                    122=LEAF-STORM: leaves caught in the wake of your movement; kick the piles up");
+            send_line(client_fd, "OK                                    123=IRON-FILINGS: you are the magnet — filings cling to your field and flow around you");
             send_line(client_fd, "OK   filter modes <name>            list ALL modes of personfx/facefx/moodfx/styleai BY NAME");
             send_line(client_fd, "OK   personfx p5 = fx  per-mode effect strength 0.2..3 (glitch amp, fire, rays, lift, fog...) — tune LIVE:");
             send_line(client_fd, "OK                       vcam-ctl filter set 0 p5 1.8");

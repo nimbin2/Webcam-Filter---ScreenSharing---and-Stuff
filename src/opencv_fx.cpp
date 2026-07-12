@@ -1486,6 +1486,63 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode,
     }
 }
 
+/* ── shared interactive-physics helpers (used by the game modes) ──
+ * The matte is the collider; the matte's CHANGE is the force. */
+struct BodyProbe {
+    bool  hit;        /* body touching the probe circle? */
+    float nx, ny;     /* surface normal, pointing away from your body   */
+    float pux, puy;   /* your push: direction you're sweeping, x speed  */
+};
+static BodyProbe probe_body(const cv::Mat &mask, const cv::Mat &prev,
+                            float px, float py, float R)
+{
+    BodyProbe b; b.hit = false; b.nx = 0; b.ny = -1; b.pux = 0; b.puy = 0;
+    if (mask.empty()) return b;
+    /* contact + normal: ring samples, weighted away from the body mass */
+    const int NS = 16;
+    float sumx = 0, sumy = 0, best = 0;
+    for (int i = 0; i < NS; i++) {
+        float a = 6.2832f * i / NS;
+        int sx = (int)(px + std::cos(a) * R);
+        int sy = (int)(py + std::sin(a) * R);
+        if (sx < 0 || sy < 0 || sx >= mask.cols || sy >= mask.rows) continue;
+        float m = mask.at<float>(sy, sx);
+        if (m > 0.5f) {
+            sumx += std::cos(a) * m;
+            sumy += std::sin(a) * m;
+            best = std::max(best, m);
+        }
+    }
+    if (best <= 0.5f) return b;
+    b.hit = true;
+    float len = std::sqrt(sumx*sumx + sumy*sumy);
+    if (len > 1e-3f) { b.nx = -sumx/len; b.ny = -sumy/len; }
+    /* push: where matte APPEARED minus where it VANISHED (immune to the
+     * aperture problem that defeats a local gradient solve) */
+    if (prev.empty() || prev.size() != mask.size()) return b;
+    float pcx=0, pcy=0, pw=0, ncx=0, ncy=0, nw=0;
+    int W = (int)(R * 3.2f);
+    for (int yy = -W; yy <= W; yy += 2)
+        for (int xx = -W; xx <= W; xx += 2) {
+            int sx = (int)px + xx, sy = (int)py + yy;
+            if (sx < 0 || sy < 0 || sx >= mask.cols || sy >= mask.rows) continue;
+            float d = mask.at<float>(sy, sx) - prev.at<float>(sy, sx);
+            if (d > 0.20f)       { pcx += sx*d; pcy += sy*d; pw += d; }
+            else if (d < -0.20f) { ncx -= sx*d; ncy -= sy*d; nw -= d; }
+        }
+    if (pw > 1.0f && nw > 1.0f) {
+        float dx = pcx/pw - ncx/nw, dy = pcy/pw - ncy/nw;
+        float dl = std::sqrt(dx*dx + dy*dy);
+        if (dl > 1e-3f) {
+            float punch = std::min(11.0f,
+                (pw + nw) / std::max(1.0f, R*R*0.10f) * 2.4f);
+            b.pux = dx/dl * punch;
+            b.puy = dy/dl * punch;
+        }
+    }
+    return b;
+}
+
 void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
                   float edge, float smooth, float size, float fx)
 {
@@ -1685,6 +1742,1767 @@ mask_ready: ;
                     ip[x][0]=(uchar)(ip[x][0]+(tp[x][0]-ip[x][0])*a);
                     ip[x][1]=(uchar)(ip[x][1]+(tp[x][1]-ip[x][1])*a);
                     ip[x][2]=(uchar)(ip[x][2]+(tp[x][2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 119) {
+            /* BOUNCY BALLS: 64 rubber balls with real ball-to-ball
+             * collisions. They bounce off you AND off each other, pile
+             * up on the floor, and you can bat them around. Elastic
+             * impulses, no cheating. fx = bounciness. */
+            const int NB2 = 64;
+            static float bx4[NB2], by4[NB2], bvx2[NB2], bvy2[NB2], br2[NB2];
+            static int bc2[NB2], binit3 = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!binit3) {
+                for (int i2 = 0; i2 < NB2; i2++) {
+                    bx4[i2] = 20 + uhash(i2,1,31)*(img.cols-40);
+                    by4[i2] = -uhash(i2,2,31)*img.rows*1.6f;
+                    bvx2[i2] = (uhash(i2,3,31)-0.5f)*3;
+                    bvy2[i2] = 0;
+                    br2[i2] = 9 + uhash(i2,4,31)*13;
+                    bc2[i2] = i2 % 5;
+                }
+                binit3 = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            float rest = 0.62f + 0.22f*std::min(2.0f, fx);   /* restitution */
+            /* integrate + body collision */
+            for (int i2 = 0; i2 < NB2; i2++) {
+                bvy2[i2] += 0.34f;
+                bx4[i2] += bvx2[i2];
+                by4[i2] += bvy2[i2];
+                int xi = std::max(0,std::min(img.cols-1,(int)bx4[i2]));
+                int yi = std::max(0,std::min(img.rows-1,(int)by4[i2]));
+                if (g_seg.mask.at<float>(yi,xi) > 0.5f) {   /* hit YOU */
+                    int x1=std::min(img.cols-1,xi+4), x0=std::max(0,xi-4);
+                    int y1=std::min(img.rows-1,yi+4), y0=std::max(0,yi-4);
+                    float gx2 = g_seg.mask.at<float>(yi,x1)-g_seg.mask.at<float>(yi,x0);
+                    float gy2 = g_seg.mask.at<float>(y1,xi)-g_seg.mask.at<float>(y0,xi);
+                    float l2 = std::sqrt(gx2*gx2+gy2*gy2);
+                    float nx2 = l2>1e-3f ? -gx2/l2 : 0;
+                    float ny2 = l2>1e-3f ? -gy2/l2 : -1;
+                    float d = g_seg.mask.at<float>(yi,xi) - prev.at<float>(yi,xi);
+                    float dot = bvx2[i2]*nx2 + bvy2[i2]*ny2;
+                    if (dot < 0) {
+                        bvx2[i2] -= (1+rest)*dot*nx2;
+                        bvy2[i2] -= (1+rest)*dot*ny2;
+                    }
+                    /* your motion adds kick */
+                    bvx2[i2] += nx2 * (1.6f + std::fabs(d)*13.0f);
+                    bvy2[i2] += ny2 * (1.6f + std::fabs(d)*13.0f);
+                    bx4[i2] += nx2*2.5f; by4[i2] += ny2*2.5f;
+                }
+                /* walls + floor */
+                if (bx4[i2] < br2[i2]) { bx4[i2]=br2[i2]; bvx2[i2]=std::fabs(bvx2[i2])*rest; }
+                if (bx4[i2] > img.cols-br2[i2]) { bx4[i2]=img.cols-br2[i2]; bvx2[i2]=-std::fabs(bvx2[i2])*rest; }
+                if (by4[i2] > img.rows-br2[i2]) {
+                    by4[i2]=img.rows-br2[i2];
+                    bvy2[i2]=-std::fabs(bvy2[i2])*rest;
+                    bvx2[i2]*=0.99f;
+                }
+                if (by4[i2] < -img.rows*2) by4[i2] = -20;
+            }
+            /* ball-to-ball elastic collisions (N^2 at N=64: cheap) */
+            for (int i2 = 0; i2 < NB2; i2++)
+                for (int j2 = i2+1; j2 < NB2; j2++) {
+                    float dx3 = bx4[j2]-bx4[i2], dy3 = by4[j2]-by4[i2];
+                    float d2 = dx3*dx3+dy3*dy3;
+                    float rr = br2[i2]+br2[j2];
+                    if (d2 >= rr*rr || d2 < 1e-4f) continue;
+                    float d = std::sqrt(d2);
+                    float nx2 = dx3/d, ny2 = dy3/d;
+                    float overlap = (rr - d) * 0.5f;
+                    bx4[i2] -= nx2*overlap; by4[i2] -= ny2*overlap;
+                    bx4[j2] += nx2*overlap; by4[j2] += ny2*overlap;
+                    float rvx = bvx2[j2]-bvx2[i2], rvy = bvy2[j2]-bvy2[i2];
+                    float vn = rvx*nx2 + rvy*ny2;
+                    if (vn > 0) continue;
+                    float imp = -(1+rest) * vn * 0.5f;
+                    bvx2[i2] -= imp*nx2; bvy2[i2] -= imp*ny2;
+                    bvx2[j2] += imp*nx2; bvy2[j2] += imp*ny2;
+                }
+            static const int BCOL[5][3] = {{80,90,240},{70,200,255},{110,220,120},
+                                           {230,170,70},{210,110,230}};
+            for (int i2 = 0; i2 < NB2; i2++) {
+                const int *c2 = BCOL[bc2[i2]];
+                cv::circle(img, {(int)bx4[i2],(int)by4[i2]}, (int)br2[i2]+2,
+                           cv::Scalar(20,20,25), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)bx4[i2],(int)by4[i2]}, (int)br2[i2],
+                           cv::Scalar(c2[0],c2[1],c2[2]), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)(bx4[i2]-br2[i2]*0.32f),
+                                 (int)(by4[i2]-br2[i2]*0.32f)},
+                           std::max(2,(int)(br2[i2]*0.3f)),
+                           cv::Scalar(255,255,255), cv::FILLED, cv::LINE_AA);
+            }
+            (void)tk;
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 120) {
+            /* LIQUID POOL: real liquid particles — they fall, POOL at the
+             * bottom, level out, slosh when you disturb them, and splash
+             * where you strike. Grid-density repulsion (position-based
+             * fluid, lite). Scoop it with your hands. fx = liquid amount. */
+            const int NL = 900;
+            static float lx[NL], ly[NL], lvx[NL], lvy[NL];
+            static int linit = 0;
+            static cv::Mat prev;
+            const int CG = 12;                       /* density cell size */
+            static int cnt[64*48];
+            unsigned tk = g_seg.counter;
+            if (!linit) {
+                for (int i2 = 0; i2 < NL; i2++) {
+                    lx[i2] = 30 + uhash(i2,1,41)*(img.cols-60);
+                    ly[i2] = -uhash(i2,2,41)*img.rows;
+                    lvx[i2] = 0; lvy[i2] = 0;
+                }
+                linit = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            int GW2 = std::min(64, img.cols/CG), GH2 = std::min(48, img.rows/CG);
+            std::memset(cnt, 0, sizeof cnt);
+            int active = (int)(NL * std::min(1.0f, 0.3f + fx*0.35f));
+            for (int i2 = 0; i2 < active; i2++) {
+                int cx2 = std::min(GW2-1, std::max(0, (int)(lx[i2]/CG)));
+                int cy2 = std::min(GH2-1, std::max(0, (int)(ly[i2]/CG)));
+                cnt[cy2*GW2+cx2]++;
+            }
+            for (int i2 = 0; i2 < active; i2++) {
+                lvy[i2] += 0.30f;                             /* gravity */
+                /* pressure: flee crowded cells */
+                int cx2 = std::min(GW2-2, std::max(1, (int)(lx[i2]/CG)));
+                int cy2 = std::min(GH2-2, std::max(1, (int)(ly[i2]/CG)));
+                float pl = (float)cnt[cy2*GW2+cx2-1], pr = (float)cnt[cy2*GW2+cx2+1];
+                float pu = (float)cnt[(cy2-1)*GW2+cx2], pd = (float)cnt[(cy2+1)*GW2+cx2];
+                lvx[i2] += (pl - pr) * 0.055f;
+                lvy[i2] += (pu - pd) * 0.055f - 0.02f*cnt[cy2*GW2+cx2];
+                /* body: push out + inherit your motion (splash) */
+                int xi = std::max(0,std::min(img.cols-1,(int)lx[i2]));
+                int yi = std::max(0,std::min(img.rows-1,(int)ly[i2]));
+                float m = g_seg.mask.at<float>(yi,xi);
+                float d = m - prev.at<float>(yi,xi);
+                if (m > 0.4f || std::fabs(d) > 0.2f) {
+                    int x1=std::min(img.cols-1,xi+4), x0=std::max(0,xi-4);
+                    int y1=std::min(img.rows-1,yi+4), y0=std::max(0,yi-4);
+                    float gx2 = g_seg.mask.at<float>(yi,x1)-g_seg.mask.at<float>(yi,x0);
+                    float gy2 = g_seg.mask.at<float>(y1,xi)-g_seg.mask.at<float>(y0,xi);
+                    float l2 = std::sqrt(gx2*gx2+gy2*gy2)+1e-3f;
+                    float force = (m > 0.4f ? 2.2f : 0.0f)
+                                + std::fabs(d) * 15.0f * fx;
+                    lvx[i2] -= gx2/l2 * force;
+                    lvy[i2] -= gy2/l2 * force;
+                }
+                lvx[i2] *= 0.94f; lvy[i2] *= 0.96f;           /* viscosity */
+                lx[i2] += lvx[i2]; ly[i2] += lvy[i2];
+                if (lx[i2] < 3) { lx[i2]=3; lvx[i2]=std::fabs(lvx[i2])*0.4f; }
+                if (lx[i2] > img.cols-4) { lx[i2]=img.cols-4; lvx[i2]=-std::fabs(lvx[i2])*0.4f; }
+                if (ly[i2] > img.rows-4) { ly[i2]=img.rows-4; lvy[i2]=-std::fabs(lvy[i2])*0.25f; }
+                if (ly[i2] < -img.rows) ly[i2] = -10;
+            }
+            /* render: additive blue blobs -> reads as a fluid body */
+            for (int i2 = 0; i2 < active; i2++) {
+                int x = (int)lx[i2], y = (int)ly[i2];
+                if (x < 2 || y < 2 || x >= img.cols-2 || y >= img.rows-2) continue;
+                float sp = std::sqrt(lvx[i2]*lvx[i2]+lvy[i2]*lvy[i2]);
+                int hi = std::min(255, 110 + (int)(sp*26));
+                for (int dy = -3; dy <= 3; dy++)
+                    for (int dx = -3; dx <= 3; dx++) {
+                        int r2 = dx*dx+dy*dy;
+                        if (r2 > 9) continue;
+                        cv::Vec3b &p2 = img.at<cv::Vec3b>(y+dy, x+dx);
+                        float k = (1.0f - r2/9.0f) * 0.85f;
+                        p2[0]=clamp_int_u8((int)(p2[0]+k*230));
+                        p2[1]=clamp_int_u8((int)(p2[1]+k*150));
+                        p2[2]=clamp_int_u8((int)(p2[2]+k*(60+hi/4)));
+                    }
+            }
+            (void)tk;
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 121) {
+            /* SLIME: sticky goo that CLINGS to you. It falls, sticks
+             * where it lands on your body, stretches and sags, drips off
+             * in strands — and flings away when you move fast enough.
+             * fx = stickiness. */
+            const int NS2 = 620;
+            static float sx4[NS2], sy4[NS2], svx[NS2], svy[NS2];
+            static float ax[NS2], ay[NS2];        /* anchor on your body */
+            static int stuck[NS2], sinit2 = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!sinit2) {
+                for (int i2 = 0; i2 < NS2; i2++) {
+                    sx4[i2] = uhash(i2,1,43)*img.cols;
+                    sy4[i2] = -uhash(i2,2,43)*img.rows*1.4f;
+                    svx[i2] = 0; svy[i2] = 1; stuck[i2] = 0;
+                }
+                sinit2 = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            for (int i2 = 0; i2 < NS2; i2++) {
+                int xi = std::max(0,std::min(img.cols-1,(int)sx4[i2]));
+                int yi = std::max(0,std::min(img.rows-1,(int)sy4[i2]));
+                float m = g_seg.mask.at<float>(yi,xi);
+                float d = m - prev.at<float>(yi,xi);
+                if (stuck[i2]) {
+                    /* cling to the anchor, sag downward, fling if you
+                     * move fast */
+                    float pull = 0.30f * fx;
+                    svx[i2] += (ax[i2]-sx4[i2]) * pull;
+                    svy[i2] += (ay[i2]-sy4[i2]) * pull + 0.16f;   /* sag */
+                    svx[i2] *= 0.7f; svy[i2] *= 0.7f;
+                    sx4[i2] += svx[i2]; sy4[i2] += svy[i2];
+                    if (std::fabs(d) > 0.3f/std::max(0.5f,fx)) {  /* flung off */
+                        stuck[i2] = 0;
+                        int x1=std::min(img.cols-1,xi+4), x0=std::max(0,xi-4);
+                        float gx2 = g_seg.mask.at<float>(yi,x1)
+                                  - g_seg.mask.at<float>(yi,x0);
+                        svx[i2] = -gx2*9.0f + (uhash(i2,tk%37,3)-0.5f)*5;
+                        svy[i2] = -2.5f;
+                    }
+                    /* strand back to the anchor */
+                    cv::line(img, {(int)sx4[i2],(int)sy4[i2]},
+                             {(int)ax[i2],(int)ay[i2]},
+                             cv::Scalar(90,220,140), 2, cv::LINE_AA);
+                } else {
+                    svy[i2] += 0.30f;
+                    svx[i2] *= 0.99f;
+                    sx4[i2] += svx[i2]; sy4[i2] += svy[i2];
+                    xi = std::max(0,std::min(img.cols-1,(int)sx4[i2]));
+                    yi = std::max(0,std::min(img.rows-1,(int)sy4[i2]));
+                    if (g_seg.mask.at<float>(yi,xi) > 0.5f) {     /* SPLAT */
+                        stuck[i2] = 1;
+                        ax[i2] = sx4[i2]; ay[i2] = sy4[i2];
+                        svx[i2] = svy[i2] = 0;
+                    }
+                    if (sy4[i2] > img.rows + 8) {                 /* recycle */
+                        sx4[i2] = uhash(i2,tk%83,9)*img.cols;
+                        sy4[i2] = -8 - uhash(i2,tk%79,11)*90;
+                        svx[i2] = 0; svy[i2] = 1;
+                    }
+                }
+                int rr = stuck[i2] ? 5 : 4;
+                cv::circle(img, {(int)sx4[i2],(int)sy4[i2]}, rr+2,
+                           cv::Scalar(40,120,60), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)sx4[i2],(int)sy4[i2]}, rr,
+                           cv::Scalar(110,240,150), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)sx4[i2]-1,(int)sy4[i2]-1}, 1,
+                           cv::Scalar(220,255,220), cv::FILLED);
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 122) {
+            /* LEAF STORM: autumn leaves with air drag — they get caught
+             * in the WAKE of your movement, swirl, tumble with spin, and
+             * settle on the floor until you kick them up again.
+             * fx = wind strength. */
+            const int NL2 = 240;
+            static float lx2[NL2], ly2[NL2], lvx2[NL2], lvy2[NL2];
+            static float rot[NL2], rv[NL2];
+            static int lset[NL2], linit2 = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!linit2) {
+                for (int i2 = 0; i2 < NL2; i2++) {
+                    lx2[i2] = uhash(i2,1,53)*img.cols;
+                    ly2[i2] = -uhash(i2,2,53)*img.rows*1.5f;
+                    lvx2[i2] = 0; lvy2[i2] = 0.7f + uhash(i2,3,53);
+                    rot[i2] = uhash(i2,4,53)*6.28f;
+                    rv[i2] = (uhash(i2,5,53)-0.5f)*0.25f;
+                    lset[i2] = 0;
+                }
+                linit2 = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            static const int LCOL[4][3] = {{40,110,205},{30,150,225},
+                                           {50,80,170},{60,170,235}};
+            for (int i2 = 0; i2 < NL2; i2++) {
+                int xi = std::max(0,std::min(img.cols-1,(int)lx2[i2]));
+                int yi = std::max(0,std::min(img.rows-1,(int)ly2[i2]));
+                float m = g_seg.mask.at<float>(yi,xi);
+                float d = m - prev.at<float>(yi,xi);
+                /* your wake: the mask's change drives a wind gust */
+                if (std::fabs(d) > 0.12f) {
+                    int x1=std::min(img.cols-1,xi+5), x0=std::max(0,xi-5);
+                    int y1=std::min(img.rows-1,yi+5), y0=std::max(0,yi-5);
+                    float gx2 = g_seg.mask.at<float>(yi,x1)-g_seg.mask.at<float>(yi,x0);
+                    float gy2 = g_seg.mask.at<float>(y1,xi)-g_seg.mask.at<float>(y0,xi);
+                    float l2 = std::sqrt(gx2*gx2+gy2*gy2)+1e-3f;
+                    float gust = std::fabs(d) * 14.0f * fx;
+                    lvx2[i2] -= gx2/l2 * gust;
+                    lvy2[i2] -= gy2/l2 * gust - 0.5f*gust;    /* lift */
+                    rv[i2] += (uhash(i2,tk%41,7)-0.5f)*0.5f;
+                    lset[i2] = 0;
+                }
+                if (m > 0.55f) {                    /* can't pass through you */
+                    int x1=std::min(img.cols-1,xi+4), x0=std::max(0,xi-4);
+                    float gx2 = g_seg.mask.at<float>(yi,x1)-g_seg.mask.at<float>(yi,x0);
+                    lvx2[i2] -= gx2 * 4.0f;
+                    lvy2[i2] -= 0.6f;
+                }
+                if (!lset[i2]) {
+                    lvy2[i2] += 0.11f;                         /* gravity */
+                    /* leaf flutter: sideways oscillation + drag */
+                    lvx2[i2] += std::sin(ly2[i2]*0.05f + i2) * 0.16f;
+                    lvx2[i2] *= 0.95f; lvy2[i2] *= 0.96f;
+                    if (lvy2[i2] > 3.2f) lvy2[i2] = 3.2f;
+                    lx2[i2] += lvx2[i2]; ly2[i2] += lvy2[i2];
+                    rot[i2] += rv[i2]; rv[i2] *= 0.97f;
+                    if (ly2[i2] > img.rows - 7) {              /* settle */
+                        ly2[i2] = img.rows - 7;
+                        lvx2[i2] = lvy2[i2] = 0;
+                        lset[i2] = 1;
+                    }
+                    if (lx2[i2] < -20) lx2[i2] = img.cols + 10;
+                    if (lx2[i2] > img.cols + 20) lx2[i2] = -10;
+                }
+                /* draw a little leaf: rotated ellipse + stem */
+                const int *c2 = LCOL[i2 & 3];
+                cv::ellipse(img, {(int)lx2[i2],(int)ly2[i2]}, {7,4},
+                            rot[i2]*57.3f, 0, 360,
+                            cv::Scalar(c2[0],c2[1],c2[2]), cv::FILLED, cv::LINE_AA);
+                cv::ellipse(img, {(int)lx2[i2],(int)ly2[i2]}, {7,4},
+                            rot[i2]*57.3f, 0, 360,
+                            cv::Scalar(c2[0]/2,c2[1]/2,c2[2]/2), 1, cv::LINE_AA);
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 123) {
+            /* IRON FILINGS: you are the magnet. Thousands of filings are
+             * DRAWN to your outline, align along your field, and cling in
+             * a shimmering shell — drag your body and they follow, flow
+             * around you, and re-settle. fx = magnet strength. */
+            const int NF = 1500;
+            static float fxs[NF], fys[NF], fvx[NF], fvy[NF];
+            static int finit2 = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!finit2) {
+                for (int i2 = 0; i2 < NF; i2++) {
+                    fxs[i2] = uhash(i2,1,61)*img.cols;
+                    fys[i2] = uhash(i2,2,61)*img.rows;
+                    fvx[i2] = fvy[i2] = 0;
+                }
+                finit2 = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            for (int i2 = 0; i2 < NF; i2++) {
+                int xi = std::max(2,std::min(img.cols-3,(int)fxs[i2]));
+                int yi = std::max(2,std::min(img.rows-3,(int)fys[i2]));
+                float m = g_seg.mask.at<float>(yi,xi);
+                /* the mask gradient IS the field: filings ride it toward
+                 * your edge, then sit in the rim where the field is
+                 * strongest */
+                float gx2 = g_seg.mask.at<float>(yi, std::min(img.cols-1,xi+3))
+                          - g_seg.mask.at<float>(yi, std::max(0,xi-3));
+                float gy2 = g_seg.mask.at<float>(std::min(img.rows-1,yi+3), xi)
+                          - g_seg.mask.at<float>(std::max(0,yi-3), xi);
+                float gl = std::sqrt(gx2*gx2+gy2*gy2);
+                if (gl > 0.02f) {                     /* near your edge */
+                    /* attraction along the field + tangential alignment */
+                    float attract = (m < 0.5f) ? 1.0f : -1.4f;   /* stay outside */
+                    fvx[i2] += gx2/gl * attract * 0.55f * fx;
+                    fvy[i2] += gy2/gl * attract * 0.55f * fx;
+                    fvx[i2] += -gy2/gl * 0.32f * fx;             /* swirl */
+                    fvy[i2] +=  gx2/gl * 0.32f * fx;
+                } else {
+                    /* far away: drift slowly toward the body centre */
+                    float d = m - prev.at<float>(yi,xi);
+                    if (std::fabs(d) > 0.2f) {                   /* your wake */
+                        fvx[i2] += (uhash(i2,tk%43,3)-0.5f)*4.0f;
+                        fvy[i2] += (uhash(i2,tk%47,5)-0.5f)*4.0f;
+                    }
+                    fvy[i2] += 0.02f;
+                }
+                fvx[i2] *= 0.86f; fvy[i2] *= 0.86f;
+                fxs[i2] += fvx[i2]; fys[i2] += fvy[i2];
+                if (fxs[i2] < 1) { fxs[i2]=1; fvx[i2]=0; }
+                if (fxs[i2] > img.cols-2) { fxs[i2]=img.cols-2; fvx[i2]=0; }
+                if (fys[i2] < 1) { fys[i2]=1; fvy[i2]=0; }
+                if (fys[i2] > img.rows-2) { fys[i2]=img.rows-2; fvy[i2]=0; }
+                /* draw each filing as a short needle along the field */
+                float sp = std::sqrt(fvx[i2]*fvx[i2]+fvy[i2]*fvy[i2]);
+                int br = std::min(255, 120 + (int)(sp*55) + (int)(gl*300));
+                float dxn = gl > 0.02f ? -gy2/gl : 1, dyn = gl > 0.02f ? gx2/gl : 0;
+                cv::line(img, {(int)(fxs[i2]-dxn*2.2f),(int)(fys[i2]-dyn*2.2f)},
+                              {(int)(fxs[i2]+dxn*2.2f),(int)(fys[i2]+dyn*2.2f)},
+                         cv::Scalar(br, br, (int)(br*0.85f)), 1, cv::LINE_AA);
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 114) {
+            /* SMOKE FLOW: a real fluid — a velocity grid your body stirs,
+             * with dye advected through it (semi-Lagrangian). Wave a hand
+             * and you push actual currents; the smoke curls and lingers.
+             * fx = how much force your motion injects. */
+            const int GW = 96, GH = 72;
+            static float vxg[GW*GH], vyg[GW*GH], dye[GW*GH];
+            static float vx2[GW*GH], vy2[GW*GH], dy2[GW*GH];
+            static int finit = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!finit) {
+                std::memset(vxg,0,sizeof vxg); std::memset(vyg,0,sizeof vyg);
+                std::memset(dye,0,sizeof dye); finit = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            /* 1. inject: body motion -> velocity, body edge -> dye source */
+            for (int gy3 = 1; gy3 < GH-1; gy3++)
+                for (int gx3 = 1; gx3 < GW-1; gx3++) {
+                    int px3 = gx3 * img.cols / GW, py3 = gy3 * img.rows / GH;
+                    float d = g_seg.mask.at<float>(py3,px3)
+                            - prev.at<float>(py3,px3);
+                    if (std::fabs(d) > 0.15f) {
+                        int x1 = std::min(img.cols-1, px3+4);
+                        int x0 = std::max(0, px3-4);
+                        int y1 = std::min(img.rows-1, py3+4);
+                        int y0 = std::max(0, py3-4);
+                        float gx2 = g_seg.mask.at<float>(py3,x1)
+                                  - g_seg.mask.at<float>(py3,x0);
+                        float gy2 = g_seg.mask.at<float>(y1,px3)
+                                  - g_seg.mask.at<float>(y0,px3);
+                        float l2 = std::sqrt(gx2*gx2+gy2*gy2)+1e-3f;
+                        vxg[gy3*GW+gx3] -= gx2/l2 * d * 9.0f * fx;
+                        vyg[gy3*GW+gx3] -= gy2/l2 * d * 9.0f * fx;
+                    }
+                    float m = g_seg.mask.at<float>(py3,px3);
+                    if (m > 0.35f && m < 0.85f)         /* your rim smokes */
+                        dye[gy3*GW+gx3] = std::min(1.0f,
+                            dye[gy3*GW+gx3] + 0.35f);
+                }
+            /* a little buoyancy + swirl so it always lives */
+            for (int i2 = 0; i2 < GW*GH; i2++) {
+                vyg[i2] -= dye[i2] * 0.012f;
+                vxg[i2] += std::sin((i2/GW)*0.3f + tk*0.02f) * 0.004f;
+            }
+            /* 2. advect velocity and dye (semi-Lagrangian backtrace) */
+            for (int gy3 = 1; gy3 < GH-1; gy3++)
+                for (int gx3 = 1; gx3 < GW-1; gx3++) {
+                    int i2 = gy3*GW+gx3;
+                    float sx2 = gx3 - vxg[i2] * 0.55f;
+                    float sy2 = gy3 - vyg[i2] * 0.55f;
+                    sx2 = std::max(0.0f, std::min((float)GW-1.01f, sx2));
+                    sy2 = std::max(0.0f, std::min((float)GH-1.01f, sy2));
+                    int ix = (int)sx2, iy = (int)sy2;
+                    float fxr = sx2-ix, fyr = sy2-iy;
+                    #define SMP(A) ((A)[iy*GW+ix]*(1-fxr)*(1-fyr) + \
+                                    (A)[iy*GW+ix+1]*fxr*(1-fyr) + \
+                                    (A)[(iy+1)*GW+ix]*(1-fxr)*fyr + \
+                                    (A)[(iy+1)*GW+ix+1]*fxr*fyr)
+                    vx2[i2] = SMP(vxg) * 0.985f;
+                    vy2[i2] = SMP(vyg) * 0.985f;
+                    dy2[i2] = SMP(dye) * 0.988f;
+                    #undef SMP
+                }
+            std::memcpy(vxg, vx2, sizeof vxg);
+            std::memcpy(vyg, vy2, sizeof vyg);
+            std::memcpy(dye, dy2, sizeof dye);
+            /* 3. render the dye, warm and glowing, never over you */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                float gy4 = (float)y * GH / img.rows;
+                int iy = std::min(GH-2, (int)gy4);
+                float fy2 = gy4 - iy;
+                for (int x = 0; x < img.cols; x++) {
+                    float gx4 = (float)x * GW / img.cols;
+                    int ix = std::min(GW-2, (int)gx4);
+                    float fx2 = gx4 - ix;
+                    float d = dye[iy*GW+ix]*(1-fx2)*(1-fy2)
+                            + dye[iy*GW+ix+1]*fx2*(1-fy2)
+                            + dye[(iy+1)*GW+ix]*(1-fx2)*fy2
+                            + dye[(iy+1)*GW+ix+1]*fx2*fy2;
+                    d *= (1.0f - mm[x]);
+                    if (d < 0.02f) continue;
+                    if (d > 1) d = 1;
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)(d*90));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(d*165));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(d*235));
+                }
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 115) {
+            /* RIPPLE POOL: the room is a water surface. Every move you
+             * make drops waves into it — a real wave equation — and the
+             * ripples REFRACT the room image as they spread and bounce
+             * off the walls. fx = wave energy. */
+            const int RW = 200, RH = 150;
+            static float w1[RW*RH], w0[RW*RH];
+            static int rinit = 0;
+            static cv::Mat prev;
+            if (!rinit) {
+                std::memset(w1,0,sizeof w1); std::memset(w0,0,sizeof w0);
+                rinit = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            /* poke the surface where your body moved */
+            for (int gy3 = 2; gy3 < RH-2; gy3++)
+                for (int gx3 = 2; gx3 < RW-2; gx3++) {
+                    int px3 = gx3*img.cols/RW, py3 = gy3*img.rows/RH;
+                    float d = g_seg.mask.at<float>(py3,px3)
+                            - prev.at<float>(py3,px3);
+                    if (std::fabs(d) > 0.25f)
+                        w1[gy3*RW+gx3] -= d * 26.0f * fx;
+                }
+            /* wave equation: w_next = 2w - w_prev + c^2 * laplacian(w) */
+            for (int gy3 = 1; gy3 < RH-1; gy3++)
+                for (int gx3 = 1; gx3 < RW-1; gx3++) {
+                    int i2 = gy3*RW+gx3;
+                    float lap = w1[i2-1] + w1[i2+1] + w1[i2-RW] + w1[i2+RW]
+                              - 4*w1[i2];
+                    float nv = 2*w1[i2] - w0[i2] + lap * 0.22f;
+                    w0[i2] = nv * 0.992f;               /* damping */
+                }
+            std::swap(*(float(*)[RW*RH])w0, *(float(*)[RW*RH])w1);
+            /* refract the room through the wave gradient */
+            cv::Mat keep = img.clone();
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                int gy3 = std::min(RH-2, std::max(1, y*RH/img.rows));
+                for (int x = 0; x < img.cols; x++) {
+                    if (mm[x] > 0.5f) continue;         /* you stay dry */
+                    int gx3 = std::min(RW-2, std::max(1, x*RW/img.cols));
+                    int i2 = gy3*RW+gx3;
+                    float dx3 = w1[i2+1] - w1[i2-1];
+                    float dy3 = w1[i2+RW] - w1[i2-RW];
+                    int sx2 = x + (int)(dx3 * 26.0f);
+                    int sy2 = y + (int)(dy3 * 26.0f);
+                    sx2 = std::max(0, std::min(img.cols-1, sx2));
+                    sy2 = std::max(0, std::min(img.rows-1, sy2));
+                    cv::Vec3b c = keep.at<cv::Vec3b>(sy2, sx2);
+                    float spec = std::max(0.0f, -(dx3+dy3) * 90.0f);
+                    ip[x][0]=clamp_int_u8((int)(c[0] + spec*1.3f));
+                    ip[x][1]=clamp_int_u8((int)(c[1] + spec*1.15f));
+                    ip[x][2]=clamp_int_u8((int)(c[2] + spec*0.9f));
+                }
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 116) {
+            /* CLOTH NET: a spring-lattice net hangs in front of you. Push
+             * it with your hands — it stretches, sags, wobbles and
+             * settles. Real Verlet cloth. fx = how bouncy it is. */
+            const int CW = 26, CH = 18;
+            static float cxs[CW*CH], cys[CW*CH], oxs[CW*CH], oys[CW*CH];
+            static int cinit = 0, cw2 = 0, ch2 = 0;
+            static cv::Mat prev;
+            if (!cinit || cw2 != img.cols || ch2 != img.rows) {
+                for (int gy3 = 0; gy3 < CH; gy3++)
+                    for (int gx3 = 0; gx3 < CW; gx3++) {
+                        int i2 = gy3*CW+gx3;
+                        cxs[i2] = (gx3+0.5f)*img.cols/CW;
+                        cys[i2] = (gy3+0.5f)*img.rows/(CH+2);
+                        oxs[i2] = cxs[i2]; oys[i2] = cys[i2];
+                    }
+                cinit = 1; cw2 = img.cols; ch2 = img.rows;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            float rest_x = (float)img.cols/CW, rest_y = (float)img.rows/(CH+2);
+            /* Verlet integrate + body push */
+            for (int i2 = 0; i2 < CW*CH; i2++) {
+                if (i2 < CW) continue;                   /* top row pinned */
+                float vx3 = (cxs[i2]-oxs[i2])*0.97f, vy3 = (cys[i2]-oys[i2])*0.97f;
+                oxs[i2] = cxs[i2]; oys[i2] = cys[i2];
+                int xi = std::max(0,std::min(img.cols-1,(int)cxs[i2]));
+                int yi = std::max(0,std::min(img.rows-1,(int)cys[i2]));
+                float d = g_seg.mask.at<float>(yi,xi) - prev.at<float>(yi,xi);
+                float m = g_seg.mask.at<float>(yi,xi);
+                if (std::fabs(d) > 0.2f || m > 0.6f) {
+                    int x1=std::min(img.cols-1,xi+4), x0=std::max(0,xi-4);
+                    int y1=std::min(img.rows-1,yi+4), y0=std::max(0,yi-4);
+                    float gx2 = g_seg.mask.at<float>(yi,x1)-g_seg.mask.at<float>(yi,x0);
+                    float gy2 = g_seg.mask.at<float>(y1,xi)-g_seg.mask.at<float>(y0,xi);
+                    float l2 = std::sqrt(gx2*gx2+gy2*gy2)+1e-3f;
+                    float push = (std::fabs(d)>0.2f ? 5.0f*fx : 2.0f);
+                    vx3 -= gx2/l2 * push;
+                    vy3 -= gy2/l2 * push;
+                }
+                cxs[i2] += vx3;
+                cys[i2] += vy3 + 0.35f;                  /* gravity */
+            }
+            /* satisfy spring constraints */
+            for (int it = 0; it < 3; it++)
+                for (int gy3 = 0; gy3 < CH; gy3++)
+                    for (int gx3 = 0; gx3 < CW; gx3++) {
+                        int i2 = gy3*CW+gx3;
+                        if (gx3+1 < CW) {
+                            int j2 = i2+1;
+                            float dx3 = cxs[j2]-cxs[i2], dy3 = cys[j2]-cys[i2];
+                            float dl = std::sqrt(dx3*dx3+dy3*dy3)+1e-4f;
+                            float corr = (dl - rest_x)/dl*0.5f;
+                            float ax = dx3*corr, ay = dy3*corr;
+                            if (i2 >= CW) { cxs[i2]+=ax; cys[i2]+=ay; }
+                            if (j2 >= CW) { cxs[j2]-=ax; cys[j2]-=ay; }
+                        }
+                        if (gy3+1 < CH) {
+                            int j2 = i2+CW;
+                            float dx3 = cxs[j2]-cxs[i2], dy3 = cys[j2]-cys[i2];
+                            float dl = std::sqrt(dx3*dx3+dy3*dy3)+1e-4f;
+                            float corr = (dl - rest_y)/dl*0.5f;
+                            float ax = dx3*corr, ay = dy3*corr;
+                            if (i2 >= CW) { cxs[i2]+=ax; cys[i2]+=ay; }
+                            cxs[j2]-=ax; cys[j2]-=ay;
+                        }
+                    }
+            /* draw the net */
+            for (int gy3 = 0; gy3 < CH; gy3++)
+                for (int gx3 = 0; gx3 < CW; gx3++) {
+                    int i2 = gy3*CW+gx3;
+                    cv::Point p2((int)cxs[i2],(int)cys[i2]);
+                    if (gx3+1 < CW) {
+                        int j2=i2+1;
+                        float st = std::fabs(std::sqrt(
+                            (cxs[j2]-cxs[i2])*(cxs[j2]-cxs[i2])+
+                            (cys[j2]-cys[i2])*(cys[j2]-cys[i2])) - rest_x)/rest_x;
+                        int b2 = std::min(255, 90+(int)(st*420));
+                        cv::line(img, p2, {(int)cxs[j2],(int)cys[j2]},
+                                 cv::Scalar(200-b2/2, 140+b2/3, b2), 1, cv::LINE_AA);
+                    }
+                    if (gy3+1 < CH) {
+                        int j2=i2+CW;
+                        cv::line(img, p2, {(int)cxs[j2],(int)cys[j2]},
+                                 cv::Scalar(190, 150, 110), 1, cv::LINE_AA);
+                    }
+                    cv::circle(img, p2, 2, cv::Scalar(230,220,190),
+                               cv::FILLED, cv::LINE_AA);
+                }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 117) {
+            /* SWARM: a flock of glowing insects with real boid rules —
+             * they cohere, align, avoid each other, and FLEE your hands.
+             * Sweep at them and the swarm scatters and re-forms.
+             * fx = how scared they are. */
+            const int NB = 190;
+            static float bx3[NB], by3[NB], bvx[NB], bvy[NB];
+            static int binit2 = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!binit2) {
+                for (int i2 = 0; i2 < NB; i2++) {
+                    bx3[i2] = uhash(i2,1,11)*img.cols;
+                    by3[i2] = uhash(i2,2,11)*img.rows;
+                    bvx[i2] = (uhash(i2,3,11)-0.5f)*2;
+                    bvy[i2] = (uhash(i2,4,11)-0.5f)*2;
+                }
+                binit2 = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            /* flock centre + mean heading (global approximation: cheap) */
+            float mx2=0,my2=0,mvx=0,mvy=0;
+            for (int i2 = 0; i2 < NB; i2++) {
+                mx2+=bx3[i2]; my2+=by3[i2]; mvx+=bvx[i2]; mvy+=bvy[i2];
+            }
+            mx2/=NB; my2/=NB; mvx/=NB; mvy/=NB;
+            for (int i2 = 0; i2 < NB; i2++) {
+                /* cohesion + alignment */
+                bvx[i2] += (mx2-bx3[i2])*0.0009f + (mvx-bvx[i2])*0.03f;
+                bvy[i2] += (my2-by3[i2])*0.0009f + (mvy-bvy[i2])*0.03f;
+                /* separation from a few neighbours */
+                for (int k2 = 1; k2 <= 3; k2++) {
+                    int j2 = (i2+k2*37) % NB;
+                    float dx3 = bx3[i2]-bx3[j2], dy3 = by3[i2]-by3[j2];
+                    float d2 = dx3*dx3+dy3*dy3;
+                    if (d2 < 420 && d2 > 1e-3f) {
+                        bvx[i2] += dx3/d2 * 5.5f;
+                        bvy[i2] += dy3/d2 * 5.5f;
+                    }
+                }
+                /* FLEE you: strongest where your body just moved */
+                int xi = std::max(0,std::min(img.cols-1,(int)bx3[i2]));
+                int yi = std::max(0,std::min(img.rows-1,(int)by3[i2]));
+                float m = g_seg.mask.at<float>(yi,xi);
+                float d = m - prev.at<float>(yi,xi);
+                if (m > 0.25f || std::fabs(d) > 0.15f) {
+                    int x1=std::min(img.cols-1,xi+5), x0=std::max(0,xi-5);
+                    int y1=std::min(img.rows-1,yi+5), y0=std::max(0,yi-5);
+                    float gx2 = g_seg.mask.at<float>(yi,x1)-g_seg.mask.at<float>(yi,x0);
+                    float gy2 = g_seg.mask.at<float>(y1,xi)-g_seg.mask.at<float>(y0,xi);
+                    float l2 = std::sqrt(gx2*gx2+gy2*gy2)+1e-3f;
+                    float scare = (2.2f + std::fabs(d)*16.0f) * fx;
+                    bvx[i2] -= gx2/l2 * scare;
+                    bvy[i2] -= gy2/l2 * scare;
+                }
+                /* wander + speed limit */
+                bvx[i2] += (uhash(i2,tk%31,13)-0.5f)*0.5f;
+                bvy[i2] += (uhash(i2,tk%29,17)-0.5f)*0.5f;
+                float sp = std::sqrt(bvx[i2]*bvx[i2]+bvy[i2]*bvy[i2]);
+                float mxs = 6.5f;
+                if (sp > mxs) { bvx[i2]*=mxs/sp; bvy[i2]*=mxs/sp; }
+                if (sp < 1.2f && sp > 1e-3f) { bvx[i2]*=1.2f/sp; bvy[i2]*=1.2f/sp; }
+                bx3[i2] += bvx[i2]; by3[i2] += bvy[i2];
+                if (bx3[i2] < 0) { bx3[i2]=0; bvx[i2]=std::fabs(bvx[i2]); }
+                if (bx3[i2] > img.cols-1) { bx3[i2]=img.cols-1; bvx[i2]=-std::fabs(bvx[i2]); }
+                if (by3[i2] < 0) { by3[i2]=0; bvy[i2]=std::fabs(bvy[i2]); }
+                if (by3[i2] > img.rows-1) { by3[i2]=img.rows-1; bvy[i2]=-std::fabs(bvy[i2]); }
+                float tw = 0.6f + 0.4f*std::sin(tk*0.3f + i2);
+                cv::circle(img, {(int)bx3[i2],(int)by3[i2]}, 2,
+                           cv::Scalar(60*tw, 230*tw, 255*tw), cv::FILLED, cv::LINE_AA);
+                cv::line(img, {(int)bx3[i2],(int)by3[i2]},
+                         {(int)(bx3[i2]-bvx[i2]*2.2f),(int)(by3[i2]-bvy[i2]*2.2f)},
+                         cv::Scalar(30*tw,150*tw,190*tw), 1, cv::LINE_AA);
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 118) {
+            /* SAND FALL: grains rain down and PILE UP on your head and
+             * shoulders — they stack where you're solid, tumble off your
+             * slopes, and get swept away when you move. Shake them off.
+             * fx = grain count. */
+            const int NG = 1400;
+            static float gx4[NG], gy4[NG], gvy[NG], gvx[NG];
+            static int ginit = 0, settled[NG];
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!ginit) {
+                for (int i2 = 0; i2 < NG; i2++) {
+                    gx4[i2] = uhash(i2,1,19)*img.cols;
+                    gy4[i2] = -uhash(i2,2,19)*img.rows*2;
+                    gvy[i2] = 1.2f + uhash(i2,3,19)*1.6f;
+                    gvx[i2] = 0; settled[i2] = 0;
+                }
+                ginit = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            int active = (int)(NG * std::min(1.0f, fx/2.0f + 0.25f));
+            for (int i2 = 0; i2 < active; i2++) {
+                int xi = std::max(0,std::min(img.cols-1,(int)gx4[i2]));
+                int yi = std::max(0,std::min(img.rows-1,(int)gy4[i2]));
+                if (settled[i2]) {
+                    /* swept off by your motion? */
+                    float d = g_seg.mask.at<float>(yi,xi) - prev.at<float>(yi,xi);
+                    if (std::fabs(d) > 0.18f) {
+                        settled[i2] = 0;
+                        gvx[i2] = (uhash(i2,tk%23,7)-0.5f)*7.0f;
+                        gvy[i2] = -1.5f;
+                    }
+                } else {
+                    gvy[i2] += 0.16f;
+                    gvx[i2] *= 0.96f;
+                    gx4[i2] += gvx[i2];
+                    gy4[i2] += gvy[i2];
+                    xi = std::max(0,std::min(img.cols-1,(int)gx4[i2]));
+                    yi = std::max(0,std::min(img.rows-1,(int)gy4[i2]));
+                    /* landed on you? */
+                    if (gy4[i2] > 0 && g_seg.mask.at<float>(yi,xi) > 0.55f) {
+                        /* tumble down the slope instead of sticking to walls */
+                        int x1=std::min(img.cols-1,xi+3), x0=std::max(0,xi-3);
+                        float gxs = g_seg.mask.at<float>(yi,x1)
+                                  - g_seg.mask.at<float>(yi,x0);
+                        if (std::fabs(gxs) > 0.30f) {      /* steep: slide */
+                            gx4[i2] -= gxs * 5.0f;
+                            gy4[i2] -= 1.0f;
+                            gvy[i2] *= 0.5f;
+                        } else {
+                            settled[i2] = 1;
+                            gy4[i2] -= 1.0f;
+                            gvy[i2] = 0; gvx[i2] = 0;
+                        }
+                    }
+                    if (gy4[i2] > img.rows + 6) {          /* recycle */
+                        gx4[i2] = uhash(i2,tk%97,23)*img.cols;
+                        gy4[i2] = -6 - uhash(i2,tk%89,29)*60;
+                        gvy[i2] = 1.2f + uhash(i2,3,19)*1.6f;
+                        gvx[i2] = 0;
+                    }
+                }
+                float b2 = settled[i2] ? 1.0f : 0.85f;
+                cv::circle(img, {(int)gx4[i2],(int)gy4[i2]}, settled[i2]?2:1,
+                           cv::Scalar(120*b2, 200*b2, 235*b2), cv::FILLED);
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 109) {
+            /* BUBBLE POP: bubbles rise from below — touch one and it
+             * pops in a burst. Combo counter rewards fast chains.
+             * fx = bubble rate. */
+            static float bx[26], by2[26], bs[26], bvy[26];
+            static int binit = 0, popped = 0, combo = 0, combo_t = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!binit) {
+                for (int i = 0; i < 26; i++) {
+                    bx[i] = uhash(i,1,3)*img.cols;
+                    by2[i] = img.rows + uhash(i,2,3)*img.rows*1.5f;
+                    bs[i] = 12 + uhash(i,3,3)*22;
+                    bvy[i] = -(0.9f + uhash(i,4,3)*1.6f);
+                }
+                binit = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            for (int i = 0; i < 26; i++) {
+                by2[i] += bvy[i] * fx;
+                bx[i] += std::sin((by2[i]+i*40)*0.02f) * 0.9f;
+                if (by2[i] < -bs[i]) {                    /* respawn below */
+                    bx[i] = uhash(i, tk%97, 5)*img.cols;
+                    by2[i] = img.rows + bs[i] + uhash(i,tk%53,6)*120;
+                }
+                if (bx[i] < 0 || bx[i] >= img.cols) continue;
+                if (by2[i] < 0 || by2[i] >= img.rows) continue;
+                float m = g_seg.mask.at<float>((int)by2[i], (int)bx[i]);
+                if (m > 0.5f) {                            /* POP */
+                    for (int k2 = 0; k2 < 10; k2++) {      /* burst */
+                        float a2 = 6.2832f*k2/10;
+                        cv::line(img, {(int)bx[i],(int)by2[i]},
+                            {(int)(bx[i]+std::cos(a2)*bs[i]*1.7f),
+                             (int)(by2[i]+std::sin(a2)*bs[i]*1.7f)},
+                            cv::Scalar(255,240,180), 2, cv::LINE_AA);
+                    }
+                    popped++;
+                    combo = (combo_t > 0) ? combo+1 : 1;
+                    combo_t = 40;
+                    bx[i] = uhash(i, tk%89, 7)*img.cols;
+                    by2[i] = img.rows + bs[i] + 40;
+                    continue;
+                }
+                /* draw bubble: rim + highlight, see-through */
+                cv::circle(img, {(int)bx[i],(int)by2[i]}, (int)bs[i],
+                           cv::Scalar(255,225,170), 2, cv::LINE_AA);
+                cv::circle(img, {(int)(bx[i]-bs[i]*0.3f),(int)(by2[i]-bs[i]*0.3f)},
+                           std::max(2,(int)(bs[i]*0.22f)),
+                           cv::Scalar(255,255,240), cv::FILLED, cv::LINE_AA);
+            }
+            if (combo_t > 0) combo_t--; else combo = 0;
+            g_seg.mask.copyTo(prev);
+            char hud[48];
+            snprintf(hud, sizeof hud, "POPPED %d", popped);
+            cv::putText(img, hud, {20,46}, cv::FONT_HERSHEY_DUPLEX, 1.0,
+                        cv::Scalar(20,20,20), 4, cv::LINE_AA);
+            cv::putText(img, hud, {20,46}, cv::FONT_HERSHEY_DUPLEX, 1.0,
+                        cv::Scalar(255,230,170), 2, cv::LINE_AA);
+            if (combo > 2) {
+                snprintf(hud, sizeof hud, "x%d COMBO", combo);
+                cv::putText(img, hud, {20,80}, cv::FONT_HERSHEY_DUPLEX, 0.8,
+                            cv::Scalar(60,220,255), 2, cv::LINE_AA);
+            }
+            return;
+        }
+        if (mode == 110) {
+            /* PUNCHING BAG: a heavy bag hangs from the ceiling. Punch it
+             * — your sweep direction and speed become angular impulse;
+             * it swings, damps, and a POWER meter reads your best hit.
+             * fx = bag weight (low = light, swings wildly). */
+            static float ang = 0, av = 0;
+            static float power = 0, bestp = 0;
+            static int flash = 0;
+            static cv::Mat prev;
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            float L = img.rows * 0.42f;                  /* rope length */
+            float px2 = img.cols*0.5f + std::sin(ang)*L;
+            float py2 = 10 + std::cos(ang)*L;
+            float R2 = std::max(26.0f, img.cols*0.075f);
+            BodyProbe b = probe_body(g_seg.mask, prev, px2, py2, R2);
+            if (b.hit) {
+                float pw2 = std::sqrt(b.pux*b.pux + b.puy*b.puy);
+                /* tangential component of your push drives the swing */
+                float tx = std::cos(ang), ty = -std::sin(ang);
+                float torque = (b.pux*tx + b.puy*ty) * 0.0016f / fx;
+                if (std::fabs(torque) < 1e-4f)            /* dead-on shove */
+                    torque = (b.nx*tx + b.ny*ty) * 0.004f / fx;
+                av += torque;
+                if (pw2 > power*0.9f) { power = pw2; flash = 10; }
+                if (power > bestp) bestp = power;
+            }
+            av -= std::sin(ang) * 0.0016f;               /* gravity */
+            av *= 0.985f;                                /* damping */
+            if (av > 0.08f) av = 0.08f;
+            if (av < -0.08f) av = -0.08f;
+            ang += av;
+            power *= 0.97f;
+            if (flash > 0) flash--;
+            /* draw: chain, bag body, straps */
+            cv::line(img, {img.cols/2, 4}, {(int)px2,(int)py2},
+                     cv::Scalar(150,150,155), 3, cv::LINE_AA);
+            cv::ellipse(img, {(int)px2,(int)(py2+R2*0.55f)},
+                        {(int)(R2*0.92f),(int)(R2*1.55f)},
+                        ang*57.3f, 0, 360,
+                        flash>0 ? cv::Scalar(60,90,220) : cv::Scalar(35,45,120),
+                        cv::FILLED, cv::LINE_AA);
+            cv::ellipse(img, {(int)px2,(int)(py2+R2*0.55f)},
+                        {(int)(R2*0.92f),(int)(R2*1.55f)},
+                        ang*57.3f, 0, 360, cv::Scalar(20,25,60), 3, cv::LINE_AA);
+            cv::ellipse(img, {(int)(px2-R2*0.3f),(int)(py2+R2*0.2f)},
+                        {(int)(R2*0.22f),(int)(R2*0.8f)}, ang*57.3f, 0, 360,
+                        cv::Scalar(120,140,220), cv::FILLED, cv::LINE_AA);
+            /* power meter */
+            int bw = (int)(std::min(1.0f, power/11.0f) * (img.cols*0.3f));
+            cv::rectangle(img, {20, img.rows-40},
+                          {20+(int)(img.cols*0.3f), img.rows-22},
+                          cv::Scalar(60,60,65), 2);
+            cv::rectangle(img, {20, img.rows-40}, {20+bw, img.rows-22},
+                          cv::Scalar(60,180,255), cv::FILLED);
+            char hud[48];
+            snprintf(hud, sizeof hud, "POWER  best %.0f", bestp*9);
+            cv::putText(img, hud, {20, img.rows-48}, cv::FONT_HERSHEY_PLAIN,
+                        1.2, cv::Scalar(220,220,230), 1, cv::LINE_AA);
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 111) {
+            /* GOALKEEPER: shots fly at you out of the background, growing
+             * as they come. Block them with ANY part of your body — a
+             * save flashes green, a goal flashes red. fx = shot rate. */
+            static float sx3[6], sy3[6], sz[6], svx[6], svy[6];
+            static int alive[6], sinit = 0, saves = 0, goals = 0, flash = 0;
+            unsigned tk = g_seg.counter;
+            if (!sinit) { for (int i=0;i<6;i++) alive[i]=0; sinit=1; }
+            /* spawn */
+            if ((tk % (unsigned)std::max(14.0f, 46.0f/fx)) == 0) {
+                for (int i = 0; i < 6; i++)
+                    if (!alive[i]) {
+                        sx3[i] = img.cols*(0.15f+0.7f*uhash(i,tk%71,2));
+                        sy3[i] = img.rows*(0.15f+0.5f*uhash(i,tk%67,3));
+                        sz[i] = 0.06f;
+                        svx[i] = (uhash(i,tk%59,4)-0.5f)*1.2f;
+                        svy[i] = (uhash(i,tk%61,5)-0.5f)*0.9f;
+                        alive[i] = 1;
+                        break;
+                    }
+            }
+            for (int i = 0; i < 6; i++) {
+                if (!alive[i]) continue;
+                sz[i] *= 1.055f;                    /* coming at you */
+                sx3[i] += svx[i]; sy3[i] += svy[i];
+                float R2 = 8 + sz[i]*110;
+                if (sx3[i] < 0 || sx3[i] >= img.cols ||
+                    sy3[i] < 0 || sy3[i] >= img.rows) { alive[i]=0; continue; }
+                float m = g_seg.mask.at<float>((int)sy3[i], (int)sx3[i]);
+                if (m > 0.5f && sz[i] > 0.20f) {    /* SAVED */
+                    saves++; alive[i] = 0; flash = 12;
+                    for (int k2=0;k2<12;k2++) {
+                        float a2=6.2832f*k2/12;
+                        cv::line(img, {(int)sx3[i],(int)sy3[i]},
+                          {(int)(sx3[i]+std::cos(a2)*R2*1.8f),
+                           (int)(sy3[i]+std::sin(a2)*R2*1.8f)},
+                          cv::Scalar(120,255,120), 2, cv::LINE_AA);
+                    }
+                    continue;
+                }
+                if (sz[i] > 1.15f) { goals++; alive[i]=0; flash = -12; continue; }
+                /* draw the shot: dark core, motion ring */
+                cv::circle(img, {(int)sx3[i],(int)sy3[i]}, (int)(R2*1.35f),
+                           cv::Scalar(40,40,50), 2, cv::LINE_AA);
+                cv::circle(img, {(int)sx3[i],(int)sy3[i]}, (int)R2,
+                           cv::Scalar(70,90,240), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)(sx3[i]-R2*0.3f),(int)(sy3[i]-R2*0.3f)},
+                           std::max(2,(int)(R2*0.25f)),
+                           cv::Scalar(200,220,255), cv::FILLED, cv::LINE_AA);
+            }
+            if (flash > 0) { flash--;
+                cv::rectangle(img, {0,0}, {img.cols-1,img.rows-1},
+                              cv::Scalar(80,220,80), 8);
+            } else if (flash < 0) { flash++;
+                cv::rectangle(img, {0,0}, {img.cols-1,img.rows-1},
+                              cv::Scalar(70,70,235), 8);
+            }
+            char hud[48];
+            snprintf(hud, sizeof hud, "SAVES %d   GOALS %d", saves, goals);
+            cv::putText(img, hud, {20,46}, cv::FONT_HERSHEY_DUPLEX, 0.95,
+                        cv::Scalar(20,20,20), 4, cv::LINE_AA);
+            cv::putText(img, hud, {20,46}, cv::FONT_HERSHEY_DUPLEX, 0.95,
+                        cv::Scalar(240,240,245), 2, cv::LINE_AA);
+            return;
+        }
+        if (mode == 112) {
+            /* MOTION PAINT: your movement sprays paint onto the room —
+             * hue follows the direction you swipe, thickness follows
+             * speed. The canvas persists and slowly dries.
+             * fx = paint fade (low = permanent). */
+            static cv::Mat canvas, prev;
+            if (canvas.empty() || canvas.size() != img.size())
+                canvas = cv::Mat::zeros(img.size(), CV_8UC3);
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            /* paint where the matte moved */
+            for (int y = 2; y < img.rows-2; y += 2)
+                for (int x = 2; x < img.cols-2; x += 2) {
+                    float d = g_seg.mask.at<float>(y,x) - prev.at<float>(y,x);
+                    if (d < 0.25f) continue;              /* newly covered */
+                    float gx2 = g_seg.mask.at<float>(y,x+2)
+                              - g_seg.mask.at<float>(y,x-2);
+                    float gy2 = g_seg.mask.at<float>(y+2,x)
+                              - g_seg.mask.at<float>(y-2,x);
+                    float hue = std::atan2(gy2, gx2) * 2.0f;
+                    cv::Scalar col((std::sin(hue+4.19f)*.5f+.5f)*255,
+                                   (std::sin(hue+2.09f)*.5f+.5f)*255,
+                                   (std::sin(hue)*.5f+.5f)*255);
+                    cv::circle(canvas, {x,y}, (int)(2 + d*5), col,
+                               cv::FILLED, cv::LINE_AA);
+                }
+            canvas *= (1.0 - 0.006 * fx);                 /* drying */
+            /* composite paint over the room, but never over you */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *cp = canvas.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    int pl = cp[x][0]+cp[x][1]+cp[x][2];
+                    if (pl < 24) continue;
+                    float a = (1.0f - mm[x]) * std::min(1.0f, pl/300.0f);
+                    ip[x][0]=(uchar)(ip[x][0]+(cp[x][0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(cp[x][1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(cp[x][2]-ip[x][2])*a);
+                }
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 113) {
+            /* FORCE FIELD: a grid of glowing particles floats in the
+             * room. Sweep your hands and you SHOVE them — they scatter,
+             * drift, and slowly spring back home. Stir the air.
+             * fx = field strength. */
+            static float pxs[300], pys[300], pvx[300], pvy[300];
+            static float hx[300], hy[300];
+            static int pinit = 0, pw2 = 0, ph2 = 0;
+            static cv::Mat prev;
+            if (!pinit || pw2 != img.cols || ph2 != img.rows) {
+                int i = 0;
+                for (int gy3 = 0; gy3 < 15 && i < 300; gy3++)
+                    for (int gx3 = 0; gx3 < 20 && i < 300; gx3++, i++) {
+                        hx[i] = (gx3+0.5f) * img.cols / 20.0f;
+                        hy[i] = (gy3+0.5f) * img.rows / 15.0f;
+                        pxs[i] = hx[i]; pys[i] = hy[i];
+                        pvx[i] = pvy[i] = 0;
+                    }
+                pinit = 1; pw2 = img.cols; ph2 = img.rows;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            for (int i = 0; i < 300; i++) {
+                int xi = std::max(0, std::min(img.cols-1, (int)pxs[i]));
+                int yi = std::max(0, std::min(img.rows-1, (int)pys[i]));
+                float d = g_seg.mask.at<float>(yi,xi) - prev.at<float>(yi,xi);
+                if (std::fabs(d) > 0.2f) {          /* your body moved here */
+                    float gx2 = g_seg.mask.at<float>(yi, std::min(img.cols-1,xi+3))
+                              - g_seg.mask.at<float>(yi, std::max(0,xi-3));
+                    float gy2 = g_seg.mask.at<float>(std::min(img.rows-1,yi+3), xi)
+                              - g_seg.mask.at<float>(std::max(0,yi-3), xi);
+                    float l2 = std::sqrt(gx2*gx2+gy2*gy2) + 1e-3f;
+                    pvx[i] -= gx2/l2 * 5.5f * fx * (d > 0 ? 1.0f : 0.4f);
+                    pvy[i] -= gy2/l2 * 5.5f * fx * (d > 0 ? 1.0f : 0.4f);
+                }
+                if (g_seg.mask.at<float>(yi,xi) > 0.6f) {   /* pushed out */
+                    float gx2 = g_seg.mask.at<float>(yi, std::min(img.cols-1,xi+3))
+                              - g_seg.mask.at<float>(yi, std::max(0,xi-3));
+                    float gy2 = g_seg.mask.at<float>(std::min(img.rows-1,yi+3), xi)
+                              - g_seg.mask.at<float>(std::max(0,yi-3), xi);
+                    pvx[i] -= gx2 * 3.0f; pvy[i] -= gy2 * 3.0f;
+                }
+                pvx[i] += (hx[i]-pxs[i]) * 0.012f;   /* spring home */
+                pvy[i] += (hy[i]-pys[i]) * 0.012f;
+                pvx[i] *= 0.93f; pvy[i] *= 0.93f;
+                pxs[i] += pvx[i]; pys[i] += pvy[i];
+                if (pxs[i] < 0) pxs[i] = 0;
+                if (pys[i] < 0) pys[i] = 0;
+                if (pxs[i] > img.cols-1) pxs[i] = img.cols-1;
+                if (pys[i] > img.rows-1) pys[i] = img.rows-1;
+                float sp = std::sqrt(pvx[i]*pvx[i]+pvy[i]*pvy[i]);
+                int br = std::min(255, 70 + (int)(sp*38));
+                cv::circle(img, {(int)pxs[i],(int)pys[i]},
+                           sp > 1.6f ? 3 : 2,
+                           cv::Scalar(br, (int)(br*0.75f), 60),
+                           cv::FILLED, cv::LINE_AA);
+                if (sp > 2.2f)                        /* motion streak */
+                    cv::line(img, {(int)pxs[i],(int)pys[i]},
+                             {(int)(pxs[i]-pvx[i]*1.8f),(int)(pys[i]-pvy[i]*1.8f)},
+                             cv::Scalar(br,(int)(br*0.6f),40), 1, cv::LINE_AA);
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 108) {
+            /* KEEPY-UPPY: ONE ball, real physics, and a score. Head it,
+             * hand it, knee it — every touch counts, dropping it resets
+             * the streak. The matte is the collider; its gradient gives
+             * the surface normal, and your body's MOTION adds impulse,
+             * so a fast hand smacks the ball harder than a slow one.
+             * fx = gravity (0.2 floaty ... 3 brutal). */
+            static float px = -1, py = 0, vx = 0, vy = 0;
+            static int score = 0, best = 0, cooldown = 0, dropped = 0;
+            static cv::Mat prev_mask;
+            unsigned tk = g_seg.counter;
+            float R = std::max(14.0f, img.cols * 0.045f);
+            float G = 0.42f * fx;
+
+            if (px < 0) {                       /* serve */
+                px = img.cols * 0.5f;
+                py = R + 4;
+                vx = (uhash(tk,1,3) - 0.5f) * 3.0f;
+                vy = 0;
+            }
+            /* motion field: how fast is your body moving here? */
+            cv::Mat cur;
+            g_seg.mask.copyTo(cur);
+            if (prev_mask.empty() || prev_mask.size() != cur.size())
+                cur.copyTo(prev_mask);
+
+            vy += G;
+            px += vx;
+            py += vy;
+
+            /* walls + ceiling bounce, floor = drop */
+            if (px < R)            { px = R;            vx = std::fabs(vx)*0.86f; }
+            if (px > img.cols - R) { px = img.cols - R; vx = -std::fabs(vx)*0.86f; }
+            if (py < R)            { py = R;            vy = std::fabs(vy)*0.7f; }
+            if (py > img.rows + R*2) {          /* dropped it */
+                if (score > best) best = score;
+                score = 0;
+                dropped = 25;
+                px = -1;                        /* re-serve next frame */
+            }
+
+            if (px > 0 && cooldown == 0) {
+                /* ---- contact + normal from a RING around the ball ----
+                 * Sampling the mask at the ball's centre is useless: on
+                 * contact the centre is often INSIDE the body, where the
+                 * gradient vanishes. Instead sample the circle around
+                 * the ball; the weighted direction of the solid samples
+                 * points INTO your body, so its negation is the surface
+                 * normal — and it angles correctly off a shoulder, a
+                 * forearm, the side of your head. */
+                const int NS = 16;
+                float sumx = 0, sumy = 0, hit = 0;
+                for (int i2 = 0; i2 < NS; i2++) {
+                    float a2 = 6.2832f * i2 / NS;
+                    float dx2 = std::cos(a2), dy2 = std::sin(a2);
+                    int sx2 = (int)(px + dx2 * R * 0.95f);
+                    int sy2 = (int)(py + dy2 * R * 0.95f);
+                    if (sx2 < 0 || sy2 < 0 || sx2 >= img.cols || sy2 >= img.rows)
+                        continue;
+                    float m2 = g_seg.mask.at<float>(sy2, sx2);
+                    if (m2 > 0.5f) {
+                        sumx += dx2 * m2;
+                        sumy += dy2 * m2;
+                        hit = std::max(hit, m2);
+                    }
+                }
+                if (hit > 0.5f) {
+                    float len = std::sqrt(sumx*sumx + sumy*sumy);
+                    float nx2, ny2;
+                    if (len > 1e-3f) {           /* away from the body mass */
+                        nx2 = -sumx/len; ny2 = -sumy/len;
+                    } else {                     /* fully engulfed: eject up */
+                        nx2 = 0; ny2 = -1;
+                    }
+                    /* ---- YOUR push direction, from where the matte
+                     * APPEARED vs where it VANISHED around the ball.
+                     * A hand sweeping right reveals mask on its leading
+                     * side and clears it behind: the vector between the
+                     * two centroids is the push. Immune to the aperture
+                     * problem that defeats a local gradient solve on a
+                     * straight edge. */
+                    float pcx=0, pcy=0, pw=0, ncx=0, ncy=0, nw=0;
+                    int W = (int)(R * 3.2f);
+                    for (int yy = -W; yy <= W; yy += 2)
+                        for (int xx = -W; xx <= W; xx += 2) {
+                            int sx2 = (int)px + xx, sy2 = (int)py + yy;
+                            if (sx2 < 0 || sy2 < 0 ||
+                                sx2 >= img.cols || sy2 >= img.rows) continue;
+                            float d = g_seg.mask.at<float>(sy2, sx2)
+                                    - prev_mask.at<float>(sy2, sx2);
+                            if (d > 0.20f)      { pcx += sx2*d; pcy += sy2*d; pw += d; }
+                            else if (d < -0.20f){ ncx -= sx2*d; ncy -= sy2*d; nw -= d; }
+                        }
+                    float bu = 0, bv = 0;
+                    if (pw > 1.0f && nw > 1.0f) {       /* body moved here */
+                        float dx3 = pcx/pw - ncx/nw;    /* vanished -> appeared */
+                        float dy3 = pcy/pw - ncy/nw;
+                        float dl2 = std::sqrt(dx3*dx3 + dy3*dy3);
+                        if (dl2 > 1e-3f) {
+                            /* direction from the centroids, strength from
+                             * how much matte moved (a fast hand shifts a
+                             * lot of mask) */
+                            float punch = std::min(11.0f,
+                                (pw + nw) / std::max(1.0f, R*R*0.10f) * 2.4f);
+                            bu = dx3/dl2 * punch;
+                            bv = dy3/dl2 * punch;
+                        }
+                    }
+                    /* ---- bounce: reflect about the ring normal, keep
+                     * the tangential component (that's what lets you
+                     * glance it sideways), then add your body's own
+                     * motion as impulse. */
+                    float dot = vx*nx2 + vy*ny2;
+                    if (dot < 0) {                   /* moving into you */
+                        float rvx = vx - 2*dot*nx2;  /* mirrored velocity */
+                        float rvy = vy - 2*dot*ny2;
+                        float tvx = rvx - (rvx*nx2 + rvy*ny2)*nx2;  /* tangent */
+                        float tvy = rvy - (rvx*nx2 + rvy*ny2)*ny2;
+                        float nvn = (rvx*nx2 + rvy*ny2) * 0.92f;    /* normal  */
+                        vx = tvx*0.94f + nx2*nvn;
+                        vy = tvy*0.94f + ny2*nvn;
+                    }
+                    /* pop off the surface + transfer your motion */
+                    vx += nx2 * 2.6f + bu * 1.15f;
+                    vy += ny2 * 2.6f + bv * 1.15f;
+                    /* a slow/still body still gives a gentle lift so
+                     * the ball doesn't die on your head */
+                    if (vy > -1.2f && ny2 < -0.2f) vy = -1.2f;
+                    /* a contact must never spike the ball hard downward —
+                     * that just ends the rally with no chance to react */
+                    if (vy > 5.0f) vy = 5.0f;
+                    float sp = std::sqrt(vx*vx + vy*vy);
+                    if (sp > 28.0f) { vx *= 28.0f/sp; vy *= 28.0f/sp; }
+                    px += nx2 * (R*0.35f);           /* unstick */
+                    py += ny2 * (R*0.35f);
+                    score++;
+                    cooldown = 5;                    /* no double-count */
+                }
+            }
+            if (cooldown > 0) cooldown--;
+            if (dropped > 0) dropped--;
+            cur.copyTo(prev_mask);
+
+            /* ---- draw: shadow, ball with shading, HUD ---- */
+            if (px > 0) {
+                int gy3 = img.rows - 8;
+                float shrink = std::max(0.25f, 1.0f - (gy3-py)/(float)img.rows);
+                cv::ellipse(img, cv::Point((int)px, gy3),
+                            cv::Size((int)(R*shrink), (int)(R*0.28f*shrink)),
+                            0, 0, 360, cv::Scalar(30,30,30), cv::FILLED,
+                            cv::LINE_AA);
+                cv::circle(img, cv::Point((int)px,(int)py), (int)R+3,
+                           cv::Scalar(20,25,30), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, cv::Point((int)px,(int)py), (int)R,
+                           cooldown > 3 ? cv::Scalar(90,240,255)
+                                        : cv::Scalar(70,180,255),
+                           cv::FILLED, cv::LINE_AA);
+                cv::circle(img, cv::Point((int)(px-R*0.3f),(int)(py-R*0.32f)),
+                           (int)(R*0.32f), cv::Scalar(230,250,255),
+                           cv::FILLED, cv::LINE_AA);
+                cv::circle(img, cv::Point((int)px,(int)py), (int)R,
+                           cv::Scalar(255,255,255), 2, cv::LINE_AA);
+            }
+            char hud[64];
+            snprintf(hud, sizeof hud, "%d", score);
+            cv::putText(img, hud, {22, 54}, cv::FONT_HERSHEY_DUPLEX, 1.7,
+                        cv::Scalar(20,20,20), 5, cv::LINE_AA);
+            cv::putText(img, hud, {22, 54}, cv::FONT_HERSHEY_DUPLEX, 1.7,
+                        score > 0 ? cv::Scalar(90,240,255)
+                                  : cv::Scalar(200,200,200), 2, cv::LINE_AA);
+            snprintf(hud, sizeof hud, "BEST %d", best);
+            cv::putText(img, hud, {22, 82}, cv::FONT_HERSHEY_PLAIN, 1.2,
+                        cv::Scalar(180,180,190), 1, cv::LINE_AA);
+            if (dropped > 0)
+                cv::putText(img, "DROPPED!", {img.cols/2 - 90, img.rows/2},
+                            cv::FONT_HERSHEY_DUPLEX, 1.4,
+                            cv::Scalar(80,80,255), 2, cv::LINE_AA);
+            return;
+        }
+        if (mode == 98) {
+            /* SEARCHLIGHT: a prison-yard searchlight wanders the dark
+             * room, finds you, and locks on. fx = beam size. */
+            unsigned tk = g_seg.counter;
+            static float sx3 = -1, sy3 = -1;
+            int cx2 = 0, cy2 = 0, n2 = 0;
+            for (int y = 0; y < img.rows; y += 8) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 8)
+                    if (mm[x] > 0.5f) { cx2 += x; cy2 += y; n2++; }
+            }
+            float tx2, ty2;
+            if (n2 > 8) {                       /* found you: ease toward */
+                tx2 = (float)cx2/n2; ty2 = (float)cy2/n2 - img.rows*0.08f;
+            } else {                            /* wander */
+                tx2 = img.cols*(0.5f+0.4f*std::sin(tk*0.021f));
+                ty2 = img.rows*(0.45f+0.3f*std::sin(tk*0.013f+2));
+            }
+            if (sx3 < 0) { sx3 = tx2; sy3 = ty2; }
+            sx3 += (tx2-sx3)*0.06f; sy3 += (ty2-sy3)*0.06f;
+            float R = std::min(img.cols,img.rows)*0.30f*fx;
+            for (int y = 0; y < img.rows; y++) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float d = std::sqrt((x-sx3)*(x-sx3)+(y-sy3)*(y-sy3)*1.4f);
+                    float k = d < R ? 1.0f : std::max(0.10f, 1.0f-(d-R)/(R*0.5f));
+                    if (k > 1) k = 1;
+                    float lift = d < R ? 1.12f : 1.0f;
+                    ip[x][0]=clamp_int_u8((int)(ip[x][0]*k*lift));
+                    ip[x][1]=clamp_int_u8((int)(ip[x][1]*k*lift));
+                    ip[x][2]=clamp_int_u8((int)(ip[x][2]*k*lift*1.02f));
+                }
+            }
+            return;
+        }
+        if (mode == 99) {
+            /* PIXEL SORT: glitch-art — bright runs inside your body get
+             * sorted along each row. fx = sort threshold. */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                int x = 0;
+                while (x < img.cols) {
+                    if (mm[x] < 0.5f) { x++; continue; }
+                    int x0 = x;
+                    while (x < img.cols && mm[x] >= 0.5f) x++;
+                    int len = x - x0;
+                    if (len < 8) continue;
+                    /* insertion sort by luma (runs are short) */
+                    for (int i2 = x0+1; i2 < x; i2++) {
+                        cv::Vec3b v = ip[i2];
+                        int lv = v[0]+2*v[1]+v[2];
+                        int j2 = i2-1;
+                        while (j2 >= x0 &&
+                               (ip[j2][0]+2*ip[j2][1]+ip[j2][2]) > lv) {
+                            ip[j2+1] = ip[j2]; j2--;
+                        }
+                        ip[j2+1] = v;
+                    }
+                    (void)fx;
+                }
+            }
+            return;
+        }
+        if (mode == 100) {
+            /* LASER GRID: red security lasers cross the room — where
+             * they hit your body they glow hot and break. fx = density. */
+            unsigned tk = g_seg.counter;
+            int gap = std::max(28, (int)(60/fx));
+            int drift = (int)(tk*0.4f) % gap;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                bool row = ((y+drift) % gap) < 2;
+                for (int x = 0; x < img.cols; x++) {
+                    bool col = ((x+drift) % gap) < 2;
+                    if (!row && !col) continue;
+                    float a = mm[x];
+                    if (a > 0.5f) {             /* beam hits you: hot spot */
+                        ip[x][2]=255; ip[x][1]=clamp_int_u8(ip[x][1]+150);
+                        ip[x][0]=clamp_int_u8(ip[x][0]+90);
+                    } else {                    /* free beam */
+                        ip[x][2]=clamp_int_u8(ip[x][2]+170);
+                        ip[x][1]=(uchar)(ip[x][1]*0.5f);
+                        ip[x][0]=(uchar)(ip[x][0]*0.5f);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 101) {
+            /* OIL SLICK: iridescent film over you — hue follows your
+             * surface gradient like light on spilled petrol. fx = swirl. */
+            unsigned tk = g_seg.counter;
+            cv::Mat gray, gx2, gy2;
+            cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+            cv::Sobel(gray, gx2, CV_32F, 1, 0, 5);
+            cv::Sobel(gray, gy2, CV_32F, 0, 1, 5);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const float *ex = gx2.ptr<float>(y);
+                const float *ey = gy2.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float ang = std::atan2(ey[x], ex[x]) * fx + tk*0.03f;
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    float b2 = (std::sin(ang)*.5f+.5f)*200*lum+30;
+                    float g2 = (std::sin(ang+2.09f)*.5f+.5f)*200*lum+30;
+                    float r2 = (std::sin(ang+4.19f)*.5f+.5f)*200*lum+30;
+                    ip[x][0]=(uchar)(ip[x][0]+(b2-ip[x][0])*a*0.85f);
+                    ip[x][1]=(uchar)(ip[x][1]+(g2-ip[x][1])*a*0.85f);
+                    ip[x][2]=(uchar)(ip[x][2]+(r2-ip[x][2])*a*0.85f);
+                }
+            }
+            return;
+        }
+        if (mode == 102) {
+            /* NEON SIGN: lights off — your outline becomes a buzzing
+             * neon tube that flickers like a cheap bar sign. fx = glow. */
+            unsigned tk = g_seg.counter;
+            float buzz = uhash(0,0,tk) < 0.06f ? 0.25f
+                       : 0.85f + 0.15f*uhash(1,0,tk);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    float edge2 = (a > 0.06f && a < 0.94f)
+                        ? 1.0f - std::fabs(a-0.5f)*2.0f : 0.0f;
+                    float k = edge2*edge2 * buzz * fx;
+                    ip[x][0]=clamp_int_u8((int)(ip[x][0]*0.16f + k*255));
+                    ip[x][1]=clamp_int_u8((int)(ip[x][1]*0.14f + k*90));
+                    ip[x][2]=clamp_int_u8((int)(ip[x][2]*0.18f + k*230));
+                }
+            }
+            return;
+        }
+        if (mode == 103) {
+            /* RAIN SHADOW: it rains in your room — everywhere except
+             * on you. You repel weather now. fx = rain amount. */
+            unsigned tk = g_seg.counter;
+            int drops = (int)(220 * fx);
+            for (int d = 0; d < drops; d++) {
+                float n1 = uhash(d, 0, 0), n2 = uhash(d, 1, 0);
+                int x = (int)(n1 * img.cols);
+                int len = 10 + (int)(n2*14);
+                int y = (int)(uhash(d,2,0)*img.rows + tk*(9+n2*7)) % (img.rows-len);
+                if (g_seg.mask.at<float>(std::min(img.rows-1,y+len/2), x) > 0.35f)
+                    continue;                   /* you are dry */
+                for (int k2 = 0; k2 < len; k2++) {
+                    cv::Vec3b *p2 = img.ptr<cv::Vec3b>(y+k2)+x;
+                    p2[0][0]=clamp_int_u8(p2[0][0]+70);
+                    p2[0][1]=clamp_int_u8(p2[0][1]+60);
+                    p2[0][2]=clamp_int_u8(p2[0][2]+50);
+                }
+            }
+            /* gloom outside, normal light on you */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float k = (1.0f-mm[x])*0.25f;
+                    ip[x][0]=(uchar)(ip[x][0]*(1-k*0.6f));
+                    ip[x][1]=(uchar)(ip[x][1]*(1-k));
+                    ip[x][2]=(uchar)(ip[x][2]*(1-k));
+                }
+            }
+            return;
+        }
+        if (mode == 104) {
+            /* MIRROR SHATTER: your body seen through a broken mirror —
+             * jittered facets each reflecting a shifted piece of you.
+             * fx = shard size. */
+            unsigned tk = g_seg.counter; (void)tk;
+            int C = std::max(24, (int)(46*fx));
+            cv::Mat keep = img.clone();
+            for (int y0 = 0; y0 < img.rows; y0 += C)
+                for (int x0 = 0; x0 < img.cols; x0 += C) {
+                    int cw = std::min(C, img.cols-x0), ch = std::min(C, img.rows-y0);
+                    if (g_seg.mask.at<float>(y0+ch/2, x0+cw/2) < 0.3f) continue;
+                    int ox = (int)((uhash(x0,y0,7)-0.5f)*C*0.6f);
+                    int oy = (int)((uhash(y0,x0,9)-0.5f)*C*0.6f);
+                    for (int y = 0; y < ch; y++)
+                        for (int x = 0; x < cw; x++) {
+                            int sx2 = std::max(0,std::min(img.cols-1,x0+x+ox));
+                            int sy2 = std::max(0,std::min(img.rows-1,y0+y+oy));
+                            img.at<cv::Vec3b>(y0+y,x0+x)=keep.at<cv::Vec3b>(sy2,sx2);
+                        }
+                    cv::line(img,{x0,y0},{x0+cw-1,y0},cv::Scalar(210,210,215),1);
+                    cv::line(img,{x0,y0},{x0,y0+ch-1},cv::Scalar(210,210,215),1);
+                }
+            return;
+        }
+        if (mode == 105) {
+            /* MAGNET FIELD: field lines arc away from your outline —
+             * you are the magnet. fx = field reach. */
+            unsigned tk = g_seg.counter;
+            cv::Mat m8, d1;
+            g_seg.mask.convertTo(m8, CV_8U, 255.0);
+            for (int ring = 1; ring <= 4; ring++) {
+                cv::dilate(m8, d1, cv::Mat(), cv::Point(-1,-1),
+                           (int)(ring*7*fx));
+                float ph = std::sin(tk*0.06f + ring)*0.5f+0.5f;
+                int br = (int)((90 - ring*16) * (0.6f+0.4f*ph));
+                for (int y = 1; y < img.rows-1; y += 2) {
+                    const uchar *da = d1.ptr<uchar>(y);
+                    cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                    for (int x = 1; x < img.cols-1; x++) {
+                        if (da[x] > 128 && (d1.at<uchar>(y,x-1) < 128 ||
+                                            d1.at<uchar>(y-1,x) < 128)) {
+                            ip[x][0]=clamp_int_u8(ip[x][0]+br*2);
+                            ip[x][1]=clamp_int_u8(ip[x][1]+br);
+                            ip[x][2]=clamp_int_u8(ip[x][2]+br/2);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 106) {
+            /* PRESENCE HEAT: everywhere you've been slowly glows warm
+             * and fades — your movement paints heat into the room.
+             * fx = memory length. */
+            static cv::Mat heat;
+            if (heat.empty() || heat.size() != img.size())
+                heat = cv::Mat::zeros(img.size(), CV_32F);
+            float decay = 1.0f - 0.02f/fx;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                float *hp = heat.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    hp[x] = std::max(hp[x]*decay, mm[x]);
+                    float k = hp[x] * (1.0f - mm[x]);   /* trail only */
+                    if (k < 0.03f) continue;
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(k*130));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(k*45));
+                    ip[x][0]=(uchar)(ip[x][0]*(1-k*0.35f));
+                }
+            }
+            return;
+        }
+        if (mode == 107) {
+            /* GRAND FINALE: golden rim light, rising sparks, warm
+             * vignette — the 100-filter victory lap. fx = celebration. */
+            unsigned tk = g_seg.counter;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                float vy = std::fabs(y-img.rows*0.5f)/(img.rows*0.5f);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    float vx2 = std::fabs(x-img.cols*0.5f)/(img.cols*0.5f);
+                    float vig = 1.0f - (vx2*vx2+vy*vy)*0.22f;
+                    float rim = (a > 0.05f && a < 0.55f)
+                        ? (0.55f-a)*2.0f : 0.0f;
+                    ip[x][0]=clamp_int_u8((int)(ip[x][0]*vig + rim*40*fx));
+                    ip[x][1]=clamp_int_u8((int)(ip[x][1]*vig + rim*150*fx));
+                    ip[x][2]=clamp_int_u8((int)(ip[x][2]*vig*1.04f + rim*230*fx));
+                }
+            }
+            for (int i2 = 0; i2 < 46; i2++) {       /* rising gold sparks */
+                float n = uhash(i2, 3, 0);
+                int x = (int)(n*img.cols);
+                int y = (int)(img.rows - ((tk*(2+(int)(n*3)) + i2*37) %
+                              (img.rows+40)));
+                if (y < 0 || y >= img.rows) continue;
+                float tw = 0.5f + 0.5f*uhash(i2, 4, tk/3);
+                cv::circle(img, {x, y}, 1 + (i2%2),
+                           cv::Scalar(60*tw, 190*tw, 250*tw), cv::FILLED);
+            }
+            return;
+        }
+        if (mode == 88) {
+            /* VAPORWAVE: pink-cyan sunset duotone on you + drifting
+             * horizontal displacement lines. fx = drift. */
+            unsigned tk = g_seg.counter;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                int off = ((y/3 + tk/4) % 9 == 0) ? (int)(6*fx) : 0;
+                for (int x = 0; x < img.cols; x++) {
+                    int sx2 = std::min(img.cols-1, std::max(0, x - off));
+                    float a = mm[sx2]; if (a < 0.05f) continue;
+                    cv::Vec3b v = img.at<cv::Vec3b>(y, sx2);
+                    float lum = (v[0]*0.114f+v[1]*0.587f+v[2]*0.299f)/255.f;
+                    cv::Vec3b c((uchar)(200+lum*55),(uchar)(60+lum*120),
+                                (uchar)(140+lum*115));
+                    ip[x][0]=(uchar)(ip[x][0]+(c[0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(c[1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(c[2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 89) {
+            /* EMBOSS RELIEF: you pressed into gray metal — self-offset
+             * difference relief, person only. fx = depth. */
+            cv::Mat keep = img.clone();
+            int o = std::max(1,(int)(2*fx));
+            for (int y = o; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *up = keep.ptr<cv::Vec3b>(y-o);
+                const cv::Vec3b *cu = keep.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = o; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    int d = (cu[x][1] - up[x-o][1]) * 2 + 128;
+                    uchar u2 = clamp_int_u8(d);
+                    ip[x][0]=(uchar)(ip[x][0]+(u2-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(u2-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(u2-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 90) {
+            /* PIXEL DRIP: your bottom edge melts — columns of you
+             * stretch downward in dripping streaks. fx = drip length. */
+            unsigned tk = g_seg.counter;
+            for (int x = 0; x < img.cols; x++) {
+                int by2 = -1;
+                for (int y = img.rows-1; y >= 0; y--)
+                    if (g_seg.mask.at<float>(y,x) > 0.5f) { by2 = y; break; }
+                if (by2 < 0 || by2 >= img.rows-2) continue;
+                float n = uhash(x/4, 0, tk/16);
+                int len = (int)(n*n * img.rows * 0.18f * fx);
+                cv::Vec3b src = img.at<cv::Vec3b>(by2, x);
+                for (int y = by2+1; y < std::min(img.rows, by2+len); y++) {
+                    float f2 = 1.0f - (float)(y-by2)/len;
+                    cv::Vec3b *p2 = img.ptr<cv::Vec3b>(y)+x;
+                    p2[0][0]=(uchar)(p2[0][0]+(src[0]-p2[0][0])*f2);
+                    p2[0][1]=(uchar)(p2[0][1]+(src[1]-p2[0][1])*f2);
+                    p2[0][2]=(uchar)(p2[0][2]+(src[2]-p2[0][2])*f2);
+                }
+            }
+            return;
+        }
+        if (mode == 91) {
+            /* ANAGLYPH 3D: red/cyan offset ghosts of you — grab the
+             * cardboard glasses. fx = eye separation. */
+            cv::Mat keep = img.clone();
+            int o = std::max(2, (int)(7*fx));
+            for (int y = 0; y < img.rows; y++) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    int xl = std::max(0, x-o), xr = std::min(img.cols-1, x+o);
+                    float al = g_seg.mask.at<float>(y,xl);
+                    float ar = g_seg.mask.at<float>(y,xr);
+                    if (al < 0.05f && ar < 0.05f) continue;
+                    if (al > 0.05f)
+                        ip[x][2]=(uchar)(ip[x][2]+(keep.at<cv::Vec3b>(y,xl)[2]-ip[x][2])*al);
+                    if (ar > 0.05f) {
+                        ip[x][0]=(uchar)(ip[x][0]+(keep.at<cv::Vec3b>(y,xr)[0]-ip[x][0])*ar);
+                        ip[x][1]=(uchar)(ip[x][1]+(keep.at<cv::Vec3b>(y,xr)[1]-ip[x][1])*ar);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 92) {
+            /* CHALK OUTLINE: the room goes crime-scene gray and a rough
+             * white chalk line traces where you are. fx = roughness. */
+            unsigned tk = g_seg.counter; (void)tk;
+            cv::Mat m8, d1, e1;
+            g_seg.mask.convertTo(m8, CV_8U, 255.0);
+            cv::dilate(m8, d1, cv::Mat(), cv::Point(-1,-1), 3);
+            cv::erode (m8, e1, cv::Mat(), cv::Point(-1,-1), 1);
+            for (int y = 0; y < img.rows; y++) {
+                const uchar *da=d1.ptr<uchar>(y), *ea=e1.ptr<uchar>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float lum = ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f;
+                    if (da[x] > 128 && ea[x] < 128) {
+                        if (uhash(x/2, y/2, 0) < 0.75f/fx + 0.2f) {
+                            ip[x] = cv::Vec3b(235, 235, 238);
+                            continue;
+                        }
+                    }
+                    ip[x][0]=(uchar)(lum*0.7f);
+                    ip[x][1]=(uchar)(lum*0.7f);
+                    ip[x][2]=(uchar)(lum*0.72f);
+                }
+            }
+            return;
+        }
+        if (mode == 93) {
+            /* SCAN BAR: a bright vertical bar sweeps across your body,
+             * over-exposing the slice it touches. fx = speed. */
+            unsigned tk = g_seg.counter;
+            int bar = (int)(tk * 4 * fx) % (img.cols + 160) - 80;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = std::max(0,bar-40); x < std::min(img.cols,bar+40); x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float k = (1.0f - std::fabs(x-bar)/40.0f) * a;
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)(k*200));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(k*220));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(k*235));
+                }
+            }
+            return;
+        }
+        if (mode == 94) {
+            /* TEST PATTERN: SMPTE color bars fill your silhouette —
+             * please stand by. */
+            static const int BARS[7][3] = {{180,180,180},{0,180,180},{180,180,0},
+                {0,180,0},{180,0,180},{0,0,180},{180,0,0}};
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    const int *b2 = BARS[(x * 7 / img.cols) % 7];
+                    ip[x][0]=(uchar)(ip[x][0]+(b2[0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(b2[1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(b2[2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 95) {
+            /* ONE-BIT DITHER: you in pure black-and-white Bayer
+             * dithering — 1985 Macintosh you. fx = brightness bias. */
+            static const int BAYER[4][4] = {{0,8,2,10},{12,4,14,6},
+                                            {3,11,1,9},{15,7,13,5}};
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)
+                              / 255.f * fx;
+                    uchar v = lum * 16 > BAYER[y&3][x&3] + 0.5f ? 245 : 12;
+                    ip[x][0]=(uchar)(ip[x][0]+(v-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(v-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(v-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 96) {
+            /* FROST EDGE: ice crystals grow along your outline — white
+             * crystalline spikes, cold blue tint creeping inward.
+             * fx = frost reach. */
+            unsigned tk = g_seg.counter; (void)tk;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    if (a < 0.04f || a > 0.97f) continue;
+                    float edge2 = 1.0f - std::fabs(a - 0.5f) * 2.0f;
+                    float n = uhash(x/2, y/2, 0);
+                    float k = edge2 * (n > 0.45f ? 1.0f : 0.25f) * std::min(1.5f, fx);
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)(k*230));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(k*200));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(k*160));
+                }
+            }
+            return;
+        }
+        if (mode == 97) {
+            /* HOLLOW MAN: your interior vanishes into the learned room;
+             * only a bright shell of edges remains. fx = shell glow. */
+            cv::Mat gray, gx2, gy2;
+            cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+            cv::Sobel(gray, gx2, CV_32F, 1, 0, 3);
+            cv::Sobel(gray, gy2, CV_32F, 0, 1, 3);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const float *ex = gx2.ptr<float>(y);
+                const float *ey = gy2.ptr<float>(y);
+                const cv::Vec3b *bp = g_seg.bg_est.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float e = (std::fabs(ex[x])+std::fabs(ey[x])) / 900.0f * fx;
+                    if (e > 1) e = 1;
+                    float nb = bp[x][0]+(255-bp[x][0])*e;
+                    float ng = bp[x][1]+(255-bp[x][1])*e;
+                    float nr = bp[x][2]+(200-bp[x][2])*e;
+                    ip[x][0]=(uchar)(ip[x][0]+(nb-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(ng-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(nr-ip[x][2])*a);
                 }
             }
             return;

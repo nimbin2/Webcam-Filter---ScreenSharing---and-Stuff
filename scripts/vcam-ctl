@@ -241,7 +241,7 @@ if [ "${1:-}" = "ai" ]; then
     case "$T" in *venetian*|*blind*|*shutter*) fadd "personfx 75" "venetian";; esac
     case "$T" in *burn*edge*|*smolder*|*ember*edge*) fadd "personfx 76" "burning edge";; esac
     case "$T" in *"glass body"*|*glass*me*|*refract*) fadd "personfx 77" "glass body";; esac
-    case "$T" in *enhance*|*"bad light"*|*"fix light"*|*brighten*|*"low light"*|*"improve quality"*)
+    case "$T" in *enhance*|*lighting*|*brighten*|*"bad light"*|*"low light"*|*"too dark"*|*"improve quality"*|*"better quality"*)
         fadd "enhance 1 0.4" "low-light rescue";; esac
     case "$T" in *blueprint*|*technical*) fadd "personfx 78" "blueprint";; esac
     case "$T" in *brick*|*lego*|*tile*) fadd "personfx 79" "brick tiles";; esac
@@ -253,6 +253,43 @@ if [ "${1:-}" = "ai" ]; then
     case "$T" in *haze*|*shimmer*|*mirage*) fadd "personfx 85" "heat haze";; esac
     case "$T" in *security*|*cctv*|*surveil*) fadd "personfx 86" "security cam";; esac
     case "$T" in *negative*|*inverted*me*) fadd "personfx 87" "negative you";; esac
+    case "$T" in *vaporwave*|*aesthetic*|*synthwave*) fadd "personfx 88" "vaporwave";; esac
+    case "$T" in *emboss*|*relief*) fadd "personfx 89" "emboss relief";; esac
+    case "$T" in *drip*|*"pixel melt"*) fadd "personfx 90" "pixel drip";; esac
+    case "$T" in *anaglyph*|*"3d glasses"*|*"red cyan"*) fadd "personfx 91" "anaglyph 3d";; esac
+    case "$T" in *chalk*|*"crime scene"*) fadd "personfx 92" "chalk outline";; esac
+    case "$T" in *"scan bar"*|*scanner*bar*) fadd "personfx 93" "scan bar";; esac
+    case "$T" in *"test pattern"*|*"color bars"*|*"stand by"*) fadd "personfx 94" "test pattern";; esac
+    case "$T" in *dither*|*"1 bit"*|*1bit*|*macintosh*) fadd "personfx 95" "dither 1bit";; esac
+    case "$T" in *frost*|*ice*edge*|*frozen*) fadd "personfx 96" "frost edge";; esac
+    case "$T" in *hollow*|*"empty shell"*|*"edges only"*) fadd "personfx 97" "hollow man";; esac
+    case "$T" in *searchlight*|*"search light"*|*prison*|*"spot me"*) fadd "personfx 98" "searchlight";; esac
+    case "$T" in *"pixel sort"*|*pixelsort*|*"glitch art"*) fadd "personfx 99" "pixel sort";; esac
+    case "$T" in *laser*grid*|*"security laser"*|*heist*) fadd "personfx 100" "laser grid";; esac
+    case "$T" in *"oil slick"*|*iridescent*|*petrol*) fadd "personfx 101" "oil slick";; esac
+    case "$T" in *neon*sign*|*"neon outline"*|*"bar sign"*) fadd "personfx 102" "neon sign";; esac
+    case "$T" in *rain*|*"weather"*) fadd "personfx 103" "rain shadow";; esac
+    case "$T" in *shatter*|*"broken mirror"*|*shard*) fadd "personfx 104" "mirror shatter";; esac
+    case "$T" in *magnet*|*"field lines"*) fadd "personfx 105" "magnet field";; esac
+    case "$T" in *"presence"*|*"heat trail"*|*"where i"*been*) fadd "personfx 106" "presence heat";; esac
+    case "$T" in *finale*|*celebrate*|*victory*|*golden*rim*) fadd "personfx 107" "grand finale";; esac
+    case "$T" in *bubble*|*pop*) fadd "personfx 109" "bubble pop (touch to pop!)";; esac
+    case "$T" in *punch*|*box*|*bag*|*hit*something*) fadd "personfx 110" "punching bag";; esac
+    case "$T" in *goal*|*keeper*|*save*|*block*|*defend*) fadd "personfx 111" "goalkeeper (block the shots!)";; esac
+    case "$T" in *paint*with*|*"motion paint"*|*"paint the room"*) fadd "personfx 112" "motion paint";; esac
+    case "$T" in *"force field"*|*particle*|*stir*|*telekine*) fadd "personfx 113" "force field (shove the particles)";; esac
+    case "$T" in *smoke*|*fluid*|*current*|*vortex*hand*) fadd "personfx 114" "smoke flow (stir the fluid)";; esac
+    case "$T" in *ripple*|*water*|*wave*|*pool*) fadd "personfx 115" "ripple pool (the room is water)";; esac
+    case "$T" in *cloth*|*net*|*fabric*|*mesh*push*) fadd "personfx 116" "cloth net (push it)";; esac
+    case "$T" in *swarm*|*boid*|*flock*|*insect*|*bees*) fadd "personfx 117" "swarm (they flee your hands)";; esac
+    case "$T" in *sand*|*grain*|*pile*|*snow*pile*) fadd "personfx 118" "sand fall (it piles on you)";; esac
+    case "$T" in *bouncy*|*"balls"*|*rubber*|*"ball pit"*) fadd "personfx 119" "bouncy balls (bat them around)";; esac
+    case "$T" in *liquid*|*fluid*pool*|*splash*|*slosh*) fadd "personfx 120" "liquid pool (scoop and splash it)";; esac
+    case "$T" in *slime*|*goo*|*sticky*|*gunge*) fadd "personfx 121" "slime (it clings to you)";; esac
+    case "$T" in *leaf*|*leaves*|*autumn*|*wind*) fadd "personfx 122" "leaf storm (your wake blows them)";; esac
+    case "$T" in *filing*|*magnet*field*|*"iron"*) fadd "personfx 123" "iron filings (you are the magnet)";; esac
+    case "$T" in *ball*|*game*|*juggl*|*keepy*|*football*|*soccer*|*play*)
+        fadd "personfx 108" "keepy-uppy (bounce the ball, keep it up!)";; esac
     case "$T" in *skeleton*|*bones*) fadd "posefx 0" "skeleton";; esac
     case "$T" in *"energy hands"*|*orb*|*"power up"*|*goku*) fadd "posefx 2" "energy hands";; esac
     case "$T" in *"wrist trail"*|*conduct*|*"draw in air"*) fadd "posefx 3" "wrist trails";; esac
