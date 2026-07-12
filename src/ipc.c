@@ -151,18 +151,31 @@ static const char *PERSONFX_MODES[] = {
     "shockwave","rapture-beam","kaleido-body","liquid-floor","astral-soul",
     "mystic-fog","color-pop","cinema","bokeh-pro","studio-light","night-boost",
     "green-screen","brb-privacy","pop-out-3d","dolly-zoom","duotone-poster",
+    "retro-sprite","acid-you","ascii-you","halftone-print","liquid-metal",
+    "contour-stripes","static-you","golden-statue","comic-ink","venetian",
+    "burning-edge","glass-body","blueprint","brick-tiles","shadow-caller",
+    "glow-in-dark","graphite","pop-poster","riso-outlines","heat-haze",
+    "security-cam","negative-you",
 };
 static const char *FACEFX_MODES[] = {
     "pixelate","ring-dots","googly-eyes","bighead","deal-with-it","laser-eyes",
     "bobblehead","third-eye","crown","mirror-face","cyclops","heart-eyes",
     "interrogation","target-lock","face-satellites","melting-face","sparkle-eyes",
     "halo","clown","auto-director","picasso","time-ripple","fisheye","golden-ratio",
+    "face-image",
 };
 static const char *MOODFX_MODES[] = {
     "aura","hud","party","emoji","paintmood","auto-grade","mood-ring","fountain",
 };
 static const char *STYLEAI_MODES[] = {
     "mosaic","candy","rain-princess","udnie","pointilism",
+};
+static const char *DEPTHFX_MODES[] = {
+    "depth-blur","depth-fog","depth-view","parallax",
+};
+static const char *POSEFX_MODES[] = {
+    "skeleton","neon-bones","energy-hands","wrist-trails","light-wings",
+    "puppet-strings",
 };
 
 static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
@@ -358,7 +371,19 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK   facefx extra modes: 5=LASERS 6=BOBBLE 7=3RD-EYE 8=CROWN 9=MIRROR 10=CYCLOPS 11=HEART-EYES 12=INTERROGATE 13=TARGET-LOCK");
             send_line(client_fd, "OK                       14=FACE-SATELLITES 15=MELTING-FACE 16=SPARKLE-EYES 17=HALO 18=CLOWN");
             send_line(client_fd, "OK                       19=AUTO-DIRECTOR (camera follows + frames your face; amount=tightness speed=follow)");
-            send_line(client_fd, "OK                       20=PICASSO 21=TIME-RIPPLE 22=FISHEYE 23=GOLDEN-RATIO (da-Vinci face analysis)");
+            send_line(client_fd, "OK                       20=PICASSO 21=TIME-RIPPLE 22=FISHEYE 23=GOLDEN-RATIO 24=FACE-IMAGE (your PNG tracks your head)");
+            send_line(client_fd, "OK   filter faceimage <path|off>    set the PNG for facefx 24 — ANY animal face / mask / meme with transparency");
+            send_line(client_fd, "OK   genai [<blend> <size>]        NEURAL img2img: run ANY 1-in/1-out ONNX (AnimeGAN, CartoonGAN...) on every frame");
+            send_line(client_fd, "OK                                    via ONNX Runtime; model: filter genmodel <path> (or <models>/img2img.onnx)");
+            send_line(client_fd, "OK                                    blend 0.2..1 (def 1)  size 128..512 (def 288)  p3: 0=[-1,1] GAN, 1=[0,1] models");
+            send_line(client_fd, "OK                                    p3=1 fits AI low-light nets (Zero-DCE class): filter genmodel <path>, add genai 1 288 1");
+            send_line(client_fd, "OK   depthfx <mode> [<fx>]         MONOCULAR DEPTH (MiDaS): every pixel gets a distance (vcam-setup --models-depth)");
+            send_line(client_fd, "OK                                    0=DEPTH-BLUR (true DoF) 1=DEPTH-FOG 2=DEPTH-VIEW 3=PARALLAX-WIGGLE; fx=strength");
+            send_line(client_fd, "OK   enhance [<strength> <denoise>] LOW-LIGHT RESCUE: retinex shadow lift + auto white balance + shadow denoise");
+            send_line(client_fd, "OK                                    strength 0.2..2 (def 1), denoise 0..1 — fixes bad lighting, no model needed");
+            send_line(client_fd, "OK   posefx <mode> [<fx>]          BODY LANDMARKS (BlazePose): vcam sees your skeleton (vcam-setup --models-pose)");
+            send_line(client_fd, "OK                                    0=SKELETON 1=NEON-BONES 2=ENERGY-HANDS (merge palms!) 3=WRIST-TRAILS");
+            send_line(client_fd, "OK                                    4=LIGHT-WINGS (beating, on your shoulders) 5=PUPPET-STRINGS");
             send_line(client_fd, "OK   personfx extra modes: 9=TINY 10=HOLOGRAM 11=RAINBOW-AURA 12=PAINTED-WORLD 13=BODY-PIXELATE 14=GRAVITY-FLIP");
             send_line(client_fd, "OK                                    15=MOTION-ECHO 16=DOUBLE-EXPOSURE 17=GLITCH-BODY 18=SLICED 19=DISINTEGRATE");
             send_line(client_fd, "OK                                    20=LIGHT-PAINT 21=MIRROR-TWIN 22=CRYSTAL 23=X-RAY-SCAN 24=WANTED-POSTER");
@@ -371,7 +396,12 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK                                    48=GOD-RAYS 49=TRON-TRACE 50=SHOCKWAVE (move fast!) 51=RAPTURE-BEAM");
             send_line(client_fd, "OK                                    52=KALEIDO-BODY 53=LIQUID-FLOOR 54=ASTRAL-SOUL 55=MYSTIC-FOG");
             send_line(client_fd, "OK                                    PRO LOOKS: 56=COLOR-POP 57=CINEMA 58=BOKEH-PRO 59=STUDIO-LIGHT 60=NIGHT-BOOST");
-            send_line(client_fd, "OK                                    61=GREEN-SCREEN-OUT 62=BRB-PRIVACY (auto) 63=POP-OUT-3D 64=DOLLY-ZOOM 65=DUOTONE");
+            send_line(client_fd, "OK                                    61=GREEN-SCREEN-OUT 62=BRB-PRIVACY 63=POP-OUT-3D 64=DOLLY-ZOOM 65=DUOTONE");
+            send_line(client_fd, "OK                                    66=RETRO-SPRITE 67=ACID-YOU 68=ASCII-YOU 69=HALFTONE-PRINT 70=LIQUID-METAL");
+            send_line(client_fd, "OK                                    71=CONTOUR-STRIPES 72=STATIC-YOU (signal lost) 73=GOLDEN-STATUE 74=COMIC-INK");
+            send_line(client_fd, "OK                                    75=VENETIAN 76=BURNING-EDGE 77=GLASS-BODY 78=BLUEPRINT 79=BRICK-TILES");
+            send_line(client_fd, "OK                                    80=SHADOW-CALLER 81=GLOW-IN-DARK 82=GRAPHITE 83=POP-POSTER 84=RISO-OUTLINES");
+            send_line(client_fd, "OK                                    85=HEAT-HAZE 86=SECURITY-CAM 87=NEGATIVE-YOU");
             send_line(client_fd, "OK   filter modes <name>            list ALL modes of personfx/facefx/moodfx/styleai BY NAME");
             send_line(client_fd, "OK   personfx p5 = fx  per-mode effect strength 0.2..3 (glitch amp, fire, rays, lift, fog...) — tune LIVE:");
             send_line(client_fd, "OK                       vcam-ctl filter set 0 p5 1.8");
@@ -516,14 +546,96 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 { tbl = MOODFX_MODES; n2 = (int)(sizeof MOODFX_MODES/sizeof *MOODFX_MODES); }
             else if (fname && (!strcmp(fname,"styleai")||!strcmp(fname,"neuralstyle")))
                 { tbl = STYLEAI_MODES; n2 = (int)(sizeof STYLEAI_MODES/sizeof *STYLEAI_MODES); }
+            else if (fname && !strcmp(fname,"depthfx"))
+                { tbl = DEPTHFX_MODES; n2 = (int)(sizeof DEPTHFX_MODES/sizeof *DEPTHFX_MODES); }
+            else if (fname && !strcmp(fname,"posefx"))
+                { tbl = POSEFX_MODES; n2 = (int)(sizeof POSEFX_MODES/sizeof *POSEFX_MODES); }
             if (!tbl) {
-                send_line(client_fd, "ERR usage: filter modes <personfx|facefx|moodfx|styleai>");
+                send_line(client_fd, "ERR usage: filter modes <personfx|facefx|moodfx|styleai|depthfx|posefx>");
                 return;
             }
             char b[96];
             for (int k2 = 0; k2 < n2; k2++) {
                 snprintf(b, sizeof b, "OK %2d %s", k2, tbl[k2]);
                 send_line(client_fd, b);
+            }
+            return;
+        }
+
+        if (strcmp(sub, "posemodel") == 0) {
+            char *path = strtok_r(NULL, "", &save);
+            while (path && (*path == ' ' || *path == '\t')) path++;
+            if (!path || !*path) {
+                send_line(client_fd, "ERR usage: filter posemodel </abs/path/pose.onnx>");
+                return;
+            }
+            if (cv_set_pose_model(path))
+                send_line(client_fd, "OK pose model set — 'filter add posefx <0-3>'");
+            else
+                send_line(client_fd, "ERR file not found");
+            return;
+        }
+
+        if (strcmp(sub, "depthmodel") == 0) {
+            char *path = strtok_r(NULL, "", &save);
+            while (path && (*path == ' ' || *path == '\t')) path++;
+            if (!path || !*path) {
+                send_line(client_fd, "ERR usage: filter depthmodel </abs/path/model-small.onnx>");
+                return;
+            }
+            if (cv_set_depth_model(path))
+                send_line(client_fd, "OK depth model set — 'filter add depthfx <0-3>'");
+            else
+                send_line(client_fd, "ERR file not found");
+            return;
+        }
+
+        if (strcmp(sub, "genmodel") == 0) {
+            /* filter genmodel <path.onnx> — img2img model for 'genai'
+             * filter genmodel off        — unload */
+            char *path = strtok_r(NULL, "", &save);
+            while (path && (*path == ' ' || *path == '\t')) path++;
+            if (!path || !*path) {
+                send_line(client_fd, "ERR usage: filter genmodel </abs/path/model.onnx | off>");
+                send_line(client_fd, "ERR   then: filter add genai [blend 0.2-1] [size 128-512]");
+                return;
+            }
+            if (!strcmp(path, "off") || !strcmp(path, "none")) {
+                cv_clear_gen_model();
+                send_line(client_fd, "OK genai model unloaded");
+                return;
+            }
+            if (cv_set_gen_model(path)) {
+                send_line(client_fd, "OK genai model set — 'filter add genai' transforms every frame through it");
+            } else {
+                send_line(client_fd, "ERR file not found (absolute path to a .onnx)");
+            }
+            return;
+        }
+
+        if (strcmp(sub, "faceimage") == 0) {
+            /* filter faceimage <path> — overlay PNG for facefx mode 24
+             * filter faceimage off    — remove it */
+            char *path = strtok_r(NULL, "", &save);
+            while (path && (*path == ' ' || *path == '\t')) path++;
+            if (!path || !*path) {
+                send_line(client_fd, "ERR usage: filter faceimage </abs/path/animal.png | off>");
+                send_line(client_fd, "ERR   used by: filter add facefx 24  (PNG tracks your face; alpha respected)");
+                return;
+            }
+            if (!strcmp(path, "off") || !strcmp(path, "none")) {
+                cv_clear_face_image();
+                send_line(client_fd, "OK face image cleared");
+                return;
+            }
+            if (!cv_available()) {
+                send_line(client_fd, "ERR this build has no OpenCV (rebuild with 'make OPENCV=1')");
+                return;
+            }
+            if (cv_set_face_image(path)) {
+                send_line(client_fd, "OK face image loaded — add/keep 'facefx 24' and it tracks your head");
+            } else {
+                send_line(client_fd, "ERR could not load image (PNG with transparency works best)");
             }
             return;
         }

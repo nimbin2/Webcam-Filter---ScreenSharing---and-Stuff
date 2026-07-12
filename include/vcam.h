@@ -221,6 +221,10 @@ typedef enum {
     FX_CV_MOOD,     /* emotion-reactive: aura / HUD / party / emoji         */
     FX_CV_PAINT,    /* optical-flow paint smear: motion drags reality       */
     FX_CV_SPEED,    /* anime speed lines when you move fast                 */
+    FX_GENAI,       /* generic img2img ONNX (AnimeGAN etc.) via ORT backend */
+    FX_DEPTHFX,     /* monocular-depth effects (MiDaS-small via ORT)        */
+    FX_POSEFX,      /* BlazePose body-landmark effects (via ORT)            */
+    FX_ENHANCE,     /* retinex low-light rescue (bad-lighting fixer)        */
 
     FX_UNKNOWN,
 } FilterType;

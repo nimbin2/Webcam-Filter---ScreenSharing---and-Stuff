@@ -187,6 +187,10 @@ static const struct { const char *name; FilterType t; } NAMES[] = {
     {"paintflow",   FX_CV_PAINT},
     {"smear",       FX_CV_PAINT},
     {"speedlines",  FX_CV_SPEED},
+    {"genai",       FX_GENAI},
+    {"depthfx",     FX_DEPTHFX},
+    {"posefx",      FX_POSEFX},
+    {"enhance",     FX_ENHANCE},
     {"anime",       FX_CV_SPEED},
     /* new effect additions */
     {"saturate",    FX_SATURATE},
@@ -321,6 +325,10 @@ float filter_default_param(FilterType t)
     case FX_CV_MOOD:     return 0.0f;   /* mode 0 = aura */
     case FX_CV_PAINT:    return 1.0f;
     case FX_CV_SPEED:    return 1.0f;
+    case FX_GENAI:       return 1.0f;
+    case FX_DEPTHFX:     return 0.0f;
+    case FX_POSEFX:      return 0.0f;
+    case FX_ENHANCE:     return 1.0f;
     default:             return 0.0f;
     }
 }
@@ -5909,6 +5917,10 @@ void filter_chain_apply(FilterChain *fc, Frame *frame)
         case FX_CV_MOOD:      cv_fx_mood   (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2, f->param3); break;
         case FX_CV_PAINT:     cv_fx_paintflow(frame->data, frame->width, frame->height, frame->stride, f->param, f->param2); break;
         case FX_CV_SPEED:     cv_fx_speedlines(frame->data, frame->width, frame->height, frame->stride, f->param, f->param2); break;
+        case FX_GENAI:        cv_fx_genai  (frame->data, frame->width, frame->height, frame->stride, f->param, f->param2, f->param3); break;
+        case FX_DEPTHFX:      cv_fx_depth  (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2); break;
+        case FX_POSEFX:       cv_fx_pose   (frame->data, frame->width, frame->height, frame->stride, (int)f->param, f->param2); break;
+        case FX_ENHANCE:      cv_fx_enhance(frame->data, frame->width, frame->height, frame->stride, f->param, f->param2); break;
         default: break;
         }
     }

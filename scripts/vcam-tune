@@ -61,7 +61,7 @@ declare -A MODE_CACHE   # "filtername" -> newline list "N name"
 # itself ('filter modes <name>' — single source of truth in ipc.c).
 mode_list() {
     local name=$1
-    case "$name" in personfx|facefx|moodfx|styleai) ;; *) return 1 ;; esac
+    case "$name" in personfx|facefx|moodfx|styleai|depthfx|posefx) ;; *) return 1 ;; esac
     if [[ -z "${MODE_CACHE[$name]:-}" ]]; then
         MODE_CACHE[$name]=$(ipc_lines "filter modes $name" \
             | sed -n 's/^OK *\([0-9][0-9]*\) \(.*\)$/\1 \2/p')
@@ -109,7 +109,8 @@ n_params_for() {
         contour|fireworks|infinity|moire) echo 2 ;;
         cartoon|drift|slitscan|mosh|zoompulse|oilslick|ascii|sketch) echo 2 ;;
         shards|portal|heattrail|wormhole|magnet|nightvision|badtv|ghosts) echo 2 ;;
-        meltdown|rotozoom|starfield|lightning|scatter|vhs|outline|timebubble|paintflow|speedlines) echo 2 ;;
+        meltdown|rotozoom|starfield|lightning|scatter|vhs|outline|timebubble|paintflow|speedlines|depthfx|posefx|enhance) echo 2 ;;
+        genai) echo 3 ;;
         *) echo 1 ;;
     esac
 }
@@ -247,6 +248,15 @@ param_label() {
         moodfx:1) echo "mode" ;;
         moodfx:2) echo "gain" ;;
         moodfx:3) echo "extra" ;;
+        genai:1) echo "blend" ;;
+        genai:2) echo "size" ;;
+        genai:3) echo "range01" ;;
+        enhance:1) echo "strength" ;;
+        enhance:2) echo "denoise" ;;
+        depthfx:1) echo "mode" ;;
+        depthfx:2) echo "fx" ;;
+        posefx:1) echo "mode" ;;
+        posefx:2) echo "fx" ;;
         speedlines:1) echo "sens" ;;
         speedlines:2) echo "density" ;;
         paintflow:1) echo "strength" ;;
@@ -329,6 +339,7 @@ param_step() {
         moodfx:3)       echo 0.1 ;;
         facefx:2)       echo 0.1 ;;
         facefx:3)       echo 0.1 ;;
+        genai:2)        echo 32 ;;
         paintflow:2)    echo 0.01 ;;
         clones:2)       echo 0.5 ;;
         clones:3)       echo 0.05 ;;
@@ -786,7 +797,7 @@ while :; do
                     mode_list "$name" | awk '{printf "  %2s %-18s", $1, $2;
                         if (NR % 3 == 0) printf "\n"} END {printf "\n"}'
                     printf "mode # (enter=cancel): "
-                    local _stty_pick; _stty_pick=$(stty -g)
+                    _stty_pick=$(stty -g)
                     stty echo icanon
                     IFS= read -r pick
                     stty "$_stty_pick"

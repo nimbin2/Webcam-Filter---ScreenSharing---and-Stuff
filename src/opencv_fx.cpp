@@ -217,6 +217,15 @@ struct BgImgState {
 };
 BgImgState g_bgimg;
 
+/* User-supplied face-overlay image (PNG with alpha) for facefx mode 24,
+ * set via 'vcam-ctl filter faceimage <path>'. Tracked to the face:
+ * scaled by face width, rotated by eye angle. */
+struct FaceImgState {
+    cv::Mat rgba;             /* as loaded, 4-channel */
+    std::mutex mtx;
+};
+FaceImgState g_faceimg;
+
 /* paintflow: a persistent canvas advected by dense optical flow —
  * moving objects drag the paint with them. */
 struct PaintState {
@@ -1034,6 +1043,100 @@ void cv_fx_face(unsigned char *data, int w, int h, int stride, int mode,
                     cv::circle(img, eye, std::max(2, fw/20),
                                cv::Scalar(255,255,255), cv::FILLED);
                 }
+            } else if (mode == 24) {
+                /* FACE IMAGE: your uploaded PNG (animal face, mask,
+                 * meme...) tracked to your face — scaled by face width,
+                 * rotated by your eye angle, alpha-composited.
+                 * Set it with: vcam-ctl filter faceimage <path>
+                 * amount = overlay size. */
+                std::lock_guard<std::mutex> fl2(g_faceimg.mtx);
+                if (!g_faceimg.rgba.empty()) {
+                    double ang = std::atan2((double)(f[7]-f[5]),
+                                            (double)(f[6]-f[4])) * 57.2958;
+                    /* ── AR life signs, all from YuNet's 5 landmarks ──
+                     * jaw: nose→mouth distance vs. its running "closed"
+                     * baseline -> mouth-open amount; yaw: nose offset
+                     * from the eye midpoint -> head turn. */
+                    float emx = (f[4]+f[6])*0.5f*inv;
+                    float nsx = f[8]*inv, nsy = f[9]*inv;
+                    float mmx = (f[10]+f[12])*0.5f*inv, mmy2 = (f[11]+f[13])*0.5f*inv;
+                    float nm = std::sqrt((mmx-nsx)*(mmx-nsx)+(mmy2-nsy)*(mmy2-nsy))
+                             / std::max(1.0f, (float)fh);
+                    static float nm_base = -1;
+                    if (nm_base < 0) nm_base = nm;
+                    if (nm < nm_base) nm_base += (nm - nm_base) * 0.10f;
+                    else              nm_base += (nm - nm_base) * 0.004f;
+                    float open2 = std::max(0.0f, std::min(1.0f,
+                                  (nm - nm_base*1.06f) / (nm_base*0.45f + 1e-4f)));
+                    float yaw = (nsx - emx) / std::max(1.0f, (float)fw);  /* ± ~0.3 */
+                    /* lighting match: your face region's light tints the mask */
+                    float lr2=0, lg2=0, lb2=0; int ln2=0;
+                    for (int yy = y; yy < y+fh; yy += 8)
+                        for (int xx = x; xx < x+fw; xx += 8) {
+                            if (xx<0||yy<0||xx>=w||yy>=h) continue;
+                            const cv::Vec3b &pv = img.at<cv::Vec3b>(yy,xx);
+                            lb2+=pv[0]; lg2+=pv[1]; lr2+=pv[2]; ln2++;
+                        }
+                    float kb=1, kg=1, kr=1;
+                    if (ln2 > 4) {
+                        kb = std::min(1.35f, std::max(0.55f, (lb2/ln2)/150.0f));
+                        kg = std::min(1.35f, std::max(0.55f, (lg2/ln2)/150.0f));
+                        kr = std::min(1.35f, std::max(0.55f, (lr2/ln2)/150.0f));
+                    }
+                    int S = std::max(24, (int)(fw * 1.9f * amount));
+                    int cx3 = x + fw/2 + (int)(yaw * S * 0.45f);   /* turn */
+                    int cy3 = y + fh/2 - fh/12;
+                    int x0 = cx3 - S/2, y0 = cy3 - S/2;
+                    if (x0 >= 0 && y0 >= 0 && x0+S < w && y0+S < h) {
+                        /* affine: PNG -> S x S canvas, rotated (manual
+                         * 2x3, version-proof), transparent border */
+                        double sc2 = (double)S / std::max(g_faceimg.rgba.cols,
+                                                          g_faceimg.rgba.rows);
+                        double ra = -ang * 3.14159265 / 180.0;
+                        double ca2 = std::cos(ra)*sc2, sa2 = std::sin(ra)*sc2;
+                        double pcx = g_faceimg.rgba.cols/2.0;
+                        double pcy = g_faceimg.rgba.rows/2.0;
+                        double abuf[6] = { ca2, sa2, S/2.0 - ca2*pcx - sa2*pcy,
+                                          -sa2, ca2, S/2.0 + sa2*pcx - ca2*pcy };
+                        cv::Mat A2(2, 3, CV_64F, abuf);
+                        cv::Mat canvas;
+                        cv::warpAffine(g_faceimg.rgba, canvas, A2,
+                                       cv::Size(S, S), cv::INTER_LINEAR,
+                                       cv::BORDER_CONSTANT, cv::Scalar(0,0,0,0));
+                        /* composite with a live jaw: the bottom of the
+                         * mask drops when YOUR mouth opens; the gap is
+                         * a darkened mouth interior. */
+                        int split = (int)(S * 0.60f);
+                        int drop = (int)(open2 * S * 0.13f);
+                        for (int yy = 0; yy < S; yy++) {
+                            int sy3;                     /* source canvas row */
+                            float dark = 1.0f;
+                            if (yy < split)              sy3 = yy;
+                            else if (yy < split + drop) { sy3 = split; dark = 0.35f; }
+                            else                         sy3 = yy - drop;
+                            const cv::Vec4b *sp = canvas.ptr<cv::Vec4b>(sy3);
+                            cv::Vec3b *dp = img.ptr<cv::Vec3b>(y0+yy) + x0;
+                            for (int xx = 0; xx < S; xx++) {
+                                float al = sp[xx][3] / 255.0f;
+                                if (al < 0.02f) continue;
+                                float b3 = sp[xx][0]*kb*dark;
+                                float g3 = sp[xx][1]*kg*dark;
+                                float r3 = sp[xx][2]*kr*dark;
+                                if (b3>255)b3=255;
+                                if (g3>255)g3=255;
+                                if (r3>255)r3=255;
+                                dp[xx][0]=(uchar)(dp[xx][0]+(b3-dp[xx][0])*al);
+                                dp[xx][1]=(uchar)(dp[xx][1]+(g3-dp[xx][1])*al);
+                                dp[xx][2]=(uchar)(dp[xx][2]+(r3-dp[xx][2])*al);
+                            }
+                        }
+                    }
+                } else {
+                    warn_once("faceimg_miss",
+                        "facefx 24: no face image set — "
+                        "vcam-ctl filter faceimage /path/animal.png "
+                        "(PNG with transparency works best)");
+                }
             } else if (mode == 23) {
                 /* GOLDEN RATIO: the da-Vinci face-analysis meme —
                  * fibonacci spiral, phi grid, rotating measurement
@@ -1582,6 +1685,537 @@ mask_ready: ;
                     ip[x][0]=(uchar)(ip[x][0]+(tp[x][0]-ip[x][0])*a);
                     ip[x][1]=(uchar)(ip[x][1]+(tp[x][1]-ip[x][1])*a);
                     ip[x][2]=(uchar)(ip[x][2]+(tp[x][2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 78) {
+            /* BLUEPRINT: you as a technical drawing — deep blue fill,
+             * white construction edges and a drafting grid; the room
+             * stays photographic. fx = line density. */
+            cv::Mat gray, gx2, gy2;
+            cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+            cv::Sobel(gray, gx2, CV_32F, 1, 0, 3);
+            cv::Sobel(gray, gy2, CV_32F, 0, 1, 3);
+            float thr = 240.0f / fx;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const float *ex = gx2.ptr<float>(y);
+                const float *ey = gy2.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float e = std::fabs(ex[x]) + std::fabs(ey[x]);
+                    bool grid = (x % 24 == 0) || (y % 24 == 0);
+                    cv::Vec3b c = e > thr ? cv::Vec3b(245,245,250)
+                                : grid    ? cv::Vec3b(150,105,60)
+                                          : cv::Vec3b(110,60,20);
+                    ip[x][0]=(uchar)(ip[x][0]+(c[0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(c[1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(c[2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 79) {
+            /* BRICK TILES: you built from beveled plastic tiles — lit
+             * top-left edge, shadowed bottom-right. fx = tile size. */
+            int C = std::max(8, (int)(14 * fx));
+            cv::Mat keep = img.clone();
+            for (int y0 = 0; y0 + C <= img.rows; y0 += C)
+                for (int x0 = 0; x0 + C <= img.cols; x0 += C) {
+                    if (g_seg.mask.at<float>(y0+C/2, x0+C/2) < 0.4f) continue;
+                    cv::Vec3b c = keep.at<cv::Vec3b>(y0+C/2, x0+C/2);
+                    c[0]=(c[0]/48)*48+24; c[1]=(c[1]/48)*48+24; c[2]=(c[2]/48)*48+24;
+                    cv::rectangle(img, cv::Rect(x0, y0, C, C),
+                                  cv::Scalar(c[0],c[1],c[2]), cv::FILLED);
+                    cv::line(img, {x0,y0}, {x0+C-1,y0},
+                             cv::Scalar(std::min(255,c[0]+55),std::min(255,c[1]+55),
+                                        std::min(255,c[2]+55)), 2);
+                    cv::line(img, {x0,y0}, {x0,y0+C-1},
+                             cv::Scalar(std::min(255,c[0]+55),std::min(255,c[1]+55),
+                                        std::min(255,c[2]+55)), 2);
+                    cv::line(img, {x0+1,y0+C-1}, {x0+C-1,y0+C-1},
+                             cv::Scalar(c[0]*2/3,c[1]*2/3,c[2]*2/3), 2);
+                    cv::circle(img, {x0+C/2, y0+C/2}, C/5,
+                               cv::Scalar(std::min(255,c[0]+30),std::min(255,c[1]+30),
+                                          std::min(255,c[2]+30)), 1);
+                }
+            return;
+        }
+        if (mode == 80) {
+            /* SHADOW CALLER: you become a flat black silhouette with a
+             * cold rim — witness-protection chic. fx = rim strength. */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.04f) continue;
+                    float rim = (a < 0.55f) ? (0.55f-a)/0.51f : 0.0f;
+                    int rb = (int)(rim * 150 * fx);
+                    ip[x][0]=(uchar)(ip[x][0]*(1-a) + std::min(255, 18+rb)*a);
+                    ip[x][1]=(uchar)(ip[x][1]*(1-a) + std::min(255, 14+rb/2)*a);
+                    ip[x][2]=(uchar)(ip[x][2]*(1-a) + 12*a);
+                }
+            }
+            return;
+        }
+        if (mode == 81) {
+            /* GLOW IN THE DARK: lights out — you luminesce toxic green,
+             * brighter where you were brighter. fx = glow. */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    if (a < 0.05f) {
+                        ip[x][0]=(uchar)(ip[x][0]*0.12f);
+                        ip[x][1]=(uchar)(ip[x][1]*0.14f);
+                        ip[x][2]=(uchar)(ip[x][2]*0.12f);
+                        continue;
+                    }
+                    float g2 = std::min(255.f, (40 + lum*215) * fx);
+                    ip[x][0]=(uchar)(ip[x][0]+((g2*0.35f)-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(g2-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+((g2*0.25f)-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 82) {
+            /* GRAPHITE: you sketched in pencil (classic dodge-blend:
+             * luma over its own blur), room in color. fx = contrast. */
+            cv::Mat gray, blur2;
+            cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+            cv::GaussianBlur(gray, blur2, cv::Size(0,0), 5.0);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const uchar *gp = gray.ptr<uchar>(y);
+                const uchar *bp = blur2.ptr<uchar>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float v = 255.0f * gp[x] / (256.0f - std::min(254, (int)bp[x]));
+                    v = 255.0f - (255.0f - std::min(255.f, v)) * fx;
+                    if (v < 0) v = 0;
+                    uchar u2 = (uchar)v;
+                    ip[x][0]=(uchar)(ip[x][0]+(u2-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(u2-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(u2-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 83) {
+            /* POP POSTER: you in flat two-tone screen-print; the ink
+             * color steps to a new one every couple of seconds.
+             * fx = switch speed. */
+            unsigned tk = g_seg.counter;
+            static const int INK[5][3] = {
+                {180,40,230},{40,180,255},{200,180,20},{60,220,90},{230,90,50}};
+            int pi = (int)(tk * 0.01f * fx) % 5;
+            const int *I2 = INK[pi];
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    cv::Vec3b c = lum > 0.52f
+                        ? cv::Vec3b(240, 238, 232)
+                        : cv::Vec3b((uchar)I2[0], (uchar)I2[1], (uchar)I2[2]);
+                    ip[x][0]=(uchar)(ip[x][0]+(c[0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(c[1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(c[2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 84) {
+            /* RISO OUTLINES: three offset colored contours around your
+             * silhouette — misregistered print, on purpose. fx = offset. */
+            cv::Mat m8, d1;
+            g_seg.mask.convertTo(m8, CV_8U, 255.0);
+            cv::dilate(m8, d1, cv::Mat(), cv::Point(-1,-1), 2);
+            int off = std::max(2, (int)(5 * fx));
+            static const int OC[3][3] = {{60,60,235},{235,180,40},{200,80,200}};
+            for (int y = 0; y < img.rows; y++) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    for (int k2 = 0; k2 < 3; k2++) {
+                        int sx2 = x + (k2-1)*off, sy2 = y + (k2==2?off:(k2==0?-off:0));
+                        if (sx2<1||sy2<1||sx2>=img.cols-1||sy2>=img.rows-1) continue;
+                        uchar c2 = d1.at<uchar>(sy2, sx2);
+                        uchar e2 = m8.at<uchar>(sy2, sx2);
+                        if (c2 > 128 && e2 < 128) {
+                            ip[x][0]=clamp_int_u8(ip[x][0]/2+OC[k2][0]/2);
+                            ip[x][1]=clamp_int_u8(ip[x][1]/2+OC[k2][1]/2);
+                            ip[x][2]=clamp_int_u8(ip[x][2]/2+OC[k2][2]/2);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 85) {
+            /* HEAT HAZE: you shimmer like air over asphalt — small
+             * animated refraction inside your silhouette only.
+             * fx = shimmer. */
+            unsigned tk = g_seg.counter;
+            cv::Mat keep = img.clone();
+            float A2 = 3.5f * fx;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    int sx2 = x + (int)(std::sin(y*0.16f + tk*0.22f) * A2 * a);
+                    int sy2 = y + (int)(std::sin(x*0.13f + tk*0.17f) * A2 * 0.6f * a);
+                    sx2 = std::max(0, std::min(img.cols-1, sx2));
+                    sy2 = std::max(0, std::min(img.rows-1, sy2));
+                    ip[x] = keep.at<cv::Vec3b>(sy2, sx2);
+                }
+            }
+            return;
+        }
+        if (mode == 86) {
+            /* SECURITY CAM: grainy green-mono CCTV with a tracking box
+             * locked on you, timestamp and REC dot. fx = grain. */
+            unsigned tk = g_seg.counter;
+            int minx=img.cols, miny=img.rows, maxx=0, maxy=0;
+            for (int y = 0; y < img.rows; y += 6) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                for (int x = 0; x < img.cols; x += 6)
+                    if (mm[x] > 0.4f) {
+                        if (x<minx)minx=x;
+                        if (x>maxx)maxx=x;
+                        if (y<miny)miny=y;
+                        if (y>maxy)maxy=y;
+                    }
+            }
+            for (int y = 0; y < img.rows; y++) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float lum = ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f;
+                    int gr = (int)((uhash(x,y,tk)-0.5f)*26*fx);
+                    ip[x][0]=clamp_int_u8((int)(lum*0.55f)+gr);
+                    ip[x][1]=clamp_int_u8((int)(lum*0.95f)+gr+10);
+                    ip[x][2]=clamp_int_u8((int)(lum*0.55f)+gr);
+                }
+            }
+            if (maxx > minx + 20) {
+                cv::rectangle(img, {minx-8,miny-8}, {maxx+8,maxy+8},
+                              cv::Scalar(120,255,120), 2);
+                cv::putText(img, "SUBJECT 01", {minx-8, std::max(18,miny-14)},
+                            cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(120,255,120), 1);
+            }
+            char ts[40];
+            snprintf(ts, sizeof ts, "CAM 04  %02u:%02u:%02u",
+                     (tk/108000)%24, (tk/1800)%60, (tk/30)%60);
+            cv::putText(img, ts, {14, img.rows-16},
+                        cv::FONT_HERSHEY_PLAIN, 1.3, cv::Scalar(140,255,140), 1);
+            if ((tk/20)%2) {
+                cv::circle(img, {img.cols-34, 26}, 7, cv::Scalar(60,60,255), cv::FILLED);
+                cv::putText(img, "REC", {img.cols-92, 32},
+                            cv::FONT_HERSHEY_PLAIN, 1.3, cv::Scalar(120,120,255), 1);
+            }
+            return;
+        }
+        if (mode == 87) {
+            /* NEGATIVE YOU: your colors inverted, film-negative style,
+             * with a faint hot rim; the room stays positive. */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float rim = (a < 0.5f) ? (0.5f-a)*2.0f*80*fx : 0.0f;
+                    ip[x][0]=(uchar)(ip[x][0]+((255-ip[x][0])-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+((255-ip[x][1])-ip[x][1])*a);
+                    ip[x][2]=clamp_int_u8((int)(ip[x][2]+((255-ip[x][2])-ip[x][2])*a+rim));
+                }
+            }
+            return;
+        }
+        if (mode == 68) {
+            /* ASCII YOU: your body rendered as green terminal
+             * characters by brightness; the room stays real.
+             * fx = character size. */
+            int C = std::max(8, (int)(10 * fx));
+            static const char *RAMP[] = {".",":","+","o","X","#","@"};
+            cv::Mat keep = img.clone();
+            for (int y0 = 0; y0 + C <= img.rows; y0 += C)
+                for (int x0 = 0; x0 + C <= img.cols; x0 += C) {
+                    if (g_seg.mask.at<float>(y0+C/2, x0+C/2) < 0.4f) continue;
+                    cv::Vec3b c = keep.at<cv::Vec3b>(y0+C/2, x0+C/2);
+                    float lum = (c[0]*0.114f+c[1]*0.587f+c[2]*0.299f)/255.f;
+                    cv::rectangle(img, cv::Rect(x0, y0, C, C),
+                                  cv::Scalar(8, 14, 8), cv::FILLED);
+                    int ri = std::min(6, (int)(lum * 7));
+                    cv::putText(img, RAMP[ri], {x0, y0 + C - 2},
+                                cv::FONT_HERSHEY_PLAIN, C/10.0,
+                                cv::Scalar(40, 100 + (int)(lum*155), 40), 1);
+                }
+            return;
+        }
+        if (mode == 69) {
+            /* HALFTONE PRINT: you as a proper newspaper dot-screen —
+             * dot size by darkness on a print grid; the room keeps its
+             * color. fx = dot cell size. */
+            int C = std::max(5, (int)(6 * fx));
+            cv::Mat keep = img.clone();
+            for (int y0 = 0; y0 + C <= img.rows; y0 += C)
+                for (int x0 = 0; x0 + C <= img.cols; x0 += C) {
+                    if (g_seg.mask.at<float>(y0+C/2, x0+C/2) < 0.4f) continue;
+                    cv::Vec3b c = keep.at<cv::Vec3b>(y0+C/2, x0+C/2);
+                    float dark = 1.0f - (c[0]*0.114f+c[1]*0.587f+c[2]*0.299f)/255.f;
+                    cv::rectangle(img, cv::Rect(x0, y0, C, C),
+                                  cv::Scalar(235, 232, 226), cv::FILLED);
+                    int r2 = (int)(dark * C * 0.62f);
+                    if (r2 > 0)
+                        cv::circle(img, {x0 + C/2, y0 + C/2}, r2,
+                                   cv::Scalar(30, 26, 24), cv::FILLED, cv::LINE_AA);
+                }
+            return;
+        }
+        if (mode == 70) {
+            /* LIQUID METAL: chrome you — luminance remapped through a
+             * banded metallic reflection curve. T-1000 energy.
+             * fx = band frequency. */
+            unsigned tk = g_seg.counter;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    float band = std::sin(lum * 9.0f * fx + tk * 0.02f);
+                    float v = lum * 0.55f + 0.30f + band * 0.22f;
+                    if (v < 0) v = 0;
+                    if (v > 1) v = 1;
+                    float nb = v*255*1.04f, ng = v*255*1.02f, nr = v*255*0.94f;
+                    ip[x][0]=(uchar)(ip[x][0]+(std::min(255.f,nb)-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(std::min(255.f,ng)-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(std::min(255.f,nr)-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 71) {
+            /* CONTOUR STRIPES: animated brightness-contour bands sweep
+             * across your body — living topography of your own light.
+             * fx = sweep speed. */
+            unsigned tk = g_seg.counter;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    float band = std::sin(lum * 22.0f - tk * 0.12f * fx);
+                    if (band > 0.55f) {
+                        float hue = lum * 5.0f + tk * 0.02f;
+                        ip[x][0]=clamp_int_u8(ip[x][0]+(int)(a*(std::sin(hue+4.19f)*.5f+.5f)*170));
+                        ip[x][1]=clamp_int_u8(ip[x][1]+(int)(a*(std::sin(hue+2.09f)*.5f+.5f)*170));
+                        ip[x][2]=clamp_int_u8(ip[x][2]+(int)(a*(std::sin(hue)*.5f+.5f)*170));
+                    } else {
+                        ip[x][0]=(uchar)(ip[x][0]*(1-a*0.35f));
+                        ip[x][1]=(uchar)(ip[x][1]*(1-a*0.35f));
+                        ip[x][2]=(uchar)(ip[x][2]*(1-a*0.35f));
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 72) {
+            /* STATIC YOU: signal lost — your silhouette is pure TV
+             * white-noise while the broadcast around you is fine.
+             * fx = noise coarseness. */
+            unsigned tk = g_seg.counter;
+            int C = std::max(1, (int)fx);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    int n = (int)(uhash(x/C, y/C, tk) * 255);
+                    ip[x][0]=(uchar)(ip[x][0]+(n-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(n-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(n-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 73) {
+            /* GOLDEN STATUE: you, cast in gold — warm metal ramp with a
+             * specular kick in the highlights. fx = shine. */
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float lum = (ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f)/255.f;
+                    float spec = lum > 0.72f ? (lum-0.72f)/0.28f : 0.0f;
+                    spec = spec * spec * 0.9f * fx;
+                    float nr = std::min(255.f, (lum*200 + 55) * (1+spec*0.5f));
+                    float ng = std::min(255.f, (lum*160 + 30) * (1+spec*0.6f));
+                    float nb = std::min(255.f, (lum*60  + 8)  * (1+spec*1.6f));
+                    ip[x][0]=(uchar)(ip[x][0]+(nb-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(ng-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(nr-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 74) {
+            /* COMIC INK: you, drawn — 4-level posterized color with
+             * black ink where your edges are. fx = ink weight. */
+            cv::Mat gray, gx2, gy2;
+            cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+            cv::Sobel(gray, gx2, CV_32F, 1, 0, 3);
+            cv::Sobel(gray, gy2, CV_32F, 0, 1, 3);
+            float thr = 260.0f / fx;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const float *ex = gx2.ptr<float>(y);
+                const float *ey = gy2.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float e = std::fabs(ex[x]) + std::fabs(ey[x]);
+                    if (e > thr) {
+                        ip[x][0]=(uchar)(ip[x][0]*(1-a));
+                        ip[x][1]=(uchar)(ip[x][1]*(1-a));
+                        ip[x][2]=(uchar)(ip[x][2]*(1-a));
+                    } else {
+                        cv::Vec3b q((ip[x][0]/64)*64+40,
+                                    (ip[x][1]/64)*64+40,
+                                    (ip[x][2]/64)*64+40);
+                        ip[x][0]=(uchar)(ip[x][0]+(q[0]-ip[x][0])*a);
+                        ip[x][1]=(uchar)(ip[x][1]+(q[1]-ip[x][1])*a);
+                        ip[x][2]=(uchar)(ip[x][2]+(q[2]-ip[x][2])*a);
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 75) {
+            /* VENETIAN: you're seen through sliding blinds — stripes of
+             * you alternate with the empty room behind. fx = blind size. */
+            unsigned tk = g_seg.counter;
+            int B = std::max(8, (int)(14 * fx));
+            int off = (int)(tk * 0.8f) % (B * 2);
+            for (int y = 0; y < img.rows; y++) {
+                bool open2 = (((y + off) / B) & 1) == 0;
+                if (open2) continue;
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const cv::Vec3b *bp = g_seg.bg_est.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    ip[x][0]=(uchar)(ip[x][0]+(bp[x][0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(bp[x][1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(bp[x][2]-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 76) {
+            /* BURNING EDGE: your outline smolders like the rim of
+             * burning paper — white-hot line, orange glow, charred
+             * band inside. fx = flicker energy. */
+            unsigned tk = g_seg.counter;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x];
+                    if (a < 0.04f || a > 0.97f) continue;
+                    float fl = 0.6f + 0.4f * uhash(x/3, y/3, tk/2) * fx;
+                    float edge2 = 1.0f - std::fabs(a - 0.5f) * 2.0f;  /* peak mid */
+                    float hot = edge2 * edge2 * fl;
+                    ip[x][0]=clamp_int_u8(ip[x][0]+(int)(hot*40));
+                    ip[x][1]=clamp_int_u8(ip[x][1]+(int)(hot*130));
+                    ip[x][2]=clamp_int_u8(ip[x][2]+(int)(hot*255));
+                    if (a > 0.75f) {                    /* charred inner band */
+                        float ch = (a - 0.75f) / 0.25f * 0.5f;
+                        ip[x][0]=(uchar)(ip[x][0]*(1-ch));
+                        ip[x][1]=(uchar)(ip[x][1]*(1-ch));
+                        ip[x][2]=(uchar)(ip[x][2]*(1-ch));
+                    }
+                }
+            }
+            return;
+        }
+        if (mode == 77) {
+            /* GLASS BODY: you become refractive glass — the learned
+             * room shows THROUGH you, bent by your body's shape (mask
+             * gradient as the surface normal) with a bright rim.
+             * fx = refraction strength. */
+            cv::Mat gx2, gy2;
+            cv::Sobel(g_seg.mask, gx2, CV_32F, 1, 0, 3);
+            cv::Sobel(g_seg.mask, gy2, CV_32F, 0, 1, 3);
+            float R = 34.0f * fx;
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                const float *px2 = gx2.ptr<float>(y);
+                const float *py2 = gy2.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    int sx2 = x + (int)(px2[x] * R);
+                    int sy2 = y + (int)(py2[x] * R);
+                    sx2 = std::max(0, std::min(img.cols-1, sx2));
+                    sy2 = std::max(0, std::min(img.rows-1, sy2));
+                    const cv::Vec3b &bg = g_seg.bg_est.at<cv::Vec3b>(sy2, sx2);
+                    float rim = (a > 0.04f && a < 0.6f) ? (0.6f-a)/0.56f : 0.0f;
+                    float nb = std::min(255.f, bg[0]*1.08f + rim*110);
+                    float ng = std::min(255.f, bg[1]*1.08f + rim*110);
+                    float nr = std::min(255.f, bg[2]*1.05f + rim*100);
+                    ip[x][0]=(uchar)(ip[x][0]+(nb-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(ng-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(nr-ip[x][2])*a);
+                }
+            }
+            return;
+        }
+        if (mode == 66) {
+            /* RETRO SPRITE: you become a chunky 16-color video-game
+             * character; the room stays photoreal. fx = chunkiness. */
+            int C = std::max(4, (int)(img.cols / 140 * fx * 2));
+            for (int y0 = 0; y0 < img.rows; y0 += C)
+                for (int x0 = 0; x0 < img.cols; x0 += C) {
+                    if (g_seg.mask.at<float>(std::min(img.rows-1, y0+C/2),
+                                             std::min(img.cols-1, x0+C/2)) < 0.4f)
+                        continue;
+                    cv::Vec3b c = img.at<cv::Vec3b>(
+                        std::min(img.rows-1, y0+C/2), std::min(img.cols-1, x0+C/2));
+                    c[0] = (c[0]/64)*64+32; c[1]=(c[1]/64)*64+32; c[2]=(c[2]/64)*64+32;
+                    cv::rectangle(img, cv::Rect(x0, y0,
+                        std::min(C, img.cols-x0), std::min(C, img.rows-y0)),
+                        cv::Scalar(c[0],c[1],c[2]), cv::FILLED);
+                }
+            return;
+        }
+        if (mode == 67) {
+            /* ACID YOU: your colors slowly cycle through the spectrum
+             * while the room stays sober. fx = cycle speed. */
+            unsigned tk = g_seg.counter;
+            float ph = tk * 0.03f * fx;
+            float c1 = std::cos(ph), s1 = std::sin(ph);
+            for (int y = 0; y < img.rows; y++) {
+                const float *mm = g_seg.mask.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < img.cols; x++) {
+                    float a = mm[x]; if (a < 0.05f) continue;
+                    float lum = ip[x][0]*0.114f+ip[x][1]*0.587f+ip[x][2]*0.299f;
+                    float u = ip[x][2]-lum, v2 = ip[x][0]-lum;   /* chroma-ish */
+                    float u2 = u*c1 - v2*s1, w2 = u*s1 + v2*c1;  /* rotate */
+                    float nr = lum+u2, nb = lum+w2, ng = lum-(u2+w2)*0.4f;
+                    ip[x][0]=(uchar)(ip[x][0]+(clamp_int_u8((int)nb)-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(clamp_int_u8((int)ng)-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(clamp_int_u8((int)nr)-ip[x][2])*a);
                 }
             }
             return;
@@ -4391,6 +5025,726 @@ void cv_fx_speedlines(unsigned char *data, int w, int h, int stride,
     }
 }
 
+/* ── enhance: retinex-style low-light rescue ────────────────────
+ * out = in / blurred_illumination — recovers shadows the way the eye
+ * does, plus gray-world white balance and shadow denoise. */
+void cv_fx_enhance(unsigned char *data, int w, int h, int stride,
+                   float strength, float denoise)
+{
+    if (!data || w < 32 || h < 32) return;
+    if (strength <= 0.0f) strength = 1.0f;
+    if (strength < 0.2f) strength = 0.2f;
+    if (strength > 2.0f) strength = 2.0f;
+    if (denoise < 0.0f) denoise = 0.0f;
+    if (denoise > 1.0f) denoise = 1.0f;
+    try {
+        cv::Mat img(h, w, CV_8UC3, data, stride);
+        /* illumination estimate: heavy blur of luma at quarter res */
+        cv::Mat q, luma(h/4, w/4, CV_32F);
+        cv::resize(img, q, cv::Size(w/4, h/4), 0, 0, cv::INTER_AREA);
+        double mb = 0, mg = 0, mr = 0;
+        for (int y = 0; y < q.rows; y++) {
+            const cv::Vec3b *p2 = q.ptr<cv::Vec3b>(y);
+            float *lp = luma.ptr<float>(y);
+            for (int x = 0; x < q.cols; x++) {
+                lp[x] = (p2[x][0]*0.114f+p2[x][1]*0.587f+p2[x][2]*0.299f)/255.f;
+                mb += p2[x][0]; mg += p2[x][1]; mr += p2[x][2];
+            }
+        }
+        double N = (double)q.rows * q.cols;
+        mb/=N; mg/=N; mr/=N;
+        double avg = (mb+mg+mr)/3.0 + 1e-3;
+        float wbB = (float)std::min(1.25, std::max(0.8, avg/(mb+1e-3)));
+        float wbG = (float)std::min(1.25, std::max(0.8, avg/(mg+1e-3)));
+        float wbR = (float)std::min(1.25, std::max(0.8, avg/(mr+1e-3)));
+        cv::GaussianBlur(luma, luma, cv::Size(0,0), 14.0);
+        cv::Mat illum;
+        cv::resize(luma, illum, img.size(), 0, 0, cv::INTER_LINEAR);
+        cv::Mat soft;
+        if (denoise > 0.01f)
+            cv::GaussianBlur(img, soft, cv::Size(0,0), 1.5);
+        for (int y = 0; y < h; y++) {
+            const float *il = illum.ptr<float>(y);
+            const cv::Vec3b *sp = soft.empty() ? NULL : soft.ptr<cv::Vec3b>(y);
+            cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < w; x++) {
+                float L2 = il[x];
+                /* retinex gain: dark regions lifted toward mid gray */
+                float gain = (0.45f + 0.1f*strength) / (L2 + 0.06f);
+                gain = 1.0f + (gain - 1.0f) * strength * 0.8f;
+                if (gain < 1.0f) gain = 1.0f;
+                if (gain > 4.5f) gain = 4.5f;
+                float dark = 1.0f - std::min(1.0f, L2*2.2f);
+                for (int c2 = 0; c2 < 3; c2++) {
+                    float v = ip[x][c2];
+                    if (sp) v += (sp[x][c2]-v) * denoise * dark;   /* shadow DN */
+                    float wb2 = c2==0?wbB:(c2==1?wbG:wbR);
+                    v = v * gain * wb2;
+                    /* soft shoulder so highlights don't clip hard */
+                    if (v > 210) v = 210 + (v-210)*0.5f;
+                    ip[x][c2] = clamp_int_u8((int)v);
+                }
+            }
+        }
+    } catch (const std::exception &e) {
+        warn_once("enh_fail", std::string("enhance failed: ") + e.what());
+    }
+}
+
+/* ── posefx: BlazePose body landmarks via the ORT backend ──────── */
+struct PoseState {
+    std::string path;
+    int state = 0;
+    float lm[33][3];              /* x,y (frame px), visibility */
+    int have = 0;                 /* landmarks valid this session */
+    int good = 0;                 /* consecutive confident frames */
+    float trailx[2][24], traily[2][24];   /* wrist trails */
+    int trail_n = 0;
+    double ema_ms = 0;
+    int skip_left = 0;
+    unsigned tick = 0;
+    std::mutex mtx;
+};
+static PoseState g_pose_s;
+
+int cv_set_pose_model(const char *path)
+{
+    if (!path || !*path || !path_exists(path)) return 0;
+    std::lock_guard<std::mutex> l(g_pose_s.mtx);
+    g_pose_s.path = path;
+    g_pose_s.state = 0;
+    ort_pose_shutdown();
+    g_pose_s.have = 0;
+    return 1;
+}
+
+/* BlazePose-33 bone list */
+static const int POSE_BONES[][2] = {
+    {11,12},{11,13},{13,15},{12,14},{14,16},{11,23},{12,24},{23,24},
+    {23,25},{25,27},{24,26},{26,28},{0,11},{0,12}};
+
+void cv_fx_pose(unsigned char *data, int w, int h, int stride,
+                int mode, float fx)
+{
+    if (!data || w < 64 || h < 64) return;
+    if (mode < 0) mode = 0;
+    if (mode > 5) mode = 5;
+    if (fx <= 0.0f) fx = 1.0f;
+    if (fx < 0.2f) fx = 0.2f;
+    if (fx > 3.0f) fx = 3.0f;
+    if (!ort_available()) {
+        warn_once("pose_ort", "posefx needs the ONNX Runtime backend — "
+                  "vcam-setup --ort, then make OPENCV=1 ORT=1");
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> l(g_pose_s.mtx);
+        if (g_pose_s.state < 0) return;
+        if (g_pose_s.state == 0) {
+            std::string p = g_pose_s.path.empty()
+                ? model_dir() + "/pose_estimation_mediapipe_2023mar.onnx"
+                : g_pose_s.path;
+            if (!path_exists(p)) {
+                g_pose_s.state = -1;
+                warn_once("pose_model",
+                    "posefx: no pose model — run 'vcam-setup --models-pose'");
+                return;
+            }
+            if (!ort_pose_init(p.c_str())) { g_pose_s.state = -1; return; }
+            g_pose_s.state = 1;
+            warn_once("pose_on", "posefx: body landmarks live — vcam can "
+                      "see your skeleton now");
+        }
+        cv::Mat img(h, w, CV_8UC3, data, stride);
+        g_pose_s.tick++;
+        bool infer_now = !(g_pose_s.skip_left > 0 && g_pose_s.have);
+        if (infer_now) {
+            auto t0 = std::chrono::steady_clock::now();
+            /* body crop: from the face box when we have one (the crop
+             * convention BlazePose expects: whole body, square) */
+            int bx = 0, by = 0, bs = std::min(w, h);
+            {
+                std::lock_guard<std::mutex> fl(g_face.mtx);
+                const int TW = 320;
+                double fs = (img.cols > TW) ? (double)TW / img.cols : 1.0;
+                int dw = std::max(16, (int)(img.cols * fs));
+                int dh = std::max(16, (int)(img.rows * fs));
+                if (ensure_face(dw, dh)) {
+                    if (tick(g_face.counter) % INFER_EVERY == 0) {
+                        cv::Mat sm2; cv::resize(img, sm2, cv::Size(dw, dh));
+                        cv::Mat fc2; g_face.det->detect(sm2, fc2);
+                        fc2.copyTo(g_face.faces);
+                    }
+                }
+                if (!g_face.faces.empty()) {
+                    const float *ff = g_face.faces.ptr<float>(0);
+                    double iv2 = 1.0 / fs;
+                    int fx2 = (int)(ff[0]*iv2), fy2 = (int)(ff[1]*iv2);
+                    int fw2 = (int)(ff[2]*iv2), fh2 = (int)(ff[3]*iv2);
+                    /* size FIRST (clamped to what fits), THEN center on
+                     * the face — the old order shrank the box after
+                     * placing it, sliding you half out of the crop */
+                    int S = (int)(fw2 * 5.4f);
+                    if (S < h/3) S = h/3;
+                    bs = std::min(S, std::min(w, h));
+                    bx = fx2 + fw2/2 - bs/2;
+                    by = fy2 - (int)(fh2*0.9f);
+                } else {
+                    bs = std::min(w, h);
+                    bx = (w - bs)/2;
+                    by = 0;
+                }
+                bs = std::max(64, std::min(bs, std::min(w, h)));
+                bx = std::max(0, std::min(w - bs, bx));
+                by = std::max(0, std::min(h - bs, by));
+            }
+            cv::Mat crop = img(cv::Rect(bx, by, bs, bs));
+            cv::Mat small2, rgb;
+            cv::resize(crop, small2, cv::Size(256, 256), 0, 0, cv::INTER_AREA);
+            cv::cvtColor(small2, rgb, cv::COLOR_BGR2RGB);
+            std::vector<float> in((size_t)3*256*256);
+            for (int i = 0; i < 256*256; i++) {           /* NHWC [0,1] */
+                const cv::Vec3b &p2 = rgb.at<cv::Vec3b>(i/256, i%256);
+                in[(size_t)i*3+0] = p2[0]/255.0f;
+                in[(size_t)i*3+1] = p2[1]/255.0f;
+                in[(size_t)i*3+2] = p2[2]/255.0f;
+            }
+            float lm195[195], conf = 0;
+            if (!ort_pose_infer(in.data(), lm195, &conf)) {
+                g_pose_s.state = -1;
+                return;
+            }
+            if (conf < 0.0f || conf > 1.0f)               /* raw logit */
+                conf = 1.0f / (1.0f + std::exp(-conf));
+            if (conf >= 0.50f) {
+                float sx2 = (float)bs / 256.0f;
+                float nx2[33], ny2[33], nv2[33];
+                for (int k2 = 0; k2 < 33; k2++) {
+                    nx2[k2] = bx + lm195[k2*5+0] * sx2;
+                    ny2[k2] = by + lm195[k2*5+1] * sx2;
+                    nv2[k2] = 1.0f/(1.0f+std::exp(-lm195[k2*5+3]));
+                }
+                /* outlier rejection: if the whole set teleported, it's a
+                 * bad frame — don't let it through */
+                bool jumped = false;
+                if (g_pose_s.have) {
+                    float acc = 0;
+                    for (int k2 = 0; k2 < 33; k2++)
+                        acc += std::fabs(nx2[k2]-g_pose_s.lm[k2][0])
+                             + std::fabs(ny2[k2]-g_pose_s.lm[k2][1]);
+                    float allow = w * 0.10f * (1 + g_pose_s.skip_left);
+                    if (acc / 33.0f > std::max(w*0.18f, allow)) jumped = true;
+                }
+                if (jumped) {
+                    if (g_pose_s.good > 0) g_pose_s.good--;
+                } else {
+                    for (int k2 = 0; k2 < 33; k2++) {
+                        if (g_pose_s.have) {              /* EMA smooth */
+                            g_pose_s.lm[k2][0] += (nx2[k2]-g_pose_s.lm[k2][0])*0.35f;
+                            g_pose_s.lm[k2][1] += (ny2[k2]-g_pose_s.lm[k2][1])*0.35f;
+                            g_pose_s.lm[k2][2] += (nv2[k2]-g_pose_s.lm[k2][2])*0.35f;
+                        } else {
+                            g_pose_s.lm[k2][0]=nx2[k2];
+                            g_pose_s.lm[k2][1]=ny2[k2];
+                            g_pose_s.lm[k2][2]=nv2[k2];
+                        }
+                    }
+                    g_pose_s.have = 1;
+                    if (g_pose_s.good < 6) g_pose_s.good++;
+                }
+            } else {
+                if (g_pose_s.good > 0) g_pose_s.good--;
+                if (g_pose_s.good <= 0) { g_pose_s.good = 0; g_pose_s.have = 0; }
+            }
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+            g_pose_s.ema_ms = g_pose_s.ema_ms <= 0 ? ms
+                            : 0.7*g_pose_s.ema_ms + 0.3*ms;
+            g_pose_s.skip_left = (g_pose_s.ema_ms <= 30) ? 0
+                               : (g_pose_s.ema_ms <= 60) ? 1
+                               : (g_pose_s.ema_ms <= 110) ? 2 : 4;
+        } else {
+            g_pose_s.skip_left--;
+        }
+        if (!g_pose_s.have || g_pose_s.good < 2) return;   /* debounced */
+        float (*L)[3] = g_pose_s.lm;
+        auto P = [&](int i){ return cv::Point((int)L[i][0], (int)L[i][1]); };
+        auto vis = [&](int i){
+            return L[i][2] > 0.55f &&
+                   L[i][0] > -w*0.02f && L[i][0] < w*1.02f &&
+                   L[i][1] > -h*0.02f && L[i][1] < h*1.02f;   /* in frame */
+        };
+
+        if (mode == 1) img *= 0.28;                       /* neon bones: dark */
+        if (mode == 0 || mode == 1) {
+            /* SKELETON: glowing bones + joints over you (0) or in the
+             * dark (1). fx = glow size. */
+            float hue = g_pose_s.tick * 0.03f;
+            cv::Scalar col((std::sin(hue+4.19f)*.5f+.5f)*255,
+                           (std::sin(hue+2.09f)*.5f+.5f)*255,
+                           (std::sin(hue)*.5f+.5f)*255);
+            int th = std::max(2, (int)(4*fx));
+            for (unsigned b2 = 0; b2 < sizeof POSE_BONES/sizeof *POSE_BONES; b2++) {
+                int a2 = POSE_BONES[b2][0], c2 = POSE_BONES[b2][1];
+                if (!vis(a2) || !vis(c2)) continue;
+                cv::line(img, P(a2), P(c2), col*0.35, th+6, cv::LINE_AA);
+                cv::line(img, P(a2), P(c2), col, th, cv::LINE_AA);
+            }
+            for (int k2 = 0; k2 < 33; k2++)
+                if (vis(k2))
+                    cv::circle(img, P(k2), std::max(2,(int)(3*fx)),
+                               cv::Scalar(255,255,255), cv::FILLED, cv::LINE_AA);
+        } else if (mode == 2) {
+            /* ENERGY HANDS: charged orbs in your actual palms — bring
+             * your wrists together to merge them into one big charge. */
+            unsigned tk = g_pose_s.tick;
+            int wl2 = 15, wr2 = 16;
+            float dx = L[wl2][0]-L[wr2][0], dy = L[wl2][1]-L[wr2][1];
+            float d = std::sqrt(dx*dx + dy*dy);
+            bool merged = vis(wl2) && vis(wr2) && d < w*0.09f;
+            for (int s2 = 0; s2 < (merged ? 1 : 2); s2++) {
+                int i2 = s2 ? wr2 : wl2;
+                if (!vis(i2) && !merged) continue;
+                cv::Point c2 = merged
+                    ? cv::Point((int)((L[wl2][0]+L[wr2][0])/2),
+                                (int)((L[wl2][1]+L[wr2][1])/2))
+                    : P(i2);
+                float R = (merged ? w*0.075f : w*0.035f) * fx
+                        * (1.0f + 0.12f*std::sin(tk*0.25f + s2*2));
+                for (int g2 = 4; g2 >= 1; g2--)
+                    cv::circle(img, c2, (int)(R*g2/2.5f),
+                               cv::Scalar(255,140+g2*20,40), 2, cv::LINE_AA);
+                cv::circle(img, c2, (int)(R*0.45f),
+                           cv::Scalar(255,240,200), cv::FILLED, cv::LINE_AA);
+                for (int k2 = 0; k2 < 7; k2++) {          /* crackle */
+                    float aa = uhash(k2, tk/2, s2)*6.283f;
+                    float rr = R*(0.6f+0.5f*uhash(k2, tk/2, s2+9));
+                    cv::line(img, c2,
+                        {c2.x+(int)(std::cos(aa)*rr), c2.y+(int)(std::sin(aa)*rr)},
+                        cv::Scalar(255,220,120), 1, cv::LINE_AA);
+                }
+            }
+        } else if (mode == 4) {
+            /* LIGHT WINGS: glowing wings of light unfold from your
+             * shoulders, slowly beating. fx = span. */
+            unsigned tk = g_pose_s.tick;
+            if (vis(11) && vis(12)) {
+                float flap = 0.82f + 0.18f * std::sin(tk * 0.07f);
+                for (int s2 = 0; s2 < 2; s2++) {
+                    cv::Point sh = P(s2 ? 12 : 11);
+                    float dir = s2 ? 1.0f : -1.0f;
+                    float span = w * 0.16f * fx * flap;
+                    for (int fth = 0; fth < 7; fth++) {   /* feather strokes */
+                        float t2 = fth / 6.0f;
+                        float ang = -1.15f + t2 * 1.35f;  /* fan downward */
+                        float len = span * (1.0f - 0.45f*t2);
+                        cv::Point tip(sh.x + (int)(dir*std::cos(ang)*len),
+                                      sh.y + (int)(std::sin(ang)*len*0.9f));
+                        cv::Point mid(sh.x + (int)(dir*std::cos(ang-0.25f)*len*0.55f),
+                                      sh.y + (int)(std::sin(ang-0.25f)*len*0.5f));
+                        int br = (int)(200 - t2*90);
+                        cv::line(img, sh, mid, cv::Scalar(br, br, 255), 5, cv::LINE_AA);
+                        cv::line(img, mid, tip, cv::Scalar(br/2, br/2, 230), 3, cv::LINE_AA);
+                        cv::line(img, sh, mid, cv::Scalar(255,255,255), 1, cv::LINE_AA);
+                    }
+                }
+            }
+        } else if (mode == 5) {
+            /* PUPPET STRINGS: fine strings from above hold your head
+             * and hands — you're the marionette. */
+            unsigned tk = g_pose_s.tick;
+            int anchors[3] = {0, 15, 16};                 /* head, wrists */
+            for (int a2 = 0; a2 < 3; a2++) {
+                int j = anchors[a2];
+                if (!vis(j)) continue;
+                cv::Point p2 = P(j);
+                int topx = p2.x + (int)(std::sin(tk*0.04f + a2*2.1f) * 14);
+                cv::line(img, {topx, 0}, p2, cv::Scalar(220,220,225), 1, cv::LINE_AA);
+                cv::line(img, {topx+1, 0}, {p2.x+1, p2.y},
+                         cv::Scalar(120,120,125), 1, cv::LINE_AA);
+                /* little cross-bar at the top */
+                cv::line(img, {topx-14, 6}, {topx+14, 6},
+                         cv::Scalar(60,80,120), 4, cv::LINE_AA);
+            }
+        } else {
+            /* WRIST TRAILS: your hands write comet trails through the
+             * air — conduct, draw, dance. fx = trail thickness. */
+            int nT = 24;
+            if (g_pose_s.trail_n < nT) g_pose_s.trail_n++;
+            for (int s2 = 0; s2 < 2; s2++) {
+                for (int i2 = nT-1; i2 > 0; i2--) {
+                    g_pose_s.trailx[s2][i2] = g_pose_s.trailx[s2][i2-1];
+                    g_pose_s.traily[s2][i2] = g_pose_s.traily[s2][i2-1];
+                }
+                int wj = s2 ? 16 : 15;
+                g_pose_s.trailx[s2][0] = L[wj][0];
+                g_pose_s.traily[s2][0] = L[wj][1];
+                for (int i2 = 0; i2 < g_pose_s.trail_n-1; i2++) {
+                    float k2 = 1.0f - (float)i2/nT;
+                    cv::Scalar col = s2 ? cv::Scalar(80,160*k2,255*k2)
+                                        : cv::Scalar(255*k2,180*k2,60);
+                    cv::line(img,
+                        {(int)g_pose_s.trailx[s2][i2],(int)g_pose_s.traily[s2][i2]},
+                        {(int)g_pose_s.trailx[s2][i2+1],(int)g_pose_s.traily[s2][i2+1]},
+                        col, std::max(1,(int)(k2*7*fx)), cv::LINE_AA);
+                }
+            }
+        }
+    } catch (const std::exception &e) {
+        g_pose_s.state = -1;
+        warn_once("pose_fail", std::string("posefx failed: ") + e.what());
+    }
+}
+
+/* ── depthfx: monocular-depth effects via the ORT backend ──────── */
+struct DepthState {
+    std::string path;
+    int state = 0;                 /* 0 untried, 1 up, -1 dead */
+    cv::Mat map;                   /* full-size CV_32F, 0=far..1=near */
+    float lo = 0, hi = 1;          /* EMA-smoothed normalization range */
+    double ema_ms = 0;
+    int skip_left = 0;
+    unsigned tick = 0;
+    std::mutex mtx;
+};
+static DepthState g_depth;
+
+int cv_set_depth_model(const char *path)
+{
+    if (!path || !*path || !path_exists(path)) return 0;
+    std::lock_guard<std::mutex> l(g_depth.mtx);
+    g_depth.path = path;
+    g_depth.state = 0;
+    ort_depth_shutdown();
+    g_depth.map.release();
+    return 1;
+}
+
+void cv_fx_depth(unsigned char *data, int w, int h, int stride,
+                 int mode, float fx)
+{
+    if (!data || w < 64 || h < 64) return;
+    if (mode < 0) mode = 0;
+    if (mode > 3) mode = 3;
+    if (fx <= 0.0f) fx = 1.0f;
+    if (fx < 0.2f) fx = 0.2f;
+    if (fx > 3.0f) fx = 3.0f;
+    if (!ort_available()) {
+        warn_once("depth_ort", "depthfx needs the ONNX Runtime backend — "
+                  "vcam-setup --ort, then make OPENCV=1 ORT=1");
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> l(g_depth.mtx);
+        if (g_depth.state < 0) return;
+        if (g_depth.state == 0) {
+            std::string p = g_depth.path.empty()
+                ? model_dir() + "/model-small.onnx" : g_depth.path;
+            if (!path_exists(p)) {
+                g_depth.state = -1;
+                warn_once("depth_model",
+                    "depthfx: no depth model — run 'vcam-setup --models-depth' "
+                    "(MiDaS v2.1 small) or 'vcam-ctl filter depthmodel <path>'");
+                return;
+            }
+            if (!ort_depth_init(p.c_str())) { g_depth.state = -1; return; }
+            g_depth.state = 1;
+            warn_once("depth_on",
+                "depthfx: monocular depth live — every pixel now has a distance");
+        }
+        cv::Mat img(h, w, CV_8UC3, data, stride);
+        g_depth.tick++;
+        bool infer_now = !(g_depth.skip_left > 0 && !g_depth.map.empty()
+                           && g_depth.map.size() == img.size());
+        if (infer_now) {
+            auto t0 = std::chrono::steady_clock::now();
+            cv::Mat small2, rgb;
+            cv::resize(img, small2, cv::Size(256, 256), 0, 0, cv::INTER_AREA);
+            cv::cvtColor(small2, rgb, cv::COLOR_BGR2RGB);
+            std::vector<float> in((size_t)3*256*256), out((size_t)256*256);
+            for (int i = 0; i < 256*256; i++) {           /* RGB [0,1] CHW */
+                const cv::Vec3b &p2 = rgb.at<cv::Vec3b>(i/256, i%256);
+                in[0*65536+i] = p2[0]/255.0f;
+                in[1*65536+i] = p2[1]/255.0f;
+                in[2*65536+i] = p2[2]/255.0f;
+            }
+            if (!ort_depth_infer(in.data(), out.data())) {
+                g_depth.state = -1;
+                return;
+            }
+            /* normalize with EMA'd min/max so the scene doesn't flicker */
+            float mn = out[0], mx = out[0];
+            for (int i = 1; i < 65536; i++) {
+                if (out[i] < mn) mn = out[i];
+                if (out[i] > mx) mx = out[i];
+            }
+            if (g_depth.map.empty()) { g_depth.lo = mn; g_depth.hi = mx; }
+            g_depth.lo += (mn - g_depth.lo) * 0.15f;
+            g_depth.hi += (mx - g_depth.hi) * 0.15f;
+            float rng = std::max(1e-4f, g_depth.hi - g_depth.lo);
+            cv::Mat d256(256, 256, CV_32F);
+            for (int i = 0; i < 65536; i++) {
+                float v = (out[i] - g_depth.lo) / rng;
+                d256.at<float>(i/256, i%256) =
+                    v < 0 ? 0.0f : (v > 1 ? 1.0f : v);
+            }
+            cv::resize(d256, g_depth.map, img.size(), 0, 0, cv::INTER_LINEAR);
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+            g_depth.ema_ms = g_depth.ema_ms <= 0 ? ms
+                           : 0.7*g_depth.ema_ms + 0.3*ms;
+            g_depth.skip_left = (g_depth.ema_ms <= 30) ? 0
+                              : (g_depth.ema_ms <= 60) ? 1
+                              : (g_depth.ema_ms <= 110) ? 2 : 4;
+        } else {
+            g_depth.skip_left--;
+        }
+        if (g_depth.map.empty() || g_depth.map.size() != img.size()) return;
+        const cv::Mat &D = g_depth.map;               /* 1 = near, 0 = far */
+
+        if (mode == 0) {
+            /* DEPTH BLUR: true depth-of-field — blur grows with
+             * distance, continuously, no person mask needed. */
+            cv::Mat b1, b2;
+            cv::GaussianBlur(img, b1, cv::Size(0,0), 2.0 + 1.5*fx);
+            cv::GaussianBlur(b1, b2, cv::Size(0,0), 3.0 + 2.5*fx);
+            for (int y = 0; y < h; y++) {
+                const float *dd = D.ptr<float>(y);
+                const cv::Vec3b *p1 = b1.ptr<cv::Vec3b>(y);
+                const cv::Vec3b *p2 = b2.ptr<cv::Vec3b>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < w; x++) {
+                    float far2 = 1.0f - dd[x];            /* 0 near, 1 far */
+                    if (far2 < 0.25f) continue;           /* near: sharp */
+                    float k = (far2 - 0.25f) / 0.75f;
+                    const cv::Vec3b &src = (k > 0.55f) ? p2[x] : p1[x];
+                    float a = std::min(1.0f, k * 1.6f);
+                    ip[x][0]=(uchar)(ip[x][0]+(src[0]-ip[x][0])*a);
+                    ip[x][1]=(uchar)(ip[x][1]+(src[1]-ip[x][1])*a);
+                    ip[x][2]=(uchar)(ip[x][2]+(src[2]-ip[x][2])*a);
+                }
+            }
+        } else if (mode == 1) {
+            /* DEPTH FOG: atmosphere thickens with distance — the room
+             * recedes into haze the way real air does. */
+            for (int y = 0; y < h; y++) {
+                const float *dd = D.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < w; x++) {
+                    float k = (1.0f - dd[x]);
+                    k = k * k * 0.85f * std::min(1.5f, fx);
+                    if (k < 0.02f) continue;
+                    if (k > 0.9f) k = 0.9f;
+                    ip[x][0]=(uchar)(ip[x][0]+(205-ip[x][0])*k);
+                    ip[x][1]=(uchar)(ip[x][1]+(200-ip[x][1])*k);
+                    ip[x][2]=(uchar)(ip[x][2]+(190-ip[x][2])*k);
+                }
+            }
+        } else if (mode == 2) {
+            /* DEPTH VIEW: the raw superpower, colormapped — near glows
+             * warm, far falls to deep blue. */
+            for (int y = 0; y < h; y++) {
+                const float *dd = D.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < w; x++) {
+                    float v = dd[x];
+                    float r2 = std::min(1.0f, v*1.8f);
+                    float g2 = v > 0.5f ? (v-0.5f)*2.0f : v*0.6f;
+                    float b2 = std::max(0.0f, 1.0f - v*1.6f);
+                    ip[x][0]=(uchar)(b2*235);
+                    ip[x][1]=(uchar)(g2*225);
+                    ip[x][2]=(uchar)(r2*245);
+                }
+            }
+        } else {
+            /* PARALLAX WIGGLE: near pixels sway more than far ones —
+             * the fake-3D wiggle-gram, live. */
+            float ph = std::sin(g_depth.tick * 0.06f) * 7.0f * fx;
+            cv::Mat keep = img.clone();
+            for (int y = 0; y < h; y++) {
+                const float *dd = D.ptr<float>(y);
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < w; x++) {
+                    int sx2 = x + (int)(ph * (dd[x] - 0.45f));
+                    if (sx2 < 0) sx2 = 0;
+                    if (sx2 >= w) sx2 = w - 1;
+                    ip[x] = keep.at<cv::Vec3b>(y, sx2);
+                }
+            }
+        }
+    } catch (const std::exception &e) {
+        g_depth.state = -1;
+        warn_once("depth_fail", std::string("depthfx failed: ") + e.what());
+    }
+}
+
+/* ── genai: generic img2img via the ORT backend ────────────────── */
+struct GenAiState {
+    std::string path;         /* model file; empty = use default */
+    int state = 0;            /* 0 untried, 1 up, -1 dead */
+    cv::Mat last;             /* last transformed frame (full size) */
+    double ema_ms = 0;
+    int skip_left = 0;
+    std::mutex mtx;
+};
+static GenAiState g_genai;
+
+int cv_set_gen_model(const char *path)
+{
+    if (!path || !*path) return 0;
+    if (!path_exists(path)) return 0;
+    std::lock_guard<std::mutex> l(g_genai.mtx);
+    g_genai.path = path;
+    g_genai.state = 0;            /* (re)load lazily */
+    ort_i2i_shutdown();
+    g_genai.last.release();
+    return 1;
+}
+
+void cv_clear_gen_model(void)
+{
+    std::lock_guard<std::mutex> l(g_genai.mtx);
+    g_genai.path.clear();
+    g_genai.state = 0;
+    ort_i2i_shutdown();
+    g_genai.last.release();
+}
+
+void cv_fx_genai(unsigned char *data, int w, int h, int stride,
+                 float blend, float size, float range01)
+{
+    if (!data || w < 32 || h < 32) return;
+    bool r01 = range01 >= 0.5f;      /* p3=1: [0,1] convention (Zero-DCE etc.) */
+    if (blend <= 0.0f) blend = 1.0f;
+    if (blend < 0.2f) blend = 0.2f;
+    if (blend > 1.0f) blend = 1.0f;
+    int iw0 = (int)size;
+    if (iw0 <= 0) iw0 = 288;
+    if (iw0 < 128) iw0 = 128;
+    if (iw0 > 512) iw0 = 512;
+    if (!ort_available()) {
+        warn_once("genai_ort", "genai needs the ONNX Runtime backend — "
+                  "vcam-setup --ort, then make OPENCV=1 ORT=1");
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> l(g_genai.mtx);
+        if (g_genai.state < 0) return;
+        if (g_genai.state == 0) {
+            std::string p = g_genai.path.empty()
+                ? model_dir() + "/img2img.onnx" : g_genai.path;
+            if (!path_exists(p)) {
+                g_genai.state = -1;
+                warn_once("genai_model",
+                    "genai: no model — drop an img2img ONNX (e.g. AnimeGAN) "
+                    "at " + p + " or set one with "
+                    "'vcam-ctl filter genmodel <path>'");
+                return;
+            }
+            if (!ort_i2i_init(p.c_str())) { g_genai.state = -1; return; }
+            g_genai.state = 1;
+            warn_once("genai_on",
+                "genai: img2img model live on ONNX Runtime — "
+                "every frame is now the network's opinion of you");
+        }
+        cv::Mat img(h, w, CV_8UC3, data, stride);
+        bool infer_now = !(g_genai.skip_left > 0 && !g_genai.last.empty()
+                           && g_genai.last.size() == img.size());
+        if (infer_now) {
+            auto t0 = std::chrono::steady_clock::now();
+            int iw = std::max(64, (iw0/8)*8);
+            int ih = std::max(64, ((int)((double)iw*h/w)/8)*8);
+            cv::Mat small2, rgb;
+            cv::resize(img, small2, cv::Size(iw, ih), 0, 0, cv::INTER_AREA);
+            cv::cvtColor(small2, rgb, cv::COLOR_BGR2RGB);
+            int N = iw*ih;
+            std::vector<float> in((size_t)3*N), out((size_t)3*N);
+            if (ort_i2i_layout() == 1) {                  /* NHWC */
+                for (int i = 0; i < N; i++) {
+                    const cv::Vec3b &p2 = rgb.at<cv::Vec3b>(i/iw, i%iw);
+                    float d2 = r01 ? 255.0f : 127.5f, o2 = r01 ? 0.0f : 1.0f;
+                    in[(size_t)i*3+0] = p2[0]/d2 - o2;
+                    in[(size_t)i*3+1] = p2[1]/d2 - o2;
+                    in[(size_t)i*3+2] = p2[2]/d2 - o2;
+                }
+            } else {                                      /* NCHW */
+                for (int i = 0; i < N; i++) {
+                    const cv::Vec3b &p2 = rgb.at<cv::Vec3b>(i/iw, i%iw);
+                    float d2 = r01 ? 255.0f : 127.5f, o2 = r01 ? 0.0f : 1.0f;
+                    in[0*(size_t)N+i] = p2[0]/d2 - o2;
+                    in[1*(size_t)N+i] = p2[1]/d2 - o2;
+                    in[2*(size_t)N+i] = p2[2]/d2 - o2;
+                }
+            }
+            if (!ort_i2i_infer(in.data(), iw, ih, out.data())) {
+                g_genai.state = -1;
+                return;
+            }
+            cv::Mat res(ih, iw, CV_8UC3);
+            if (ort_i2i_layout() == 1) {
+                for (int i = 0; i < N; i++) {
+                    cv::Vec3b &p2 = res.at<cv::Vec3b>(i/iw, i%iw);
+                    float m2 = r01 ? 255.0f : 127.5f, a2 = r01 ? 0.0f : 1.0f;
+                    p2[2]=clamp_int_u8((int)((out[(size_t)i*3+0]+a2)*m2));
+                    p2[1]=clamp_int_u8((int)((out[(size_t)i*3+1]+a2)*m2));
+                    p2[0]=clamp_int_u8((int)((out[(size_t)i*3+2]+a2)*m2));
+                }
+            } else {
+                for (int i = 0; i < N; i++) {
+                    cv::Vec3b &p2 = res.at<cv::Vec3b>(i/iw, i%iw);
+                    float m2 = r01 ? 255.0f : 127.5f, a2 = r01 ? 0.0f : 1.0f;
+                    p2[2]=clamp_int_u8((int)((out[0*(size_t)N+i]+a2)*m2));
+                    p2[1]=clamp_int_u8((int)((out[1*(size_t)N+i]+a2)*m2));
+                    p2[0]=clamp_int_u8((int)((out[2*(size_t)N+i]+a2)*m2));
+                }
+            }
+            cv::resize(res, g_genai.last, img.size(), 0, 0, cv::INTER_LINEAR);
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+            g_genai.ema_ms = g_genai.ema_ms <= 0 ? ms
+                           : 0.7*g_genai.ema_ms + 0.3*ms;
+            g_genai.skip_left = (g_genai.ema_ms <= 30) ? 0
+                              : (g_genai.ema_ms <= 60) ? 1
+                              : (g_genai.ema_ms <= 110) ? 2 : 4;
+        } else {
+            g_genai.skip_left--;
+        }
+        if (!g_genai.last.empty() && g_genai.last.size() == img.size()) {
+            if (blend >= 0.99f) g_genai.last.copyTo(img);
+            else cv::addWeighted(g_genai.last, blend, img, 1.0-blend, 0, img);
+        }
+    } catch (const std::exception &e) {
+        g_genai.state = -1;
+        warn_once("genai_fail", std::string("genai failed: ") + e.what());
+    }
+}
+
+int cv_set_face_image(const char *path)
+{
+    if (!path || !*path) return 0;
+    try {
+        cv::Mat m = cv::imread(path, cv::IMREAD_UNCHANGED);
+        if (m.empty()) return 0;
+        if (m.channels() == 3)                  /* no alpha: make opaque */
+            cv::cvtColor(m, m, cv::COLOR_BGR2BGRA);
+        if (m.channels() != 4) return 0;
+        std::lock_guard<std::mutex> l(g_faceimg.mtx);
+        m.copyTo(g_faceimg.rgba);
+        return 1;
+    } catch (const std::exception &e) {
+        warn_once("faceimg", std::string("face image load failed: ") + e.what());
+        return 0;
+    }
+}
+
+void cv_clear_face_image(void)
+{
+    try {
+        std::lock_guard<std::mutex> l(g_faceimg.mtx);
+        g_faceimg.rgba.release();
+    } catch (...) { }
+}
+
 int cv_set_bg_image(const char *path)
 {
     if (!path || !*path) return 0;
@@ -4434,6 +5788,8 @@ void cv_shutdown(void)
           g_paint.mapx.release(); g_paint.mapy.release(); }
         { std::lock_guard<std::mutex> l(g_bgimg.mtx);
           g_bgimg.orig.release(); g_bgimg.scaled.release(); }
+        { std::lock_guard<std::mutex> l(g_faceimg.mtx);
+          g_faceimg.rgba.release(); }
     } catch (...) { /* shutdown must never throw */ }
 }
 

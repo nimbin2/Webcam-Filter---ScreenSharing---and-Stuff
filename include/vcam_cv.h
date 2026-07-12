@@ -144,6 +144,49 @@ void cv_fx_paintflow(unsigned char *data, int w, int h, int stride,
 void cv_fx_speedlines(unsigned char *data, int w, int h, int stride,
                       float sens, float density);
 
+/* posefx: BlazePose body landmarks (MediaPipe pose via ORT).
+ * Model: <models>/pose_estimation_mediapipe_2023mar.onnx
+ * (vcam-setup --models-pose) or 'filter posemodel <path>'.
+ * modes: 0 skeleton-glow, 1 neon-bones (dark room, glowing skeleton),
+ *        2 energy-hands (orbs in your palms; merge them!), 3 wrist-trails.
+ * fx = size/strength 0.2..3. */
+void cv_fx_pose(unsigned char *data, int w, int h, int stride,
+                int mode, float fx);
+int  cv_set_pose_model(const char *path);
+
+/* depthfx: effects driven by a monocular depth model (MiDaS v2.1
+ * small interface) on the ORT backend. Model at <models>/model-small.onnx
+ * (vcam-setup --models-depth) or set via 'filter depthmodel <path>'.
+ * modes: 0 depth-blur (true depth-of-field), 1 depth-fog,
+ *        2 depth-view (colormapped), 3 parallax-wiggle.
+ * fx = effect strength 0.2..3. Adaptive pacing keeps it live. */
+void cv_fx_depth(unsigned char *data, int w, int h, int stride,
+                 int mode, float fx);
+int  cv_set_depth_model(const char *path);
+
+/* genai: run a generic img2img ONNX model (AnimeGAN, CartoonGAN, any
+ * 1-in/1-out [-1,1] transformer) on the frame via the ORT backend.
+ * blend 0.2..1 (how much of the transformed image shows, def 1),
+ * size 128..512 (inference resolution, def 288). Model file is set
+ * with cv_set_gen_model() ('filter genmodel <path>'), defaulting to
+ * <models>/img2img.onnx if present. Adaptive pacing keeps it live. */
+void cv_fx_genai(unsigned char *data, int w, int h, int stride,
+                 float blend, float size, float range01);
+
+/* enhance: retinex low-light rescue (no model needed). strength
+ * 0.2..2 def 1; denoise 0..1 = shadow noise smoothing. */
+void cv_fx_enhance(unsigned char *data, int w, int h, int stride,
+                   float strength, float denoise);
+int  cv_set_gen_model(const char *path);
+void cv_clear_gen_model(void);
+
+/* Set the face-overlay image for facefx mode 24 (any PNG; alpha
+ * channel respected — an animal face with transparency tracks your
+ * head: scaled by face width, rotated by eye angle). Returns 1 on
+ * success. cv_clear_face_image() removes it. */
+int  cv_set_face_image(const char *path);
+void cv_clear_face_image(void);
+
 /* Set/replace the user background image used by cv_fx_bgblur mode 3
  * (person keeps the camera, background becomes this image, cover-
  * scaled). Returns 1 on success, 0 if the file can't be loaded.

@@ -225,7 +225,46 @@ if [ "${1:-}" = "ai" ]; then
     case "$T" in *soul*|*astral*|*spirit*) fadd "personfx 54" "astral soul";; esac
     case "$T" in *fog*|*mist*|*smoke*) fadd "personfx 55" "mystic fog";; esac
     case "$T" in *golden*|*ratio*|*davinci*|*"da vinci"*|*phi*) fadd "facefx 23" "golden ratio scan";; esac
+    case "$T" in *cat*|*dog*|*animal*|*tiger*|*bear*|*"face image"*|*mask*me*)
+        fadd "facefx 24" "face image overlay"
+        echo "  hint: set the image first ->  vcam-ctl filter faceimage /path/animal.png";; esac
     case "$T" in *fountain*|*erupt*) fadd "moodfx 7" "emotion fountain";; esac
+    case "$T" in *retro*|*sprite*|*pixel*game*|*8bit*|*"8-bit"*) fadd "personfx 66" "retro sprite";; esac
+    case "$T" in *acid*|*psychedelic*|*"hue cycle"*) fadd "personfx 67" "acid you";; esac
+    case "$T" in *ascii*|*terminal*) fadd "personfx 68" "ascii you";; esac
+    case "$T" in *halftone*|*newspaper*|*print*me*) fadd "personfx 69" "halftone print";; esac
+    case "$T" in *chrome*|*metal*|*t1000*|*terminator*) fadd "personfx 70" "liquid metal";; esac
+    case "$T" in *contour*|*stripe*) fadd "personfx 71" "contour stripes";; esac
+    case "$T" in *static*|*"signal lost"*|*"no signal"*) fadd "personfx 72" "static you";; esac
+    case "$T" in *gold*|*statue*|*trophy*|*oscar*) fadd "personfx 73" "golden statue";; esac
+    case "$T" in *comic*|*ink*) fadd "personfx 74" "comic ink";; esac
+    case "$T" in *venetian*|*blind*|*shutter*) fadd "personfx 75" "venetian";; esac
+    case "$T" in *burn*edge*|*smolder*|*ember*edge*) fadd "personfx 76" "burning edge";; esac
+    case "$T" in *"glass body"*|*glass*me*|*refract*) fadd "personfx 77" "glass body";; esac
+    case "$T" in *enhance*|*"bad light"*|*"fix light"*|*brighten*|*"low light"*|*"improve quality"*)
+        fadd "enhance 1 0.4" "low-light rescue";; esac
+    case "$T" in *blueprint*|*technical*) fadd "personfx 78" "blueprint";; esac
+    case "$T" in *brick*|*lego*|*tile*) fadd "personfx 79" "brick tiles";; esac
+    case "$T" in *silhouette*|*witness*|*anonymous*) fadd "personfx 80" "shadow caller";; esac
+    case "$T" in *"glow in"*|*luminous*|*radioactive*) fadd "personfx 81" "glow in dark";; esac
+    case "$T" in *graphite*|*pencil*me*|*sketch*me*) fadd "personfx 82" "graphite";; esac
+    case "$T" in *"pop poster"*|*warhol*|*screenprint*) fadd "personfx 83" "pop poster";; esac
+    case "$T" in *riso*|*misregist*|*"offset print"*) fadd "personfx 84" "riso outlines";; esac
+    case "$T" in *haze*|*shimmer*|*mirage*) fadd "personfx 85" "heat haze";; esac
+    case "$T" in *security*|*cctv*|*surveil*) fadd "personfx 86" "security cam";; esac
+    case "$T" in *negative*|*inverted*me*) fadd "personfx 87" "negative you";; esac
+    case "$T" in *skeleton*|*bones*) fadd "posefx 0" "skeleton";; esac
+    case "$T" in *"energy hands"*|*orb*|*"power up"*|*goku*) fadd "posefx 2" "energy hands";; esac
+    case "$T" in *"wrist trail"*|*conduct*|*"draw in air"*) fadd "posefx 3" "wrist trails";; esac
+    case "$T" in *wing*|*angel*wing*) fadd "posefx 4" "light wings";; esac
+    case "$T" in *puppet*|*marionette*|*string*) fadd "posefx 5" "puppet strings";; esac
+    case "$T" in *"depth of field"*|*dof*|*"real bokeh"*) fadd "depthfx 0" "true depth-of-field";; esac
+    case "$T" in *"depth fog"*|*haze*|*atmosphere*) fadd "depthfx 1" "depth fog";; esac
+    case "$T" in *"depth view"*|*"depth map"*|*distance*) fadd "depthfx 2" "depth view";; esac
+    case "$T" in *parallax*|*wiggle*|*"3d effect"*) fadd "depthfx 3" "parallax wiggle";; esac
+    case "$T" in *anime*|*toon*|*cartoon*me*|*gan*|*"neural transform"*)
+        fadd "genai 1" "neural img2img"
+        echo "  hint: needs a model ->  vcam-ctl filter genmodel /path/animegan.onnx";; esac
     case "$T" in *"color pop"*|*colorpop*|*"black and white"*) fadd "personfx 56" "color pop";; esac
     case "$T" in *cinema*|*movie*|*film*) fadd "personfx 57" "cinema grade";; esac
     case "$T" in *bokeh*) fadd "personfx 58" "bokeh pro";; esac

@@ -29,6 +29,10 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     echo "  vcam-setup --models-style    download the 5 neural style transfer models"
     echo "  vcam-setup --models-rvm      download RVM video matting (best personfx quality)"
     echo "  vcam-setup --ort             download ONNX Runtime (runs RVM correctly)"
+    echo "  vcam-setup --models-anime [ghibli|hayao|shinkai]"
+    echo "                               download an AnimeGAN img2img model for 'genai'"
+    echo "  vcam-setup --models-depth    download MiDaS v2.1 small (depthfx: every pixel gets a distance)"
+    echo "  vcam-setup --models-pose     download BlazePose landmarks (posefx: skeleton/energy-hands)"
     exit 0
 fi
 
@@ -94,6 +98,116 @@ if [ "${1:-}" = "--models" ]; then
         echo "If you built without OpenCV, rebuild with:  make OPENCV=1 && sudo make install"
     fi
     exit "$rc"
+fi
+
+# ── BlazePose landmarks for the 'posefx' filter ──────────────
+# OpenCV-zoo export, same host that serves our face/seg/FER models.
+if [ "${1:-}" = "--models-pose" ]; then
+    MODELS_DIR="${VCAM_MODELS_DIR:-$HOME/.local/share/vcam/models}"
+    mkdir -p "$MODELS_DIR" || { echo "Error: cannot create $MODELS_DIR" >&2; exit 1; }
+    DEST="$MODELS_DIR/pose_estimation_mediapipe_2023mar.onnx"
+    U="https://huggingface.co/opencv/pose_estimation_mediapipe/resolve/main/pose_estimation_mediapipe_2023mar.onnx"
+    if [ -s "$DEST" ]; then
+        echo "already present: $DEST"
+    else
+        if command -v curl >/dev/null 2>&1; then DL="curl -fL --retry 3 -o";
+        elif command -v wget >/dev/null 2>&1; then DL="wget -O"; else
+            echo "Error: need curl or wget." >&2; exit 1; fi
+        echo "downloading BlazePose landmarks (~5 MB) ..."
+        # shellcheck disable=SC2086
+        if $DL "$DEST" "$U" && [ -s "$DEST" ] \
+           && [ "$(wc -c < "$DEST")" -gt 1000000 ]; then
+            echo "ok: $DEST"
+        else
+            rm -f "$DEST"; echo "FAILED to download $U" >&2; exit 1
+        fi
+    fi
+    echo ""
+    echo "Use it:"
+    echo "    vcam-ctl filter add posefx 2       # energy orbs in your palms"
+    echo "    vcam-ctl filter add posefx 0       # glowing skeleton"
+    exit 0
+fi
+
+# ── MiDaS depth model for the 'depthfx' filter ───────────────
+# Official release asset, URL taken from the MiDaS repo's own docs
+# (github.com/isl-org/MiDaS, tag v2_1). ~64 MB.
+if [ "${1:-}" = "--models-depth" ]; then
+    MODELS_DIR="${VCAM_MODELS_DIR:-$HOME/.local/share/vcam/models}"
+    mkdir -p "$MODELS_DIR" || { echo "Error: cannot create $MODELS_DIR" >&2; exit 1; }
+    DEST="$MODELS_DIR/model-small.onnx"
+    U="https://github.com/isl-org/MiDaS/releases/download/v2_1/model-small.onnx"
+    if [ -s "$DEST" ]; then
+        echo "already present: $DEST"
+    else
+        if command -v curl >/dev/null 2>&1; then DL="curl -fL --retry 3 -o";
+        elif command -v wget >/dev/null 2>&1; then DL="wget -O"; else
+            echo "Error: need curl or wget." >&2; exit 1; fi
+        echo "downloading MiDaS v2.1 small ..."
+        # shellcheck disable=SC2086
+        if $DL "$DEST" "$U" && [ -s "$DEST" ] \
+           && [ "$(wc -c < "$DEST")" -gt 1000000 ]; then
+            echo "ok: $DEST"
+        else
+            rm -f "$DEST"
+            echo "FAILED to download $U" >&2; exit 1
+        fi
+    fi
+    echo ""
+    echo "Use it:"
+    echo "    vcam-ctl filter add depthfx 0      # true depth-of-field"
+    echo "    vcam-ctl filter add depthfx 3      # 3D parallax wiggle"
+    exit 0
+fi
+
+# ── AnimeGAN img2img models for the 'genai' neural filter ────
+# Official AnimeGANv3 releases (github.com/TachibanaYoshino/AnimeGANv3).
+# Their documented I/O convention (RGB, /127.5-1, sizes %8==0) is
+# exactly what vcam's genai engine implements. The Ghibli asset's URL
+# is taken from the project's own docs; for the others we probe a few
+# plausible release tags, since assets are spread across releases.
+if [ "${1:-}" = "--models-anime" ]; then
+    STYLE="${2:-ghibli}"
+    case "$STYLE" in
+        ghibli)  ASSET="AnimeGANv3_large_Ghibli_c1_e299.onnx"; TAGS="1.0 v1.0" ;;
+        hayao)   ASSET="AnimeGANv3_Hayao_36.onnx";  TAGS="v1.1.0 1.1.0 v1.0 1.0" ;;
+        shinkai) ASSET="AnimeGANv3_Shinkai_37.onnx"; TAGS="v1.1.0 1.1.0 v1.0 1.0" ;;
+        *) echo "Error: style must be ghibli, hayao, or shinkai" >&2; exit 1 ;;
+    esac
+    MODELS_DIR="${VCAM_MODELS_DIR:-$HOME/.local/share/vcam/models}"
+    mkdir -p "$MODELS_DIR" || { echo "Error: cannot create $MODELS_DIR" >&2; exit 1; }
+    DEST="$MODELS_DIR/$ASSET"
+    if [ -s "$DEST" ]; then
+        echo "already present: $DEST"
+    else
+        if command -v curl >/dev/null 2>&1; then DL="curl -fL --retry 2 -o";
+        elif command -v wget >/dev/null 2>&1; then DL="wget -O";
+        else echo "Error: need curl or wget." >&2; exit 1; fi
+        GOT=""
+        for TAG in $TAGS; do
+            U="https://github.com/TachibanaYoshino/AnimeGANv3/releases/download/$TAG/$ASSET"
+            echo "trying $U ..."
+            # shellcheck disable=SC2086
+            if $DL "$DEST" "$U" 2>/dev/null && [ -s "$DEST" ] \
+               && [ "$(wc -c < "$DEST")" -gt 1000000 ]; then
+                GOT=1; break
+            fi
+            rm -f "$DEST"
+        done
+        if [ -z "$GOT" ]; then
+            echo "FAILED — the asset may live under a different release tag." >&2
+            echo "Browse https://github.com/TachibanaYoshino/AnimeGANv3/releases ," >&2
+            echo "download any .onnx, then:  vcam-ctl filter genmodel /path/to/it" >&2
+            exit 1
+        fi
+        echo "ok: $DEST"
+    fi
+    echo ""
+    echo "Use it:"
+    echo "    vcam-ctl filter genmodel $DEST"
+    echo "    vcam-ctl filter add genai          # full anime transform"
+    echo "    vcam-ctl filter set 0 p2 224       # smaller = faster if laggy"
+    exit 0
 fi
 
 # ── ONNX Runtime: the backend that runs RVM correctly ────────

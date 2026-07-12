@@ -257,6 +257,367 @@ cleanup:
     return ret;
 }
 
+/* ── BlazePose landmarks (MediaPipe pose, OpenCV-zoo export):
+ * input [1,256,256,3] RGB [0,1] NHWC; outputs selected by element
+ * count: 195 floats = 39 landmarks x (x,y,z,vis,pres), 1 float =
+ * person-presence confidence. ── */
+static OrtSession *g_pose;
+static char g_pose_in[128];
+static char g_pose_outs[8][128];
+static size_t g_pose_nout = 0;
+static int g_pose_dead = 0;
+
+int ort_pose_init(const char *model_path)
+{
+    if (!model_path || !*model_path) return 0;
+    pthread_mutex_lock(&g_mtx);
+    if (g_pose) { pthread_mutex_unlock(&g_mtx); return 1; }
+    g_pose_dead = 0;
+    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!A) goto fail;
+    if (!g_env && !ok(A->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "vcam", &g_env),
+                      "CreateEnv")) goto fail;
+    if (!g_so) {
+        if (!ok(A->CreateSessionOptions(&g_so), "CreateSessionOptions")) goto fail;
+        if (!ok(A->SetSessionGraphOptimizationLevel(g_so, ORT_ENABLE_ALL),
+                "SetGraphOptimizationLevel")) goto fail;
+    }
+    if (!g_mi && !ok(A->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
+                     &g_mi), "CreateCpuMemoryInfo")) goto fail;
+    if (!g_alloc && !ok(A->GetAllocatorWithDefaultOptions(&g_alloc),
+                        "GetAllocator")) goto fail;
+    if (!ok(A->CreateSession(g_env, model_path, g_so, &g_pose),
+            "CreateSession(pose)")) goto fail;
+    {
+        size_t nin = 0;
+        if (!ok(A->SessionGetInputCount(g_pose, &nin), "pose InCount") ||
+            nin != 1 ||
+            !ok(A->SessionGetOutputCount(g_pose, &g_pose_nout), "pose OutCount") ||
+            g_pose_nout < 2 || g_pose_nout > 8) {
+            fprintf(stderr, "[vcam/ort] unexpected pose model interface\n");
+            A->ReleaseSession(g_pose); g_pose = NULL; goto fail;
+        }
+        char *nm = NULL;
+        if (!ok(A->SessionGetInputName(g_pose, 0, g_alloc, &nm), "pose InName"))
+            { A->ReleaseSession(g_pose); g_pose = NULL; goto fail; }
+        snprintf(g_pose_in, sizeof g_pose_in, "%s", nm);
+        if (!ok(A->AllocatorFree(g_alloc, nm), "free")) { }
+        for (size_t i = 0; i < g_pose_nout; i++) {
+            if (!ok(A->SessionGetOutputName(g_pose, i, g_alloc, &nm), "pose OutName"))
+                { A->ReleaseSession(g_pose); g_pose = NULL; goto fail; }
+            snprintf(g_pose_outs[i], sizeof g_pose_outs[i], "%s", nm);
+            if (!ok(A->AllocatorFree(g_alloc, nm), "free")) { }
+        }
+    }
+    fprintf(stderr, "[vcam/ort] pose model ready (%zu outputs)\n", g_pose_nout);
+    pthread_mutex_unlock(&g_mtx);
+    return 1;
+fail:
+    g_pose_dead = 1;
+    pthread_mutex_unlock(&g_mtx);
+    return 0;
+}
+
+int ort_pose_infer(const float *rgb_nhwc_256, float *landmarks195, float *conf1)
+{
+    if (!rgb_nhwc_256 || !landmarks195 || !conf1) return 0;
+    pthread_mutex_lock(&g_mtx);
+    if (!g_pose || g_pose_dead) { pthread_mutex_unlock(&g_mtx); return 0; }
+    OrtValue *iv = NULL, *outs[8] = {0};
+    const char *names[8];
+    int ret = 0;
+    {
+        for (size_t i = 0; i < g_pose_nout; i++) names[i] = g_pose_outs[i];
+        const int64_t shp[4] = {1, 256, 256, 3};
+        if (!ok(A->CreateTensorWithDataAsOrtValue(g_mi, (void *)rgb_nhwc_256,
+                    (size_t)3*256*256*sizeof(float), shp, 4,
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &iv),
+                "pose CreateTensor")) goto done_dead;
+        const OrtValue *ivs[1] = {iv};
+        const char *ins[1] = {g_pose_in};
+        if (!ok(A->Run(g_pose, NULL, ins, ivs, 1, names, g_pose_nout, outs),
+                "pose Run")) goto done_dead;
+        int got_lm = 0, got_cf = 0;
+        for (size_t i = 0; i < g_pose_nout; i++) {
+            OrtTensorTypeAndShapeInfo *sh = NULL;
+            size_t cnt = 0;
+            if (!ok(A->GetTensorTypeAndShape(outs[i], &sh), "pose Shape"))
+                goto done_dead;
+            int sok = ok(A->GetTensorShapeElementCount(sh, &cnt), "pose Count");
+            A->ReleaseTensorTypeAndShapeInfo(sh);
+            if (!sok) goto done_dead;
+            float *p = NULL;
+            if (cnt == 195 && !got_lm) {
+                if (!ok(A->GetTensorMutableData(outs[i], (void **)&p), "pose LM"))
+                    goto done_dead;
+                memcpy(landmarks195, p, 195*sizeof(float));
+                got_lm = 1;
+            } else if (cnt == 1 && !got_cf) {
+                if (!ok(A->GetTensorMutableData(outs[i], (void **)&p), "pose CF"))
+                    goto done_dead;
+                *conf1 = p[0];
+                got_cf = 1;
+            }
+        }
+        if (!got_lm || !got_cf) {
+            fprintf(stderr, "[vcam/ort] pose outputs missing landmarks/conf\n");
+            goto done_dead;
+        }
+        ret = 1;
+        goto done;
+    }
+done_dead:
+    g_pose_dead = 1;
+    fprintf(stderr, "[vcam/ort] pose backend disabled after error\n");
+done:
+    if (iv) A->ReleaseValue(iv);
+    for (size_t i = 0; i < g_pose_nout; i++)
+        if (outs[i]) A->ReleaseValue(outs[i]);
+    pthread_mutex_unlock(&g_mtx);
+    return ret;
+}
+
+void ort_pose_shutdown(void)
+{
+    pthread_mutex_lock(&g_mtx);
+    if (g_pose) { A->ReleaseSession(g_pose); g_pose = NULL; }
+    g_pose_dead = 0;
+    pthread_mutex_unlock(&g_mtx);
+}
+
+/* ── monocular depth (MiDaS-small interface): fixed [1,3,256,256]
+ * RGB [0,1] in -> [1,256,256] (or [1,1,256,256]) inverse depth out. ── */
+static OrtSession *g_dep;
+static char g_dep_in[128], g_dep_out[128];
+static int g_dep_dead = 0;
+
+int ort_depth_init(const char *model_path)
+{
+    if (!model_path || !*model_path) return 0;
+    pthread_mutex_lock(&g_mtx);
+    if (g_dep) { pthread_mutex_unlock(&g_mtx); return 1; }
+    g_dep_dead = 0;
+    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!A) goto fail;
+    if (!g_env && !ok(A->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "vcam", &g_env),
+                      "CreateEnv")) goto fail;
+    if (!g_so) {
+        if (!ok(A->CreateSessionOptions(&g_so), "CreateSessionOptions")) goto fail;
+        if (!ok(A->SetSessionGraphOptimizationLevel(g_so, ORT_ENABLE_ALL),
+                "SetGraphOptimizationLevel")) goto fail;
+    }
+    if (!g_mi && !ok(A->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
+                     &g_mi), "CreateCpuMemoryInfo")) goto fail;
+    if (!g_alloc && !ok(A->GetAllocatorWithDefaultOptions(&g_alloc),
+                        "GetAllocator")) goto fail;
+    if (!ok(A->CreateSession(g_env, model_path, g_so, &g_dep),
+            "CreateSession(depth)")) goto fail;
+    {
+        size_t nin = 0, nout = 0;
+        if (!ok(A->SessionGetInputCount(g_dep, &nin), "depth InCount") ||
+            !ok(A->SessionGetOutputCount(g_dep, &nout), "depth OutCount") ||
+            nin != 1 || nout != 1) {
+            fprintf(stderr, "[vcam/ort] depth model must be 1-in/1-out\n");
+            A->ReleaseSession(g_dep); g_dep = NULL; goto fail;
+        }
+        char *nm = NULL;
+        if (!ok(A->SessionGetInputName(g_dep, 0, g_alloc, &nm), "depth InName"))
+            { A->ReleaseSession(g_dep); g_dep = NULL; goto fail; }
+        snprintf(g_dep_in, sizeof g_dep_in, "%s", nm);
+        if (!ok(A->AllocatorFree(g_alloc, nm), "free")) { }
+        if (!ok(A->SessionGetOutputName(g_dep, 0, g_alloc, &nm), "depth OutName"))
+            { A->ReleaseSession(g_dep); g_dep = NULL; goto fail; }
+        snprintf(g_dep_out, sizeof g_dep_out, "%s", nm);
+        if (!ok(A->AllocatorFree(g_alloc, nm), "free")) { }
+    }
+    fprintf(stderr, "[vcam/ort] depth model ready ('%s'->'%s')\n",
+            g_dep_in, g_dep_out);
+    pthread_mutex_unlock(&g_mtx);
+    return 1;
+fail:
+    g_dep_dead = 1;
+    pthread_mutex_unlock(&g_mtx);
+    return 0;
+}
+
+int ort_depth_infer(const float *rgb_chw_256, float *depth_out_65536)
+{
+    if (!rgb_chw_256 || !depth_out_65536) return 0;
+    pthread_mutex_lock(&g_mtx);
+    if (!g_dep || g_dep_dead) { pthread_mutex_unlock(&g_mtx); return 0; }
+    OrtValue *iv = NULL, *ov = NULL;
+    int ret = 0;
+    {
+        const int64_t shp[4] = {1, 3, 256, 256};
+        if (!ok(A->CreateTensorWithDataAsOrtValue(g_mi, (void *)rgb_chw_256,
+                    (size_t)3*256*256*sizeof(float), shp, 4,
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &iv),
+                "depth CreateTensor")) goto done_dead;
+        const char *ins[1] = {g_dep_in}, *outs2[1] = {g_dep_out};
+        const OrtValue *ivs[1] = {iv};
+        if (!ok(A->Run(g_dep, NULL, ins, ivs, 1, outs2, 1, &ov), "depth Run"))
+            goto done_dead;
+        OrtTensorTypeAndShapeInfo *sh = NULL;
+        size_t cnt = 0;
+        if (!ok(A->GetTensorTypeAndShape(ov, &sh), "depth OutShape"))
+            goto done_dead;
+        int sok = ok(A->GetTensorShapeElementCount(sh, &cnt), "depth Count");
+        A->ReleaseTensorTypeAndShapeInfo(sh);
+        if (!sok || cnt != (size_t)256*256) {
+            fprintf(stderr, "[vcam/ort] depth output must be 256x256\n");
+            goto done_dead;
+        }
+        float *p = NULL;
+        if (!ok(A->GetTensorMutableData(ov, (void **)&p), "depth OutData"))
+            goto done_dead;
+        memcpy(depth_out_65536, p, (size_t)256*256*sizeof(float));
+        ret = 1;
+        goto done;
+    }
+done_dead:
+    g_dep_dead = 1;
+    fprintf(stderr, "[vcam/ort] depth backend disabled after error\n");
+done:
+    if (iv) A->ReleaseValue(iv);
+    if (ov) A->ReleaseValue(ov);
+    pthread_mutex_unlock(&g_mtx);
+    return ret;
+}
+
+void ort_depth_shutdown(void)
+{
+    pthread_mutex_lock(&g_mtx);
+    if (g_dep) { A->ReleaseSession(g_dep); g_dep = NULL; }
+    if (g_pose) { A->ReleaseSession(g_pose); g_pose = NULL; }
+    g_dep_dead = 0;
+    pthread_mutex_unlock(&g_mtx);
+}
+
+/* ── generic img2img (single input, single output, dynamic H/W) ── */
+static OrtSession *g_i2i;
+static char g_i2i_in[128], g_i2i_out[128];
+static int g_i2i_nhwc = 0, g_i2i_dead = 0;
+
+int ort_i2i_layout(void) { return g_i2i_nhwc; }
+
+int ort_i2i_init(const char *model_path)
+{
+    if (!model_path || !*model_path) return 0;
+    pthread_mutex_lock(&g_mtx);
+    if (g_i2i) { pthread_mutex_unlock(&g_mtx); return 1; }
+    g_i2i_dead = 0;
+    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!A) goto fail;
+    if (!g_env && !ok(A->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "vcam", &g_env),
+                      "CreateEnv")) goto fail;
+    if (!g_so) {
+        if (!ok(A->CreateSessionOptions(&g_so), "CreateSessionOptions")) goto fail;
+        if (!ok(A->SetSessionGraphOptimizationLevel(g_so, ORT_ENABLE_ALL),
+                "SetGraphOptimizationLevel")) goto fail;
+    }
+    if (!g_mi && !ok(A->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
+                     &g_mi), "CreateCpuMemoryInfo")) goto fail;
+    if (!g_alloc && !ok(A->GetAllocatorWithDefaultOptions(&g_alloc),
+                        "GetAllocator")) goto fail;
+    if (!ok(A->CreateSession(g_env, model_path, g_so, &g_i2i),
+            "CreateSession(i2i)")) goto fail;
+    {
+        size_t nin = 0, nout = 0;
+        if (!ok(A->SessionGetInputCount(g_i2i, &nin), "i2i InputCount") ||
+            !ok(A->SessionGetOutputCount(g_i2i, &nout), "i2i OutputCount") ||
+            nin != 1 || nout != 1) {
+            fprintf(stderr, "[vcam/ort] img2img model must have exactly "
+                            "1 input and 1 output (has %zu/%zu)\n", nin, nout);
+            A->ReleaseSession(g_i2i); g_i2i = NULL; goto fail;
+        }
+        char *nm = NULL;
+        if (!ok(A->SessionGetInputName(g_i2i, 0, g_alloc, &nm), "i2i InName"))
+            { A->ReleaseSession(g_i2i); g_i2i = NULL; goto fail; }
+        snprintf(g_i2i_in, sizeof g_i2i_in, "%s", nm);
+        if (!ok(A->AllocatorFree(g_alloc, nm), "free")) { }
+        if (!ok(A->SessionGetOutputName(g_i2i, 0, g_alloc, &nm), "i2i OutName"))
+            { A->ReleaseSession(g_i2i); g_i2i = NULL; goto fail; }
+        snprintf(g_i2i_out, sizeof g_i2i_out, "%s", nm);
+        if (!ok(A->AllocatorFree(g_alloc, nm), "free")) { }
+        /* layout: channels dim == 3 at index 1 -> NCHW, at 3 -> NHWC */
+        OrtTypeInfo *ti = NULL;
+        const OrtTensorTypeAndShapeInfo *sh = NULL;
+        int64_t dims[8] = {0}; size_t nd = 0;
+        if (ok(A->SessionGetInputTypeInfo(g_i2i, 0, &ti), "i2i TypeInfo") &&
+            ok(A->CastTypeInfoToTensorInfo(ti, &sh), "i2i Cast") &&
+            ok(A->GetDimensionsCount(sh, &nd), "i2i DimCount") && nd == 4 &&
+            ok(A->GetDimensions(sh, dims, nd), "i2i Dims")) {
+            g_i2i_nhwc = (dims[3] == 3) ? 1 : 0;
+        } else {
+            g_i2i_nhwc = 0;   /* dynamic everywhere: NCHW is the safer bet */
+        }
+        if (ti) A->ReleaseTypeInfo(ti);
+    }
+    fprintf(stderr, "[vcam/ort] img2img model ready (io '%s'->'%s', %s)\n",
+            g_i2i_in, g_i2i_out, g_i2i_nhwc ? "NHWC" : "NCHW");
+    pthread_mutex_unlock(&g_mtx);
+    return 1;
+fail:
+    g_i2i_dead = 1;
+    pthread_mutex_unlock(&g_mtx);
+    return 0;
+}
+
+int ort_i2i_infer(const float *in, int w, int h, float *out)
+{
+    if (!in || !out || w < 16 || h < 16) return 0;
+    pthread_mutex_lock(&g_mtx);
+    if (!g_i2i || g_i2i_dead) { pthread_mutex_unlock(&g_mtx); return 0; }
+    OrtValue *iv = NULL, *ov = NULL;
+    int ret = 0;
+    {
+        int64_t shp[4];
+        if (g_i2i_nhwc) { shp[0]=1; shp[1]=h; shp[2]=w; shp[3]=3; }
+        else            { shp[0]=1; shp[1]=3; shp[2]=h; shp[3]=w; }
+        if (!ok(A->CreateTensorWithDataAsOrtValue(g_mi, (void *)in,
+                    (size_t)3*w*h*sizeof(float), shp, 4,
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &iv),
+                "i2i CreateTensor")) goto done_dead;
+        const char *ins[1] = {g_i2i_in}, *outs2[1] = {g_i2i_out};
+        const OrtValue *ivs[1] = {iv};
+        if (!ok(A->Run(g_i2i, NULL, ins, ivs, 1, outs2, 1, &ov), "i2i Run"))
+            goto done_dead;
+        OrtTensorTypeAndShapeInfo *sh = NULL;
+        size_t cnt = 0;
+        if (!ok(A->GetTensorTypeAndShape(ov, &sh), "i2i OutShape"))
+            goto done_dead;
+        int sok = ok(A->GetTensorShapeElementCount(sh, &cnt), "i2i Count");
+        A->ReleaseTensorTypeAndShapeInfo(sh);
+        if (!sok || cnt != (size_t)3*w*h) {
+            fprintf(stderr, "[vcam/ort] img2img output size mismatch\n");
+            goto done_dead;
+        }
+        float *p = NULL;
+        if (!ok(A->GetTensorMutableData(ov, (void **)&p), "i2i OutData"))
+            goto done_dead;
+        memcpy(out, p, (size_t)3*w*h*sizeof(float));
+        ret = 1;
+        goto done;
+    }
+done_dead:
+    g_i2i_dead = 1;
+    fprintf(stderr, "[vcam/ort] img2img backend disabled after error\n");
+done:
+    if (iv) A->ReleaseValue(iv);
+    if (ov) A->ReleaseValue(ov);
+    pthread_mutex_unlock(&g_mtx);
+    return ret;
+}
+
+void ort_i2i_shutdown(void)
+{
+    pthread_mutex_lock(&g_mtx);
+    if (g_i2i) { A->ReleaseSession(g_i2i); g_i2i = NULL; }
+    if (g_dep) { A->ReleaseSession(g_dep); g_dep = NULL; }
+    g_i2i_dead = 0;
+    pthread_mutex_unlock(&g_mtx);
+}
+
 void ort_rvm_reset(void)
 {
     pthread_mutex_lock(&g_mtx);
@@ -268,6 +629,7 @@ void ort_shutdown(void)
 {
     pthread_mutex_lock(&g_mtx);
     release_rec();
+    if (g_i2i) { A->ReleaseSession(g_i2i); g_i2i = NULL; }
     if (g_sess) { A->ReleaseSession(g_sess); g_sess = NULL; }
     if (g_so)   { A->ReleaseSessionOptions(g_so); g_so = NULL; }
     if (g_mi)   { A->ReleaseMemoryInfo(g_mi); g_mi = NULL; }
@@ -287,6 +649,28 @@ int ort_rvm_init(const char *p) { (void)p; return 0; }
 
 int ort_rvm_infer(const float *s, int w, int h, float d, float *o)
 { (void)s; (void)w; (void)h; (void)d; (void)o; return 0; }
+
+int ort_i2i_init(const char *p) { (void)p; return 0; }
+
+int ort_i2i_layout(void) { return 0; }
+
+int ort_i2i_infer(const float *i, int w, int h, float *o)
+{ (void)i; (void)w; (void)h; (void)o; return 0; }
+
+void ort_i2i_shutdown(void) { }
+
+int ort_depth_init(const char *p) { (void)p; return 0; }
+
+int ort_depth_infer(const float *i, float *o) { (void)i; (void)o; return 0; }
+
+void ort_depth_shutdown(void) { }
+
+int ort_pose_init(const char *p) { (void)p; return 0; }
+
+int ort_pose_infer(const float *i, float *l, float *c)
+{ (void)i; (void)l; (void)c; return 0; }
+
+void ort_pose_shutdown(void) { }
 
 void ort_rvm_reset(void) { }
 

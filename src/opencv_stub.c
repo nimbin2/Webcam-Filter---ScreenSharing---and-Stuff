@@ -60,6 +60,30 @@ void cv_fx_paintflow(unsigned char *d, int w, int h, int s, float st, float dc)
 void cv_fx_speedlines(unsigned char *d, int w, int h, int s, float a, float b)
 { (void)d; (void)w; (void)h; (void)s; (void)a; (void)b; }
 
+void cv_fx_pose(unsigned char *d, int w, int h, int s, int m, float fx)
+{ (void)d; (void)w; (void)h; (void)s; (void)m; (void)fx; }
+
+int  cv_set_pose_model(const char *p) { (void)p; return 0; }
+
+void cv_fx_depth(unsigned char *d, int w, int h, int s, int m, float fx)
+{ (void)d; (void)w; (void)h; (void)s; (void)m; (void)fx; }
+
+int  cv_set_depth_model(const char *p) { (void)p; return 0; }
+
+void cv_fx_genai(unsigned char *d, int w, int h, int s, float b, float sz, float r)
+{ (void)d; (void)w; (void)h; (void)s; (void)b; (void)sz; (void)r; }
+
+void cv_fx_enhance(unsigned char *d, int w, int h, int s, float a, float b)
+{ (void)d; (void)w; (void)h; (void)s; (void)a; (void)b; }
+
+int  cv_set_gen_model(const char *p) { (void)p; return 0; }
+
+void cv_clear_gen_model(void) { }
+
+int  cv_set_face_image(const char *p) { (void)p; return 0; }
+
+void cv_clear_face_image(void) { }
+
 int  cv_set_bg_image(const char *p) { (void)p; return 0; }
 
 void cv_clear_bg_image(void) { }

@@ -65,6 +65,31 @@ int ort_rvm_init(const char *model_path);
 int ort_rvm_infer(const float *src_chw, int iw, int ih, float ds,
                   float *pha_out);
 
+/* ── generic img2img session (AnimeGAN / CartoonGAN / any 1-in 1-out
+ * image transformer). Values are [-1,1] floats, the GAN convention.
+ * Layout is auto-detected from the model at init. */
+int  ort_i2i_init(const char *model_path);   /* 1 ok, 0 fail */
+int  ort_i2i_layout(void);                   /* 0 = NCHW, 1 = NHWC */
+/* in/out are w*h*3 floats in the model's own layout; same buffer
+ * layout for input and output. 1 ok, 0 fail. */
+int  ort_i2i_infer(const float *in, int w, int h, float *out);
+void ort_i2i_shutdown(void);
+
+/* ── BlazePose landmarks (MediaPipe pose): input RGB [0,1] NHWC at
+ * 256x256; landmarks195 = 39 x (x,y,z,vis,pres) in 256-crop space;
+ * conf1 = person-presence confidence. */
+int  ort_pose_init(const char *model_path);
+int  ort_pose_infer(const float *rgb_nhwc_256, float *landmarks195,
+                    float *conf1);
+void ort_pose_shutdown(void);
+
+/* ── monocular depth (MiDaS-small interface): input RGB [0,1] planar
+ * CHW at exactly 256x256; output 256*256 floats of relative inverse
+ * depth (bigger = closer). */
+int  ort_depth_init(const char *model_path);
+int  ort_depth_infer(const float *rgb_chw_256, float *depth_out_65536);
+void ort_depth_shutdown(void);
+
 /* Zero the recurrent state (e.g. on a scene cut). Cheap; optional. */
 void ort_rvm_reset(void);
 
