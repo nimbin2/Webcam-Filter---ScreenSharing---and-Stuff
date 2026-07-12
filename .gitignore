@@ -36,3 +36,5 @@ perf.data*
 core
 core.*
 vgcore.*
+
+.built-opencv-1-ort-1
