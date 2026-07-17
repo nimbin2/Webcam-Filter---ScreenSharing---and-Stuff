@@ -162,7 +162,9 @@ static const char *PERSONFX_MODES[] = {
     "presence-heat","grand-finale","keepy-uppy","bubble-pop","punching-bag",
     "goalkeeper","motion-paint","force-field","smoke-flow","ripple-pool",
     "cloth-net","swarm","sand-fall","bouncy-balls","liquid-pool","slime",
-    "leaf-storm","iron-filings",
+    "leaf-storm","iron-filings","breakout","pinata","chain-whip",
+    "plasma-orbs","target-puck","carry-crates","two-hand-lift","wrist-magnet",
+    "virtual-room",
 };
 static const char *FACEFX_MODES[] = {
     "pixelate","ring-dots","googly-eyes","bighead","deal-with-it","laser-eyes",
@@ -430,6 +432,17 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
             send_line(client_fd, "OK                                    121=SLIME: sticky goo clings to you, sags in strands, flings off when you move");
             send_line(client_fd, "OK                                    122=LEAF-STORM: leaves caught in the wake of your movement; kick the piles up");
             send_line(client_fd, "OK                                    123=IRON-FILINGS: you are the magnet — filings cling to your field and flow around you");
+            send_line(client_fd, "OK                                    124=BREAKOUT *GAME*: your body is the paddle — smash the brick wall, levels+lives");
+            send_line(client_fd, "OK                                    125=PINATA *GAME*: hit it 8 times, it bursts into candy you can bat around");
+            send_line(client_fd, "OK                                    126=CHAIN-WHIP: a wrecking ball on a chain — shove it, whip it, feel the momentum");
+            send_line(client_fd, "OK                                    127=PLASMA-ORBS: charged orbs that repel each other — shove one, all reorganize");
+            send_line(client_fd, "OK                                    128=TARGET-PUCK *GAME*: strike the puck through the ring; it relocates; streaks");
+            send_line(client_fd, "OK   -- HANDS: move / hold / lift --");
+            send_line(client_fd, "OK                                    129=CARRY-CRATES: your hands (matte extremities) grab, carry, throw + stack crates");
+            send_line(client_fd, "OK                                    130=TWO-HAND-LIFT: a beam that needs BOTH hands under it; balance it to the goal");
+            send_line(client_fd, "OK                                    131=WRIST-MAGNET: REAL tracked wrists (pose model) — two-handed cube carry");
+            send_line(client_fd, "OK                                    132=VIRTUAL-ROOM: you + a person cut out of a screen region, seated together");
+            send_line(client_fd, "OK                                       region: vcam-ctl room pick | p2=their seat .55-.95  p5=their scale .5-1.6");
             send_line(client_fd, "OK   filter modes <name>            list ALL modes of personfx/facefx/moodfx/styleai BY NAME");
             send_line(client_fd, "OK   personfx p5 = fx  per-mode effect strength 0.2..3 (glitch amp, fire, rays, lift, fog...) — tune LIVE:");
             send_line(client_fd, "OK                       vcam-ctl filter set 0 p5 1.8");
@@ -587,6 +600,29 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
                 snprintf(b, sizeof b, "OK %2d %s", k2, tbl[k2]);
                 send_line(client_fd, b);
             }
+            return;
+        }
+
+        if (strcmp(sub, "roomregion") == 0) {
+            /* filter roomregion <x> <y> <w> <h> | off */
+            char *a1 = strtok_r(NULL, " \t", &save);
+            if (a1 && (!strcmp(a1,"off") || !strcmp(a1,"none"))) {
+                cv_room_off();
+                send_line(client_fd, "OK virtual-room region cleared");
+                return;
+            }
+            char *a2 = strtok_r(NULL, " \t", &save);
+            char *a3 = strtok_r(NULL, " \t", &save);
+            char *a4 = strtok_r(NULL, " \t", &save);
+            if (!a1 || !a2 || !a3 || !a4) {
+                send_line(client_fd, "ERR usage: filter roomregion <x> <y> <w> <h> | off");
+                send_line(client_fd, "ERR   easiest: vcam-ctl room pick   (draw the region with your mouse)");
+                return;
+            }
+            if (cv_room_set_region(atoi(a1), atoi(a2), atoi(a3), atoi(a4)))
+                send_line(client_fd, "OK region set — 'filter add personfx 132' seats you both in the room");
+            else
+                send_line(client_fd, "ERR bad region (need width/height >= 32)");
             return;
         }
 

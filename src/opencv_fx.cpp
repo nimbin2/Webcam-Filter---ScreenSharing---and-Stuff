@@ -1543,6 +1543,199 @@ static BodyProbe probe_body(const cv::Mat &mask, const cv::Mat &prev,
     return b;
 }
 
+/* Heuristic hand tracking from the matte alone: your hands are the
+ * silhouette's lateral extremes (leftmost / rightmost body pixels in
+ * the upper part of the frame), EMA-smoothed, with velocity. No model
+ * needed; works whenever an arm reaches away from the torso. */
+static int cv_pose_hands(unsigned char *data, int w, int h, int stride,
+                         float out[6]);
+
+/* ── virtual room: screen-region grabber + remote-person matting ────
+ * A second video source: an X11 screen region the user selects (the
+ * other person's video window). PP-HumanSeg — stateless per frame,
+ * unlike RVM whose recurrent memory belongs to the webcam — cuts the
+ * person out of it. */
+#ifdef VCAM_HAVE_X11
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#endif
+struct RoomState {
+    int rx = 0, ry = 0, rw = 0, rh = 0;    /* selected screen region */
+    int enabled = 0;
+#ifdef VCAM_HAVE_X11
+    Display *dpy = nullptr;
+    int dpy_failed = 0;
+#endif
+    cv::dnn::Net net;                       /* remote-person segmenter */
+    int net_state = 0;                      /* 0 untried, 1 up, -1 dead */
+    int person_ch = -1;                     /* locked person channel */
+    cv::Mat grab;                           /* last grabbed region BGR */
+    cv::Mat rmask;                          /* remote mask CV_8U */
+    unsigned tick = 0;
+    std::mutex mtx;
+};
+static RoomState g_room;
+
+int cv_room_set_region(int x, int y, int w2, int h2)
+{
+    if (w2 < 32 || h2 < 32) return 0;
+    std::lock_guard<std::mutex> l(g_room.mtx);
+    g_room.rx = x; g_room.ry = y; g_room.rw = w2; g_room.rh = h2;
+    g_room.enabled = 1;
+    g_room.rmask.release();
+    return 1;
+}
+
+void cv_room_off(void)
+{
+    std::lock_guard<std::mutex> l(g_room.mtx);
+    g_room.enabled = 0;
+}
+
+/* grab the region from the X display; empty Mat on any failure */
+static cv::Mat room_grab_locked(void)
+{
+#ifdef VCAM_HAVE_X11
+    if (g_room.dpy_failed) return cv::Mat();
+    if (!g_room.dpy) {
+        g_room.dpy = XOpenDisplay(NULL);
+        if (!g_room.dpy) {
+            g_room.dpy_failed = 1;
+            warn_once("room_dpy", "virtual-room: cannot open X display "
+                      "(DISPLAY unset, or Wayland without XWayland)");
+            return cv::Mat();
+        }
+    }
+    Window root = DefaultRootWindow(g_room.dpy);
+    XImage *xi = XGetImage(g_room.dpy, root, g_room.rx, g_room.ry,
+                           g_room.rw, g_room.rh, AllPlanes, ZPixmap);
+    if (!xi) return cv::Mat();
+    cv::Mat out;
+    if (xi->bits_per_pixel == 32) {
+        cv::Mat bgra(g_room.rh, g_room.rw, CV_8UC4, xi->data,
+                     xi->bytes_per_line);
+        cv::cvtColor(bgra, out, cv::COLOR_BGRA2BGR);
+    } else if (xi->bits_per_pixel == 24) {
+        cv::Mat bgr(g_room.rh, g_room.rw, CV_8UC3, xi->data,
+                    xi->bytes_per_line);
+        out = bgr.clone();
+    }
+    XDestroyImage(xi);
+    return out;
+#else
+    warn_once("room_x11", "virtual-room: vcam was built without X11 — "
+              "install libx11-dev and rebuild (make OPENCV=1 ORT=1)");
+    return cv::Mat();
+#endif
+}
+
+/* PP-HumanSeg on the grabbed region (stateless). CV_8U mask or empty. */
+static cv::Mat room_seg_locked(const cv::Mat &bgr)
+{
+    if (g_room.net_state < 0 || bgr.empty()) return cv::Mat();
+    try {
+        if (g_room.net_state == 0) {
+            std::string p = model_dir()
+                + "/human_segmentation_pphumanseg_2023mar.onnx";
+            if (!path_exists(p)) {
+                g_room.net_state = -1;
+                warn_once("room_seg", "virtual-room: segmentation model "
+                    "missing — run 'vcam-setup --models'; showing the "
+                    "region as a framed screen instead");
+                return cv::Mat();
+            }
+            g_room.net = cv::dnn::readNetFromONNX(p);
+            g_room.net_state = 1;
+        }
+        const int N = 192;
+        double s2 = (double)N / std::max(bgr.cols, bgr.rows);
+        int lw = std::max(8, (int)(bgr.cols * s2));
+        int lh = std::max(8, (int)(bgr.rows * s2));
+        cv::Mat resized(N, N, CV_8UC3, cv::Scalar(114,114,114));
+        int lx = (N - lw)/2, ly = (N - lh)/2;
+        {
+            cv::Mat dst2 = resized(cv::Rect(lx, ly, lw, lh));
+            cv::resize(bgr, dst2, dst2.size(), 0, 0, cv::INTER_AREA);
+        }
+        cv::Mat blob = cv::dnn::blobFromImage(resized, 1.0/127.5,
+            cv::Size(N, N), cv::Scalar(127.5,127.5,127.5), true, false);
+        g_room.net.setInput(blob);
+        cv::Mat out = g_room.net.forward();
+        if (out.dims != 4 || out.size[1] < 2) return cv::Mat();
+        const int HW = N * N;
+        float *base = (float *)out.ptr<float>(0);
+        cv::Mat ch0(N, N, CV_32F, base), ch1(N, N, CV_32F, base + HW);
+        if (g_room.person_ch < 0) {
+            /* person channel = hotter in the crop centre */
+            cv::Rect c2(N/3, N/3, N/3, N/3);
+            g_room.person_ch = cv::mean(ch1(c2))[0] > cv::mean(ch0(c2))[0]
+                             ? 1 : 0;
+        }
+        cv::Mat &pc = g_room.person_ch ? ch1 : ch0;
+        cv::Mat &bc = g_room.person_ch ? ch0 : ch1;
+        cv::Mat m8(N, N, CV_8U);
+        for (int y = 0; y < N; y++) {
+            const float *pp = pc.ptr<float>(y);
+            const float *bb = bc.ptr<float>(y);
+            uchar *mm = m8.ptr<uchar>(y);
+            for (int x = 0; x < N; x++)
+                mm[x] = pp[x] > bb[x] ? 255 : 0;
+        }
+        /* unletterbox back to region size */
+        cv::Mat inner = m8(cv::Rect(lx, ly, lw, lh));
+        cv::Mat full;
+        cv::resize(inner, full, bgr.size(), 0, 0, cv::INTER_LINEAR);
+        cv::medianBlur(full, full, 5);
+        return full;
+    } catch (const std::exception &e) {
+        g_room.net_state = -1;
+        warn_once("room_seg_fail",
+                  std::string("virtual-room seg failed: ") + e.what());
+        return cv::Mat();
+    }
+}
+
+struct MatteHands {
+    float lx, ly, rx, ry;       /* left / right hand points */
+    float lvx, lvy, rvx, rvy;   /* velocities (px/frame)     */
+    int   lok, rok;             /* tracked this frame?       */
+};
+static void track_hands(const cv::Mat &mask, MatteHands *H)
+{
+    static float slx=-1, sly, srx=-1, sry;
+    static float plx, ply, prx, pry;
+    int w = mask.cols, h = mask.rows;
+    int found_l = 0, found_r = 0;
+    float blx = 1e9f, bly = 0, brx = -1e9f, bry = 0;
+    int ytop = (int)(h*0.06f), ybot = (int)(h*0.97f);
+    for (int y = ytop; y < ybot; y += 3) {
+        const float *mm = mask.ptr<float>(y);
+        for (int x = 0; x < w; x += 2)
+            if (mm[x] > 0.5f) { if (x < blx) { blx = x; bly = y; } break; }
+        for (int x = w-1; x >= 0; x -= 2)
+            if (mm[x] > 0.5f) { if (x > brx) { brx = x; bry = y; } break; }
+    }
+    found_l = blx < 1e8f;
+    found_r = brx > -1e8f;
+    H->lok = found_l; H->rok = found_r;
+    if (found_l) {
+        if (slx < 0) { slx = blx; sly = bly; plx = blx; ply = bly; }
+        plx = slx; ply = sly;
+        slx += (blx - slx) * 0.45f;
+        sly += (bly - sly) * 0.45f;
+        H->lx = slx; H->ly = sly;
+        H->lvx = slx - plx; H->lvy = sly - ply;
+    } else { slx = -1; H->lvx = H->lvy = 0; }
+    if (found_r) {
+        if (srx < 0) { srx = brx; sry = bry; prx = brx; pry = bry; }
+        prx = srx; pry = sry;
+        srx += (brx - srx) * 0.45f;
+        sry += (bry - sry) * 0.45f;
+        H->rx = srx; H->ry = sry;
+        H->rvx = srx - prx; H->rvy = sry - pry;
+    } else { srx = -1; H->rvx = H->rvy = 0; }
+}
+
 void cv_fx_bgblur(unsigned char *data, int w, int h, int stride, int mode,
                   float edge, float smooth, float size, float fx)
 {
@@ -1744,6 +1937,985 @@ mask_ready: ;
                     ip[x][2]=(uchar)(ip[x][2]+(tp[x][2]-ip[x][2])*a);
                 }
             }
+            return;
+        }
+        if (mode == 132) {
+            /* VIRTUAL ROOM: you (webcam matte) and the person from your
+             * selected screen region (their own matting pass), seated
+             * together in a rendered room. Region: 'vcam-ctl room pick'.
+             * edge(p2) = remote seat position 0.55..0.95 (default .72),
+             * fx(p5)   = remote person scale 0.5..1.6 (default 1). */
+            cv::Mat me_src = img.clone();            /* webcam before paint */
+            float rxpos = (edge >= 0.55f && edge <= 0.95f) ? edge : 0.72f;
+            float rscale = (fx >= 0.5f && fx <= 1.6f) ? fx : 1.0f;
+            unsigned tk = g_seg.counter;
+            /* ---- the room ---- */
+            int floor_y = (int)(img.rows * 0.78f);
+            for (int y = 0; y < img.rows; y++) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                if (y < floor_y) {
+                    float t2 = (float)y / floor_y;
+                    uchar b2 = (uchar)(96 - t2*26), g2 = (uchar)(78 - t2*20),
+                          r2 = (uchar)(64 - t2*16);
+                    for (int x = 0; x < img.cols; x++)
+                        { ip[x][0]=b2; ip[x][1]=g2; ip[x][2]=r2; }
+                } else {
+                    float t2 = (float)(y - floor_y) / (img.rows - floor_y);
+                    uchar b2 = (uchar)(52 + t2*22), g2 = (uchar)(58 + t2*26),
+                          r2 = (uchar)(66 + t2*30);
+                    for (int x = 0; x < img.cols; x++)
+                        { ip[x][0]=b2; ip[x][1]=g2; ip[x][2]=r2; }
+                }
+            }
+            /* window with light on the left wall */
+            cv::Rect win((int)(img.cols*0.05f), (int)(img.rows*0.12f),
+                         (int)(img.cols*0.16f), (int)(img.rows*0.38f));
+            cv::rectangle(img, win, cv::Scalar(150,130,105), cv::FILLED);
+            cv::rectangle(img, win, cv::Scalar(40,36,30), 4);
+            cv::line(img, {win.x+win.width/2, win.y},
+                     {win.x+win.width/2, win.y+win.height},
+                     cv::Scalar(40,36,30), 3);
+            cv::line(img, {win.x, win.y+win.height/2},
+                     {win.x+win.width, win.y+win.height/2},
+                     cv::Scalar(40,36,30), 3);
+            /* floor skirting + rug */
+            cv::line(img, {0, floor_y}, {img.cols, floor_y},
+                     cv::Scalar(38,40,46), 3);
+            cv::ellipse(img, {img.cols/2, (int)(img.rows*0.93f)},
+                        {(int)(img.cols*0.42f), (int)(img.rows*0.09f)},
+                        0, 0, 360, cv::Scalar(70,52,88), cv::FILLED, cv::LINE_AA);
+            cv::ellipse(img, {img.cols/2, (int)(img.rows*0.93f)},
+                        {(int)(img.cols*0.42f), (int)(img.rows*0.09f)},
+                        0, 0, 360, cv::Scalar(96,74,120), 3, cv::LINE_AA);
+            /* ---- remote person from the screen region ---- */
+            {
+                std::lock_guard<std::mutex> rl(g_room.mtx);
+                if (g_room.enabled) {
+                    g_room.tick++;
+                    if ((g_room.tick % 2) == 0 || g_room.grab.empty()) {
+                        cv::Mat gr = room_grab_locked();
+                        if (!gr.empty()) {
+                            g_room.grab = gr;
+                            if ((g_room.tick % 4) == 0 || g_room.rmask.empty())
+                                g_room.rmask = room_seg_locked(gr);
+                        }
+                    }
+                    if (!g_room.grab.empty()) {
+                        cv::Rect bb;
+                        bool have_person = false;
+                        if (!g_room.rmask.empty()) {
+                            /* bbox of the remote mask */
+                            int minx=1<<28,miny=1<<28,maxx=-1,maxy=-1;
+                            for (int y = 0; y < g_room.rmask.rows; y += 2) {
+                                const uchar *mm = g_room.rmask.ptr<uchar>(y);
+                                for (int x = 0; x < g_room.rmask.cols; x += 2)
+                                    if (mm[x] > 128) {
+                                        if (x<minx)minx=x;
+                                        if (x>maxx)maxx=x;
+                                        if (y<miny)miny=y;
+                                        if (y>maxy)maxy=y;
+                                    }
+                            }
+                            if (maxx > minx+16 && maxy > miny+24) {
+                                bb = cv::Rect(minx, miny,
+                                              maxx-minx, maxy-miny);
+                                have_person = true;
+                            }
+                        }
+                        if (have_person) {
+                            cv::Mat pc = g_room.grab(bb);
+                            cv::Mat pm = g_room.rmask(bb);
+                            float th = img.rows * 0.60f * rscale;
+                            float sc2 = th / pc.rows;
+                            int nw2 = std::max(8, (int)(pc.cols*sc2));
+                            int nh2 = std::max(8, (int)(pc.rows*sc2));
+                            cv::Mat pcs, pms;
+                            cv::resize(pc, pcs, cv::Size(nw2, nh2));
+                            cv::resize(pm, pms, cv::Size(nw2, nh2));
+                            int dx0 = (int)(img.cols*rxpos) - nw2/2;
+                            int dy0 = (int)(img.rows*0.92f) - nh2;
+                            for (int y = 0; y < nh2; y++) {
+                                int ty2 = dy0 + y;
+                                if (ty2 < 0 || ty2 >= img.rows) continue;
+                                const uchar *mm = pms.ptr<uchar>(y);
+                                const cv::Vec3b *sp = pcs.ptr<cv::Vec3b>(y);
+                                cv::Vec3b *ip = img.ptr<cv::Vec3b>(ty2);
+                                for (int x = 0; x < nw2; x++) {
+                                    int tx2 = dx0 + x;
+                                    if (tx2 < 0 || tx2 >= img.cols) continue;
+                                    float a = mm[x] / 255.0f;
+                                    if (a < 0.1f) continue;
+                                    ip[tx2][0]=(uchar)(ip[tx2][0]+(sp[x][0]-ip[tx2][0])*a);
+                                    ip[tx2][1]=(uchar)(ip[tx2][1]+(sp[x][1]-ip[tx2][1])*a);
+                                    ip[tx2][2]=(uchar)(ip[tx2][2]+(sp[x][2]-ip[tx2][2])*a);
+                                }
+                            }
+                            /* soft contact shadow */
+                            cv::ellipse(img,
+                                {(int)(img.cols*rxpos), (int)(img.rows*0.925f)},
+                                {(int)(nw2*0.42f), (int)(img.rows*0.02f)},
+                                0, 0, 360, cv::Scalar(30,28,34), cv::FILLED,
+                                cv::LINE_AA);
+                        } else {
+                            /* no person found: hang the region as a
+                             * framed screen so it's still useful */
+                            int fw2 = (int)(img.cols*0.30f);
+                            int fh2 = fw2 * g_room.grab.rows
+                                    / std::max(1, g_room.grab.cols);
+                            cv::Rect fr((int)(img.cols*rxpos) - fw2/2,
+                                        (int)(img.rows*0.16f), fw2, fh2);
+                            fr &= cv::Rect(0,0,img.cols,img.rows);
+                            if (fr.width > 8 && fr.height > 8) {
+                                cv::Mat dst2 = img(fr);
+                                cv::resize(g_room.grab, dst2, dst2.size());
+                                cv::rectangle(img, fr, cv::Scalar(30,30,36), 5);
+                            }
+                        }
+                    } else {
+                        cv::putText(img, "waiting for screen region...",
+                            {(int)(img.cols*0.55f), (int)(img.rows*0.5f)},
+                            cv::FONT_HERSHEY_PLAIN, 1.2,
+                            cv::Scalar(150,150,160), 1, cv::LINE_AA);
+                    }
+                } else {
+                    cv::putText(img,
+                        "pick the other person:  vcam-ctl room pick",
+                        {(int)(img.cols*0.42f), (int)(img.rows*0.5f)},
+                        cv::FONT_HERSHEY_PLAIN, 1.2,
+                        cv::Scalar(150,150,160), 1, cv::LINE_AA);
+                }
+            }
+            /* ---- you, from the webcam matte ---- */
+            {
+                int minx=1<<28,miny=1<<28,maxx=-1,maxy=-1;
+                for (int y = 0; y < img.rows; y += 2) {
+                    const float *mm = g_seg.mask.ptr<float>(y);
+                    for (int x = 0; x < img.cols; x += 2)
+                        if (mm[x] > 0.5f) {
+                            if (x<minx)minx=x;
+                            if (x>maxx)maxx=x;
+                            if (y<miny)miny=y;
+                            if (y>maxy)maxy=y;
+                        }
+                }
+                if (maxx > minx+16 && maxy > miny+24) {
+                    cv::Rect mb(minx, miny, maxx-minx, maxy-miny);
+                    cv::Mat pc = me_src(mb);
+                    cv::Mat pmf = g_seg.mask(mb);
+                    float th = img.rows * 0.64f;
+                    float sc2 = th / pc.rows;
+                    if (sc2 > 1.6f) sc2 = 1.6f;
+                    int nw2 = std::max(8, (int)(pc.cols*sc2));
+                    int nh2 = std::max(8, (int)(pc.rows*sc2));
+                    cv::Mat pcs, pms;
+                    cv::resize(pc, pcs, cv::Size(nw2, nh2));
+                    cv::resize(pmf, pms, cv::Size(nw2, nh2));
+                    int dx0 = (int)(img.cols*0.28f) - nw2/2;
+                    int dy0 = (int)(img.rows*0.94f) - nh2;
+                    cv::ellipse(img, {(int)(img.cols*0.28f),
+                                      (int)(img.rows*0.945f)},
+                        {(int)(nw2*0.42f), (int)(img.rows*0.02f)},
+                        0, 0, 360, cv::Scalar(30,28,34), cv::FILLED, cv::LINE_AA);
+                    for (int y = 0; y < nh2; y++) {
+                        int ty2 = dy0 + y;
+                        if (ty2 < 0 || ty2 >= img.rows) continue;
+                        const float *mm = pms.ptr<float>(y);
+                        const cv::Vec3b *sp = pcs.ptr<cv::Vec3b>(y);
+                        cv::Vec3b *ip = img.ptr<cv::Vec3b>(ty2);
+                        for (int x = 0; x < nw2; x++) {
+                            int tx2 = dx0 + x;
+                            if (tx2 < 0 || tx2 >= img.cols) continue;
+                            float a = mm[x];
+                            if (a < 0.05f) continue;
+                            ip[tx2][0]=(uchar)(ip[tx2][0]+(sp[x][0]-ip[tx2][0])*a);
+                            ip[tx2][1]=(uchar)(ip[tx2][1]+(sp[x][1]-ip[tx2][1])*a);
+                            ip[tx2][2]=(uchar)(ip[tx2][2]+(sp[x][2]-ip[tx2][2])*a);
+                        }
+                    }
+                }
+            }
+            /* warm lamp vignette so it reads as one scene */
+            for (int y = 0; y < img.rows; y += 1) {
+                cv::Vec3b *ip = img.ptr<cv::Vec3b>(y);
+                float vy = std::fabs(y-img.rows*0.45f)/(img.rows*0.6f);
+                for (int x = 0; x < img.cols; x++) {
+                    float vx2 = std::fabs(x-img.cols*0.5f)/(img.cols*0.62f);
+                    float k = 1.0f - (vx2*vx2 + vy*vy)*0.18f;
+                    if (k >= 1) continue;
+                    ip[x][0]=(uchar)(ip[x][0]*k);
+                    ip[x][1]=(uchar)(ip[x][1]*k);
+                    ip[x][2]=(uchar)(ip[x][2]*std::min(1.0f, k*1.02f));
+                }
+            }
+            (void)tk;
+            return;
+        }
+        if (mode == 131) {
+            /* WRIST MAGNET (needs the pose model): vcam tracks your
+             * ACTUAL wrists — glowing gauntlets snap to them, and a cube
+             * can only be lifted TWO-HANDED: bring both wrists to it,
+             * carry it at their midpoint, deliver it into the ring.
+             * This mode genuinely knows hands from head.
+             * fx = magnet snappiness. */
+            static float g1x=-1, g1y, g2x=-1, g2y;      /* gauntlets */
+            static float qx=-1, qy, qvx, qvy;           /* the cube  */
+            static int holding = 0, score11 = 0, flash11 = 0, warn11 = 0;
+            unsigned tk = g_seg.counter;
+            float wr[6] = {0,0,0,0,0,0};
+            int have_hands = cv_pose_hands(data, w, h, stride, wr);
+            float QS = std::max(30.0f, img.cols*0.06f);
+            if (qx < 0) { qx = img.cols*0.5f; qy = img.rows-QS/2-2;
+                          qvx = qvy = 0; }
+            cv::Rect ring(img.cols - (int)(QS*2.6f), 10,
+                          (int)(QS*2.2f), (int)(QS*2.2f));
+            if (!have_hands) {
+                if (!warn11) {
+                    warn_once("wristmag",
+                        "wrist-magnet: waiting for pose tracking — needs "
+                        "'vcam-setup --models-pose' and you in frame");
+                    warn11 = 1;
+                }
+                cv::putText(img, "looking for your wrists...",
+                            {16, img.rows-16}, cv::FONT_HERSHEY_PLAIN, 1.3,
+                            cv::Scalar(160,160,170), 1, cv::LINE_AA);
+                holding = 0;
+            } else {
+                float k11 = 0.25f + 0.35f*std::min(1.0f, fx*0.5f);
+                if (g1x < 0) { g1x=wr[0]; g1y=wr[1]; g2x=wr[3]; g2y=wr[4]; }
+                int v1 = wr[2] > 0.5f, v2 = wr[5] > 0.5f;
+                if (v1) { g1x += (wr[0]-g1x)*k11; g1y += (wr[1]-g1y)*k11; }
+                if (v2) { g2x += (wr[3]-g2x)*k11; g2y += (wr[4]-g2y)*k11; }
+                /* gauntlets */
+                for (int s2 = 0; s2 < 2; s2++) {
+                    if (!(s2 ? v2 : v1)) continue;
+                    float gx3 = s2 ? g2x : g1x, gy3 = s2 ? g2y : g1y;
+                    float pl = 0.8f + 0.2f*std::sin(tk*0.2f + s2*3);
+                    cv::circle(img, {(int)gx3,(int)gy3}, (int)(QS*0.34f*pl),
+                               s2 ? cv::Scalar(255,170,80)
+                                  : cv::Scalar(90,220,255), 3, cv::LINE_AA);
+                    cv::circle(img, {(int)gx3,(int)gy3}, 4,
+                               cv::Scalar(255,255,255), cv::FILLED, cv::LINE_AA);
+                }
+                /* two-handed grab */
+                float d1 = std::hypot(g1x-qx, g1y-qy);
+                float d2 = std::hypot(g2x-qx, g2y-qy);
+                if (v1 && v2 && d1 < QS*1.4f && d2 < QS*1.4f)
+                    holding = 1;
+                if (!v1 || !v2 ||
+                    (holding && (d1 > QS*2.6f || d2 > QS*2.6f)))
+                    holding = 0;
+                if (holding) {
+                    float mx3 = (g1x+g2x)*0.5f, my3 = (g1y+g2y)*0.5f;
+                    qvx = (mx3-qx)*0.5f; qvy = (my3-qy)*0.5f;
+                    qx += qvx; qy += qvy;
+                    cv::line(img, {(int)g1x,(int)g1y}, {(int)qx,(int)qy},
+                             cv::Scalar(90,220,255), 2, cv::LINE_AA);
+                    cv::line(img, {(int)g2x,(int)g2y}, {(int)qx,(int)qy},
+                             cv::Scalar(255,170,80), 2, cv::LINE_AA);
+                }
+            }
+            if (!holding) {
+                qvy += 0.4f; qvx *= 0.96f;
+                qx += qvx; qy += qvy;
+                if (qy > img.rows-QS/2-2) { qy = img.rows-QS/2-2;
+                    qvy = -std::fabs(qvy)*0.3f; qvx *= 0.8f; }
+                if (qx < QS/2) { qx=QS/2; qvx=std::fabs(qvx)*0.5f; }
+                if (qx > img.cols-QS/2) { qx=img.cols-QS/2; qvx=-std::fabs(qvx)*0.5f; }
+            }
+            /* delivered? */
+            if (qx > ring.x && qx < ring.x+ring.width &&
+                qy > ring.y && qy < ring.y+ring.height) {
+                score11++; flash11 = 16; holding = 0;
+                qx = img.cols*0.25f; qy = img.rows-QS/2-2; qvx = qvy = 0;
+            }
+            float pul = 0.8f + 0.2f*std::sin(tk*0.12f);
+            cv::rectangle(img, ring,
+                cv::Scalar(60*pul, 220*pul, 120*pul), 3);
+            /* the cube */
+            cv::Rect rq((int)(qx-QS/2), (int)(qy-QS/2), (int)QS, (int)QS);
+            rq &= cv::Rect(0,0,img.cols,img.rows);
+            if (rq.width > 2 && rq.height > 2) {
+                cv::rectangle(img, rq, cv::Scalar(170,110,60), cv::FILLED);
+                cv::rectangle(img, rq,
+                    holding ? cv::Scalar(90,240,255) : cv::Scalar(90,55,25),
+                    holding ? 4 : 3);
+            }
+            if (flash11 > 0) { flash11--;
+                cv::rectangle(img, {0,0}, {img.cols-1,img.rows-1},
+                              cv::Scalar(80,220,80), 8); }
+            char hud12[48];
+            snprintf(hud12, sizeof hud12, "DELIVERED %d", score11);
+            cv::putText(img, hud12, {20,46}, cv::FONT_HERSHEY_DUPLEX, 1.0,
+                        cv::Scalar(20,20,20), 4, cv::LINE_AA);
+            cv::putText(img, hud12, {20,46}, cv::FONT_HERSHEY_DUPLEX, 1.0,
+                        cv::Scalar(120,255,160), 2, cv::LINE_AA);
+            return;
+        }
+        if (mode == 130) {
+            /* TWO-HAND LIFT: a heavy beam that genuinely needs BOTH
+             * hands under it. One support -> it tilts and slides off.
+             * Both -> it lifts. Carry it level into the glowing goal
+             * zone at the top. Balance game. fx = beam weight. */
+            static float bx10, by10, bang, bvx10, bvy10, bav;
+            static int binit10 = 0, score10 = 0, flash10 = 0;
+            float BW = img.cols * 0.34f, BH = std::max(14.0f, img.rows*0.035f);
+            if (!binit10) {
+                bx10 = img.cols*0.5f; by10 = img.rows - BH - 2;
+                bang = 0; bvx10 = bvy10 = bav = 0;
+                binit10 = 1;
+            }
+            /* support probes under each end of the (rotated) beam */
+            float ca = std::cos(bang), sa = std::sin(bang);
+            float exl = bx10 - ca*BW*0.38f, eyl = by10 - sa*BW*0.38f;
+            float exr = bx10 + ca*BW*0.38f, eyr = by10 + sa*BW*0.38f;
+            auto support = [&](float ex, float ey) -> float {
+                float best = 0;
+                for (int dy = 2; dy <= (int)(BH*1.2f); dy += 3)
+                    for (int dx = -14; dx <= 14; dx += 7) {
+                        int sx2 = (int)(ex+dx), sy2 = (int)(ey+BH*0.5f+dy);
+                        if (sx2 < 0 || sy2 < 0 ||
+                            sx2 >= img.cols || sy2 >= img.rows) continue;
+                        best = std::max(best, g_seg.mask.at<float>(sy2, sx2));
+                    }
+                return best;
+            };
+            float sl = support(exl, eyl), sr = support(exr, eyr);
+            int supL = sl > 0.5f, supR = sr > 0.5f;
+            float g10 = 0.34f * std::max(0.4f, fx);
+            if (supL && supR) {
+                /* lifted: rise gently, level out */
+                bvy10 -= g10 * 1.55f;
+                bav += (0 - bang) * 0.06f;
+            } else if (supL || supR) {
+                /* one side held: pivot — the free end drops */
+                bav += (supL ? 1 : -1) * 0.0045f * std::max(0.4f, fx);
+                bvy10 += g10 * 0.35f;
+                bvx10 += sa * 0.5f;              /* slides down the tilt */
+            } else {
+                bvy10 += g10;
+                bav += (0 - bang) * 0.01f;
+            }
+            bvx10 *= 0.90f; bvy10 *= 0.90f; bav *= 0.92f;
+            bx10 += bvx10; by10 += bvy10; bang += bav;
+            if (bang > 0.9f) bang = 0.9f;
+            if (bang < -0.9f) bang = -0.9f;
+            if (bx10 < BW*0.3f) { bx10 = BW*0.3f; bvx10 = 0; }
+            if (bx10 > img.cols-BW*0.3f) { bx10 = img.cols-BW*0.3f; bvx10 = 0; }
+            if (by10 > img.rows - BH - 2) {
+                by10 = img.rows - BH - 2;
+                bvy10 = 0;
+                bang *= 0.9f;
+            }
+            if (by10 < BH) by10 = BH;
+            /* goal zone at the top */
+            cv::Rect goal(img.cols/2 - (int)(BW*0.6f), 6,
+                          (int)(BW*1.2f), (int)(BH*2.4f));
+            float pul = 0.8f + 0.2f*std::sin(g_seg.counter*0.12f);
+            cv::rectangle(img, goal,
+                cv::Scalar(60*pul, 220*pul, 120*pul), 3);
+            if (by10 < goal.y + goal.height && std::fabs(bang) < 0.18f &&
+                bx10 > goal.x && bx10 < goal.x+goal.width) {
+                score10++; flash10 = 16;
+                bx10 = img.cols*0.5f; by10 = img.rows - BH - 2;
+                bang = 0; bvx10 = bvy10 = bav = 0;
+            }
+            /* draw the beam as a rotated slab + end caps + support glow */
+            cv::Point2f c10(bx10, by10);
+            cv::Point2f dxv(ca*BW*0.5f, sa*BW*0.5f);
+            cv::Point2f dyv(-sa*BH*0.5f, ca*BH*0.5f);
+            cv::Point pts[4] = {
+                cv::Point(c10 - dxv - dyv), cv::Point(c10 + dxv - dyv),
+                cv::Point(c10 + dxv + dyv), cv::Point(c10 - dxv + dyv)};
+            cv::fillConvexPoly(img, pts, 4, cv::Scalar(70,120,180), cv::LINE_AA);
+            cv::polylines(img, std::vector<std::vector<cv::Point>>{
+                {pts[0],pts[1],pts[2],pts[3]}}, true,
+                cv::Scalar(35,65,110), 3, cv::LINE_AA);
+            cv::circle(img, {(int)exl,(int)eyl}, 8,
+                supL ? cv::Scalar(90,240,140) : cv::Scalar(60,60,200),
+                supL ? cv::FILLED : 2, cv::LINE_AA);
+            cv::circle(img, {(int)exr,(int)eyr}, 8,
+                supR ? cv::Scalar(90,240,140) : cv::Scalar(60,60,200),
+                supR ? cv::FILLED : 2, cv::LINE_AA);
+            if (flash10 > 0) { flash10--;
+                cv::rectangle(img, {0,0}, {img.cols-1,img.rows-1},
+                              cv::Scalar(80,220,80), 8); }
+            char hud11[48];
+            snprintf(hud11, sizeof hud11, "DELIVERED %d", score10);
+            cv::putText(img, hud11, {20,46}, cv::FONT_HERSHEY_DUPLEX, 1.0,
+                        cv::Scalar(20,20,20), 4, cv::LINE_AA);
+            cv::putText(img, hud11, {20,46}, cv::FONT_HERSHEY_DUPLEX, 1.0,
+                        cv::Scalar(120,255,160), 2, cv::LINE_AA);
+            return;
+        }
+        if (mode == 129) {
+            /* CARRY CRATES: three wooden crates with gravity and
+             * stacking. Reach out — your hand (the silhouette's
+             * extremity) GRABS a crate on touch, carries it, and throws
+             * it with your hand's velocity when you let go. Stack them:
+             * the HUD counts your tower. fx = throw power. */
+            const int NC = 3;
+            static float cx9[NC], cy9[NC], cvx9[NC], cvy9[NC];
+            static int held[NC], hold_hand[NC], cinit9 = 0, dwell[NC];
+            unsigned tk = g_seg.counter;
+            float S9 = std::max(34.0f, img.cols*0.075f);
+            if (!cinit9) {
+                for (int i2 = 0; i2 < NC; i2++) {
+                    cx9[i2] = img.cols*(0.25f+0.25f*i2);
+                    cy9[i2] = img.rows - S9/2 - 2;
+                    cvx9[i2] = cvy9[i2] = 0;
+                    held[i2] = 0; dwell[i2] = 0;
+                }
+                cinit9 = 1;
+            }
+            MatteHands H;
+            track_hands(g_seg.mask, &H);
+
+            for (int i2 = 0; i2 < NC; i2++) {
+                if (held[i2]) {
+                    float hx2 = hold_hand[i2] ? H.rx : H.lx;
+                    float hy2 = hold_hand[i2] ? H.ry : H.ly;
+                    int hok = hold_hand[i2] ? H.rok : H.lok;
+                    float hvx = hold_hand[i2] ? H.rvx : H.lvx;
+                    float hvy = hold_hand[i2] ? H.rvy : H.lvy;
+                    if (!hok ||
+                        std::fabs(hx2-cx9[i2]) > S9*1.6f ||
+                        std::fabs(hy2-cy9[i2]) > S9*1.6f) {
+                        held[i2] = 0;                    /* released: THROW */
+                        cvx9[i2] = hvx * 1.4f * fx;
+                        cvy9[i2] = hvy * 1.4f * fx - 1.0f;
+                    } else {
+                        cx9[i2] += (hx2 - cx9[i2]) * 0.55f;
+                        cy9[i2] += (hy2 - cy9[i2]) * 0.55f;
+                        cvx9[i2] = hvx; cvy9[i2] = hvy;
+                    }
+                } else {
+                    /* grab check: a hand inside the crate for 3 frames */
+                    int grabbed = 0, touching = 0;
+                    for (int s2 = 0; s2 < 2; s2++) {
+                        float hx2 = s2 ? H.rx : H.lx;
+                        float hy2 = s2 ? H.ry : H.ly;
+                        int hok = s2 ? H.rok : H.lok;
+                        if (hok && std::fabs(hx2-cx9[i2]) < S9*0.95f &&
+                                   std::fabs(hy2-cy9[i2]) < S9*1.15f) {
+                            touching = 1;
+                            dwell[i2]++;
+                            if (dwell[i2] >= 3) {
+                                held[i2] = 1; hold_hand[i2] = s2;
+                                grabbed = 1;
+                            }
+                            break;
+                        }
+                    }
+                    if (!touching && dwell[i2] > 0) dwell[i2]--;
+                    (void)grabbed;
+                    if (!held[i2]) {
+                        cvy9[i2] += 0.42f;
+                        cvx9[i2] *= 0.97f;
+                        cx9[i2] += cvx9[i2];
+                        cy9[i2] += cvy9[i2];
+                        /* floor */
+                        if (cy9[i2] > img.rows - S9/2 - 2) {
+                            cy9[i2] = img.rows - S9/2 - 2;
+                            cvy9[i2] = -std::fabs(cvy9[i2])*0.25f;
+                            cvx9[i2] *= 0.8f;
+                        }
+                        /* walls */
+                        if (cx9[i2] < S9/2) { cx9[i2]=S9/2; cvx9[i2]=std::fabs(cvx9[i2])*0.5f; }
+                        if (cx9[i2] > img.cols-S9/2) { cx9[i2]=img.cols-S9/2; cvx9[i2]=-std::fabs(cvx9[i2])*0.5f; }
+                        /* rest on another crate */
+                        for (int j2 = 0; j2 < NC; j2++) {
+                            if (j2 == i2 || held[j2]) continue;
+                            if (std::fabs(cx9[i2]-cx9[j2]) < S9*0.85f &&
+                                cy9[i2] < cy9[j2] &&
+                                cy9[j2]-cy9[i2] < S9*1.05f &&
+                                cvy9[i2] >= 0) {
+                                cy9[i2] = cy9[j2] - S9 - 1;
+                                cvy9[i2] = 0;
+                                cvx9[i2] *= 0.7f;
+                            }
+                        }
+                    }
+                }
+            }
+            /* stack score: tallest chain of resting crates */
+            int stack = 1;
+            for (int i2 = 0; i2 < NC; i2++) {
+                int c2 = 1;
+                for (int j2 = 0; j2 < NC; j2++)
+                    if (j2 != i2 && std::fabs(cx9[i2]-cx9[j2]) < S9*0.9f &&
+                        cy9[j2] < cy9[i2]) c2++;
+                if (c2 > stack) stack = c2;
+            }
+            /* draw crates: wood fill, X brace, held = golden edge */
+            for (int i2 = 0; i2 < NC; i2++) {
+                cv::Rect rc((int)(cx9[i2]-S9/2), (int)(cy9[i2]-S9/2),
+                            (int)S9, (int)S9);
+                rc &= cv::Rect(0, 0, img.cols, img.rows);
+                if (rc.width < 3 || rc.height < 3) continue;
+                cv::rectangle(img, rc, cv::Scalar(55,105,160), cv::FILLED);
+                cv::rectangle(img, rc,
+                    held[i2] ? cv::Scalar(70,210,255) : cv::Scalar(30,60,100),
+                    held[i2] ? 4 : 3);
+                cv::line(img, {rc.x,rc.y}, {rc.x+rc.width,rc.y+rc.height},
+                         cv::Scalar(35,70,115), 2);
+                cv::line(img, {rc.x+rc.width,rc.y}, {rc.x,rc.y+rc.height},
+                         cv::Scalar(35,70,115), 2);
+            }
+            /* hand markers so you can see what the tracker thinks */
+            if (H.lok) cv::circle(img, {(int)H.lx,(int)H.ly}, 9,
+                                  cv::Scalar(90,240,255), 2, cv::LINE_AA);
+            if (H.rok) cv::circle(img, {(int)H.rx,(int)H.ry}, 9,
+                                  cv::Scalar(90,240,255), 2, cv::LINE_AA);
+            char hud10[40];
+            snprintf(hud10, sizeof hud10, "STACK %d", stack);
+            cv::putText(img, hud10, {20,46}, cv::FONT_HERSHEY_DUPLEX, 1.0,
+                        cv::Scalar(20,20,20), 4, cv::LINE_AA);
+            cv::putText(img, hud10, {20,46}, cv::FONT_HERSHEY_DUPLEX, 1.0,
+                        cv::Scalar(120,220,255), 2, cv::LINE_AA);
+            (void)tk;
+            return;
+        }
+        if (mode == 124) {
+            /* BREAKOUT: the classic — but YOUR BODY is the paddle. A
+             * brick wall hangs at the top; keep the ball alive with your
+             * head and hands and smash every brick. Levels + score.
+             * fx = ball speed. */
+            const int BCOLS = 9, BROWS = 4;
+            static int alive5[BCOLS*BROWS], level = 1, score5 = 0, lives = 3;
+            static float px5 = -1, py5 = 0, vx5 = 0, vy5 = 0;
+            static int binit5 = 0, flash5 = 0;
+            static cv::Mat prev;
+            if (!binit5) { for (int i2=0;i2<BCOLS*BROWS;i2++) alive5[i2]=1; binit5=1; }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            float R5 = std::max(10.0f, img.cols*0.018f);
+            float spd = (3.4f + level*0.5f) * std::min(2.0f, std::max(0.5f, fx));
+            if (px5 < 0) {                          /* serve downward */
+                px5 = img.cols*0.5f; py5 = img.rows*0.45f;
+                float a2 = 1.2f + uhash(level,lives,3)*0.7f;
+                vx5 = std::cos(a2)*spd; vy5 = std::sin(a2)*spd;
+            }
+            px5 += vx5; py5 += vy5;
+            if (px5 < R5) { px5=R5; vx5=std::fabs(vx5); }
+            if (px5 > img.cols-R5) { px5=img.cols-R5; vx5=-std::fabs(vx5); }
+            if (py5 < R5) { py5=R5; vy5=std::fabs(vy5); }
+            if (py5 > img.rows+R5*2) {              /* lost */
+                lives--; px5 = -1; flash5 = -14;
+                if (lives <= 0) { lives = 3; score5 = 0; level = 1;
+                    for (int i2=0;i2<BCOLS*BROWS;i2++) alive5[i2]=1; }
+            }
+            /* body = paddle */
+            BodyProbe b5 = probe_body(g_seg.mask, prev, px5, py5, R5);
+            if (b5.hit) {
+                float dot = vx5*b5.nx + vy5*b5.ny;
+                if (dot < 0) { vx5 -= 2*dot*b5.nx; vy5 -= 2*dot*b5.ny; }
+                vx5 += b5.nx*1.2f + b5.pux*0.7f;
+                vy5 += b5.ny*1.2f + b5.puy*0.7f;
+                float sp2 = std::sqrt(vx5*vx5+vy5*vy5);
+                if (sp2 > 1e-3f) { vx5 *= spd/sp2; vy5 *= spd/sp2; }
+                if (vy5 > -0.8f && b5.ny < -0.2f) vy5 = -0.8f*spd*0.4f;
+                px5 += b5.nx*3; py5 += b5.ny*3;
+            }
+            /* bricks */
+            int bw2 = img.cols/BCOLS, bh2 = std::max(16, img.rows/16);
+            int left = 0;
+            for (int r2 = 0; r2 < BROWS; r2++)
+                for (int c2 = 0; c2 < BCOLS; c2++) {
+                    int i2 = r2*BCOLS+c2;
+                    if (!alive5[i2]) continue;
+                    left++;
+                    int x0 = c2*bw2+2, y0 = 8+r2*(bh2+4);
+                    if (px5 > x0-R5 && px5 < x0+bw2-4+R5 &&
+                        py5 > y0-R5 && py5 < y0+bh2+R5) {
+                        alive5[i2] = 0; score5 += 10; flash5 = 6;
+                        /* bounce off nearest face */
+                        float dl = px5-(x0-R5), dr = (x0+bw2-4+R5)-px5;
+                        float du = py5-(y0-R5), dd = (y0+bh2+R5)-py5;
+                        float m2 = std::min(std::min(dl,dr), std::min(du,dd));
+                        if (m2 == dl) vx5 = -std::fabs(vx5);
+                        else if (m2 == dr) vx5 = std::fabs(vx5);
+                        else if (m2 == du) vy5 = -std::fabs(vy5);
+                        else vy5 = std::fabs(vy5);
+                    }
+                    float hue2 = (float)r2/BROWS;
+                    cv::rectangle(img, cv::Rect(x0, y0, bw2-4, bh2),
+                        cv::Scalar(90+hue2*120, 190-hue2*130, 240-hue2*60),
+                        cv::FILLED);
+                    cv::rectangle(img, cv::Rect(x0, y0, bw2-4, bh2),
+                        cv::Scalar(25,25,30), 2);
+                }
+            if (left == 0) {
+                level++;
+                for (int i2=0;i2<BCOLS*BROWS;i2++) alive5[i2]=1;
+                px5 = -1;
+            }
+            if (px5 > 0) {
+                cv::circle(img, {(int)px5,(int)py5}, (int)R5+3,
+                           cv::Scalar(20,20,25), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)px5,(int)py5}, (int)R5,
+                           cv::Scalar(230,235,245), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)(px5-R5*0.3f),(int)(py5-R5*0.3f)},
+                           (int)(R5*0.3f), cv::Scalar(255,255,255),
+                           cv::FILLED, cv::LINE_AA);
+            }
+            if (flash5 > 0) flash5--;
+            if (flash5 < 0) { flash5++;
+                cv::rectangle(img, {0,0}, {img.cols-1,img.rows-1},
+                              cv::Scalar(70,70,235), 8); }
+            char hud5[64];
+            snprintf(hud5, sizeof hud5, "SCORE %d   LV %d   %s%s%s",
+                     score5, level, lives>0?"O":"", lives>1?"O":"", lives>2?"O":"");
+            cv::putText(img, hud5, {16, img.rows-16}, cv::FONT_HERSHEY_DUPLEX,
+                        0.8, cv::Scalar(20,20,20), 4, cv::LINE_AA);
+            cv::putText(img, hud5, {16, img.rows-16}, cv::FONT_HERSHEY_DUPLEX,
+                        0.8, cv::Scalar(240,240,245), 2, cv::LINE_AA);
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 125) {
+            /* PINATA: it hangs, it swings — HIT IT. Eight solid hits
+             * crack it open in a candy explosion you can bat around;
+             * then a fresh one drops. fx = toughness. */
+            static float ang6 = 0.3f, av6 = 0;
+            static int hp = 8, burst_t = 0, total = 0;
+            static float cx6[70], cy6[70], cvx6[70], cvy6[70];
+            static int cinit6 = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            int maxhp = std::max(4, (int)(8*fx));
+            if (!cinit6) { hp = maxhp; cinit6 = 1; }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            float L6 = img.rows*0.34f;
+            float px6 = img.cols*0.5f + std::sin(ang6)*L6;
+            float py6 = 8 + std::cos(ang6)*L6;
+            float R6 = std::max(24.0f, img.cols*0.06f);
+            if (burst_t == 0) {
+                BodyProbe b6 = probe_body(g_seg.mask, prev, px6, py6, R6*1.1f);
+                static int cool6 = 0;
+                if (cool6 > 0) cool6--;
+                if (b6.hit && cool6 == 0) {
+                    float pw6 = std::sqrt(b6.pux*b6.pux + b6.puy*b6.puy);
+                    if (pw6 > 1.4f) {                    /* a real hit */
+                        hp--;
+                        cool6 = 8;
+                        float tx6 = std::cos(ang6), ty6 = -std::sin(ang6);
+                        av6 += (b6.pux*tx6 + b6.puy*ty6) * 0.004f;
+                        if (hp <= 0) {                   /* BURST */
+                            burst_t = 90; total++;
+                            for (int i2 = 0; i2 < 70; i2++) {
+                                cx6[i2] = px6; cy6[i2] = py6;
+                                float a2 = uhash(i2,tk%71,5)*6.2832f;
+                                float sp2 = 2 + uhash(i2,tk%73,7)*7;
+                                cvx6[i2] = std::cos(a2)*sp2;
+                                cvy6[i2] = std::sin(a2)*sp2 - 2.5f;
+                            }
+                        }
+                    }
+                }
+                av6 -= std::sin(ang6)*0.0018f;
+                av6 *= 0.985f;
+                ang6 += av6;
+                /* draw pinata: striped donkey-ish blob + crack marks */
+                int shake = (hp < maxhp && (tk % 30) < 3) ? 2 : 0;
+                for (int s6 = 0; s6 < 4; s6++)
+                    cv::ellipse(img, {(int)px6+shake,(int)(py6+R6*0.2f)},
+                        {(int)(R6*(1.0f-s6*0.18f)),(int)(R6*1.25f*(1.0f-s6*0.18f))},
+                        ang6*57.3f, 0, 360,
+                        s6%2 ? cv::Scalar(60,80,230) : cv::Scalar(70,200,250),
+                        s6 ? 6 : cv::FILLED, cv::LINE_AA);
+                cv::line(img, {img.cols/2, 2}, {(int)px6,(int)py6},
+                         cv::Scalar(150,150,155), 2, cv::LINE_AA);
+                for (int k2 = 0; k2 < maxhp-hp; k2++) {
+                    float ca = uhash(k2, 5, 9)*6.28f;
+                    cv::line(img, {(int)(px6+std::cos(ca)*R6*0.3f),
+                                   (int)(py6+std::sin(ca)*R6*0.4f)},
+                                  {(int)(px6+std::cos(ca)*R6*0.8f),
+                                   (int)(py6+std::sin(ca)*R6*1.0f)},
+                             cv::Scalar(25,25,30), 2, cv::LINE_AA);
+                }
+                /* HP pips */
+                for (int k2 = 0; k2 < maxhp; k2++)
+                    cv::circle(img, {20+k2*18, 24}, 6,
+                               k2 < hp ? cv::Scalar(80,220,255)
+                                       : cv::Scalar(60,60,70),
+                               cv::FILLED, cv::LINE_AA);
+            } else {
+                /* candy rain: batable, bouncy */
+                burst_t--;
+                for (int i2 = 0; i2 < 70; i2++) {
+                    cvy6[i2] += 0.32f;
+                    cx6[i2] += cvx6[i2]; cy6[i2] += cvy6[i2];
+                    int xi = std::max(0,std::min(img.cols-1,(int)cx6[i2]));
+                    int yi = std::max(0,std::min(img.rows-1,(int)cy6[i2]));
+                    float d6 = g_seg.mask.at<float>(yi,xi) - prev.at<float>(yi,xi);
+                    if (g_seg.mask.at<float>(yi,xi) > 0.5f) {
+                        int x1=std::min(img.cols-1,xi+4), x0=std::max(0,xi-4);
+                        float gx2 = g_seg.mask.at<float>(yi,x1)
+                                  - g_seg.mask.at<float>(yi,x0);
+                        cvx6[i2] -= gx2*6.0f;
+                        cvy6[i2] = -std::fabs(cvy6[i2])*0.7f - std::fabs(d6)*10;
+                    }
+                    if (cy6[i2] > img.rows-4) { cy6[i2]=img.rows-4;
+                        cvy6[i2]=-std::fabs(cvy6[i2])*0.5f; cvx6[i2]*=0.9f; }
+                    if (cx6[i2]<3){cx6[i2]=3;cvx6[i2]=std::fabs(cvx6[i2]);}
+                    if (cx6[i2]>img.cols-4){cx6[i2]=img.cols-4;cvx6[i2]=-std::fabs(cvx6[i2]);}
+                    static const int CC[4][3]={{80,90,240},{70,220,255},
+                                               {200,120,240},{110,230,130}};
+                    const int *c2 = CC[i2&3];
+                    cv::circle(img, {(int)cx6[i2],(int)cy6[i2]}, 4,
+                               cv::Scalar(c2[0],c2[1],c2[2]), cv::FILLED, cv::LINE_AA);
+                }
+                if (burst_t == 0) { hp = maxhp; ang6 = 0.3f; av6 = 0; }
+                cv::putText(img, "FIESTA!", {img.cols/2-80, 60},
+                            cv::FONT_HERSHEY_DUPLEX, 1.3,
+                            cv::Scalar(80,220,255), 2, cv::LINE_AA);
+            }
+            char hud6[32];
+            snprintf(hud6, sizeof hud6, "BROKEN %d", total);
+            cv::putText(img, hud6, {16, img.rows-16}, cv::FONT_HERSHEY_PLAIN,
+                        1.3, cv::Scalar(220,220,230), 1, cv::LINE_AA);
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 126) {
+            /* CHAIN WHIP: a heavy wrecking ball on a Verlet chain hangs
+             * from the top. Shove it, whip it in circles, feel the
+             * momentum — pure physics toy. fx = ball weight. */
+            const int CN = 15;
+            static float nx7[CN], ny7[CN], ox7[CN], oy7[CN];
+            static int cinit7 = 0, cw7 = 0;
+            static cv::Mat prev;
+            if (!cinit7 || cw7 != img.cols) {
+                for (int i2 = 0; i2 < CN; i2++) {
+                    nx7[i2] = img.cols*0.5f;
+                    ny7[i2] = 6 + i2 * (img.rows*0.5f/CN);
+                    ox7[i2] = nx7[i2]; oy7[i2] = ny7[i2];
+                }
+                cinit7 = 1; cw7 = img.cols;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            float seg = img.rows*0.5f/CN;
+            float bR = std::max(18.0f, img.cols*0.045f);
+            /* Verlet + body push on every node (end node heaviest) */
+            for (int i2 = 1; i2 < CN; i2++) {
+                float vx7 = (nx7[i2]-ox7[i2])*0.985f;
+                float vy7 = (ny7[i2]-oy7[i2])*0.985f;
+                ox7[i2] = nx7[i2]; oy7[i2] = ny7[i2];
+                int xi = std::max(0,std::min(img.cols-1,(int)nx7[i2]));
+                int yi = std::max(0,std::min(img.rows-1,(int)ny7[i2]));
+                float m7 = g_seg.mask.at<float>(yi,xi);
+                float d7 = m7 - prev.at<float>(yi,xi);
+                if (m7 > 0.5f || std::fabs(d7) > 0.2f) {
+                    int x1=std::min(img.cols-1,xi+4), x0=std::max(0,xi-4);
+                    int y1=std::min(img.rows-1,yi+4), y0=std::max(0,yi-4);
+                    float gx2 = g_seg.mask.at<float>(yi,x1)-g_seg.mask.at<float>(yi,x0);
+                    float gy2 = g_seg.mask.at<float>(y1,xi)-g_seg.mask.at<float>(y0,xi);
+                    float l2 = std::sqrt(gx2*gx2+gy2*gy2)+1e-3f;
+                    float push = (m7 > 0.5f ? 3.0f : 0.0f)
+                               + std::fabs(d7)*20.0f;
+                    vx7 -= gx2/l2 * push;
+                    vy7 -= gy2/l2 * push;
+                }
+                nx7[i2] += vx7;
+                ny7[i2] += vy7 + 0.5f/std::max(0.5f, fx);   /* gravity */
+            }
+            /* constraints: fixed segment lengths, top pinned */
+            nx7[0] = img.cols*0.5f; ny7[0] = 6;
+            for (int it = 0; it < 6; it++)
+                for (int i2 = 0; i2 < CN-1; i2++) {
+                    float dx3 = nx7[i2+1]-nx7[i2], dy3 = ny7[i2+1]-ny7[i2];
+                    float dl = std::sqrt(dx3*dx3+dy3*dy3)+1e-4f;
+                    float corr = (dl - seg)/dl * 0.5f;
+                    float w1 = (i2==0) ? 0 : 0.5f;
+                    float w2 = (i2+1==CN-1) ? 0.85f : 0.5f;  /* heavy end */
+                    float tot = w1+w2+1e-4f;
+                    nx7[i2]   += dx3*corr*2*w1/tot;
+                    ny7[i2]   += dy3*corr*2*w1/tot;
+                    nx7[i2+1] -= dx3*corr*2*w2/tot;
+                    ny7[i2+1] -= dy3*corr*2*w2/tot;
+                }
+            /* draw: chain links + wrecking ball with speed glow */
+            for (int i2 = 0; i2 < CN-1; i2++)
+                cv::line(img, {(int)nx7[i2],(int)ny7[i2]},
+                              {(int)nx7[i2+1],(int)ny7[i2+1]},
+                         cv::Scalar(160,160,170), i2 < CN-2 ? 3 : 5, cv::LINE_AA);
+            float esp = std::sqrt((nx7[CN-1]-ox7[CN-1])*(nx7[CN-1]-ox7[CN-1])
+                                + (ny7[CN-1]-oy7[CN-1])*(ny7[CN-1]-oy7[CN-1]));
+            int gl7 = std::min(120, (int)(esp*14));
+            cv::circle(img, {(int)nx7[CN-1],(int)ny7[CN-1]}, (int)bR+4,
+                       cv::Scalar(20+gl7/2, 20+gl7, 25+gl7), cv::FILLED, cv::LINE_AA);
+            cv::circle(img, {(int)nx7[CN-1],(int)ny7[CN-1]}, (int)bR,
+                       cv::Scalar(70+gl7, 80+gl7, 95+gl7), cv::FILLED, cv::LINE_AA);
+            cv::circle(img, {(int)(nx7[CN-1]-bR*0.3f),(int)(ny7[CN-1]-bR*0.3f)},
+                       (int)(bR*0.3f), cv::Scalar(210,215,225), cv::FILLED, cv::LINE_AA);
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 127) {
+            /* PLASMA ORBS: charged spheres that repel each other and
+             * arrange themselves — shove one and the whole formation
+             * reorganizes. Electric arcs crackle between close pairs.
+             * Force-field's big brother. fx = charge. */
+            const int NO = 13;
+            static float ox8[NO], oy8[NO], ovx[NO], ovy[NO];
+            static int oinit = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (!oinit) {
+                for (int i2 = 0; i2 < NO; i2++) {
+                    ox8[i2] = (0.2f+0.6f*uhash(i2,1,67))*img.cols;
+                    oy8[i2] = (0.2f+0.6f*uhash(i2,2,67))*img.rows;
+                    ovx[i2] = ovy[i2] = 0;
+                }
+                oinit = 1;
+            }
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            float oR = std::max(12.0f, img.cols*0.022f);
+            for (int i2 = 0; i2 < NO; i2++) {
+                /* mutual Coulomb repulsion */
+                for (int j2 = 0; j2 < NO; j2++) {
+                    if (j2 == i2) continue;
+                    float dx3 = ox8[i2]-ox8[j2], dy3 = oy8[i2]-oy8[j2];
+                    float d2 = dx3*dx3+dy3*dy3+40;
+                    float f2 = 5200.0f * fx / d2;
+                    float dl = std::sqrt(d2);
+                    ovx[i2] += dx3/dl * f2;
+                    ovy[i2] += dy3/dl * f2;
+                }
+                /* soft wall confinement */
+                if (ox8[i2] < oR*2) ovx[i2] += (oR*2-ox8[i2])*0.02f;
+                if (ox8[i2] > img.cols-oR*2) ovx[i2] -= (ox8[i2]-(img.cols-oR*2))*0.02f;
+                if (oy8[i2] < oR*2) ovy[i2] += (oR*2-oy8[i2])*0.02f;
+                if (oy8[i2] > img.rows-oR*2) ovy[i2] -= (oy8[i2]-(img.rows-oR*2))*0.02f;
+                /* body shove (probe on each orb) */
+                BodyProbe b8 = probe_body(g_seg.mask, prev, ox8[i2], oy8[i2], oR*1.3f);
+                if (b8.hit) {
+                    ovx[i2] += b8.nx*2.2f + b8.pux*1.2f;
+                    ovy[i2] += b8.ny*2.2f + b8.puy*1.2f;
+                }
+                ovx[i2] *= 0.90f; ovy[i2] *= 0.90f;
+                ox8[i2] += ovx[i2]; oy8[i2] += ovy[i2];
+                ox8[i2] = std::max(oR, std::min(img.cols-oR, ox8[i2]));
+                oy8[i2] = std::max(oR, std::min(img.rows-oR, oy8[i2]));
+            }
+            /* arcs between close pairs */
+            for (int i2 = 0; i2 < NO; i2++)
+                for (int j2 = i2+1; j2 < NO; j2++) {
+                    float dx3 = ox8[j2]-ox8[i2], dy3 = oy8[j2]-oy8[i2];
+                    float d = std::sqrt(dx3*dx3+dy3*dy3);
+                    if (d > img.cols*0.24f) continue;
+                    int segs = 5;
+                    int lx3 = (int)ox8[i2], ly3 = (int)oy8[i2];
+                    for (int k2 = 1; k2 <= segs; k2++) {
+                        float t2 = (float)k2/segs;
+                        int jx = (int)(ox8[i2]+dx3*t2
+                                 + (uhash(i2*31+j2,k2,tk)-0.5f)*14);
+                        int jy = (int)(oy8[i2]+dy3*t2
+                                 + (uhash(j2*37+i2,k2,tk+1)-0.5f)*14);
+                        if (k2 == segs) { jx=(int)ox8[j2]; jy=(int)oy8[j2]; }
+                        cv::line(img, {lx3,ly3}, {jx,jy},
+                                 cv::Scalar(255,210,140), 1, cv::LINE_AA);
+                        lx3=jx; ly3=jy;
+                    }
+                }
+            /* orbs with velocity glow */
+            for (int i2 = 0; i2 < NO; i2++) {
+                float sp2 = std::sqrt(ovx[i2]*ovx[i2]+ovy[i2]*ovy[i2]);
+                int gl8 = std::min(90, (int)(sp2*30));
+                cv::circle(img, {(int)ox8[i2],(int)oy8[i2]}, (int)(oR*1.7f),
+                           cv::Scalar(60+gl8/2, 40+gl8/2, 20), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)ox8[i2],(int)oy8[i2]}, (int)oR,
+                           cv::Scalar(255, 190+gl8/2, 120+gl8), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, {(int)(ox8[i2]-oR*0.3f),(int)(oy8[i2]-oR*0.3f)},
+                           (int)(oR*0.32f), cv::Scalar(255,250,235),
+                           cv::FILLED, cv::LINE_AA);
+            }
+            g_seg.mask.copyTo(prev);
+            return;
+        }
+        if (mode == 128) {
+            /* TARGET PUCK: an air-hockey puck glides friction-free.
+             * Strike it through the glowing target ring — score, ring
+             * jumps somewhere new. Precision keepy-uppy, horizontal.
+             * fx = puck speed retention. */
+            static float px9 = -1, py9 = 0, vx9 = 0, vy9 = 0;
+            static float tx9 = 0, ty9 = 0;
+            static int score9 = 0, streak9 = 0, flash9 = 0, tinit9 = 0;
+            static cv::Mat prev;
+            unsigned tk = g_seg.counter;
+            if (prev.empty() || prev.size() != g_seg.mask.size())
+                g_seg.mask.copyTo(prev);
+            float pR = std::max(14.0f, img.cols*0.028f);
+            float tR = pR*2.4f;
+            if (!tinit9 || px9 < 0) {
+                px9 = img.cols*0.5f; py9 = img.rows*0.55f;
+                vx9 = 2.4f; vy9 = -1.2f;
+                if (!tinit9) {
+                    tx9 = img.cols*0.75f; ty9 = img.rows*0.3f;
+                    tinit9 = 1;
+                }
+            }
+            float fric = 0.985f + 0.012f*std::min(1.0f, fx*0.5f);
+            if (fric > 0.998f) fric = 0.998f;
+            vx9 *= fric; vy9 *= fric;
+            px9 += vx9; py9 += vy9;
+            if (px9 < pR) { px9=pR; vx9=std::fabs(vx9)*0.96f; }
+            if (px9 > img.cols-pR) { px9=img.cols-pR; vx9=-std::fabs(vx9)*0.96f; }
+            if (py9 < pR) { py9=pR; vy9=std::fabs(vy9)*0.96f; }
+            if (py9 > img.rows-pR) { py9=img.rows-pR; vy9=-std::fabs(vy9)*0.96f; }
+            BodyProbe b9 = probe_body(g_seg.mask, prev, px9, py9, pR);
+            if (b9.hit) {
+                float dot = vx9*b9.nx + vy9*b9.ny;
+                if (dot < 0) { vx9 -= 2*dot*b9.nx; vy9 -= 2*dot*b9.ny; }
+                vx9 += b9.nx*1.5f + b9.pux*1.1f;
+                vy9 += b9.ny*1.5f + b9.puy*1.1f;
+                float sp2 = std::sqrt(vx9*vx9+vy9*vy9);
+                if (sp2 > 22) { vx9*=22/sp2; vy9*=22/sp2; }
+                px9 += b9.nx*3; py9 += b9.ny*3;
+            }
+            /* through the target? require real speed so parking doesn't count */
+            float td = std::sqrt((px9-tx9)*(px9-tx9)+(py9-ty9)*(py9-ty9));
+            float psp = std::sqrt(vx9*vx9+vy9*vy9);
+            if (td < tR*0.7f && psp > 2.2f) {
+                score9++; streak9++; flash9 = 14;
+                tx9 = (0.15f+0.7f*uhash(score9,tk%79,3))*img.cols;
+                ty9 = (0.15f+0.6f*uhash(tk%83,score9,5))*img.rows;
+            }
+            if (psp < 0.4f && streak9 > 0) streak9 = 0;   /* stalled */
+            /* draw target ring (pulsing) */
+            float pul = 0.85f + 0.15f*std::sin(tk*0.15f);
+            cv::circle(img, {(int)tx9,(int)ty9}, (int)(tR*pul),
+                       flash9>0 ? cv::Scalar(120,255,140) : cv::Scalar(80,200,255),
+                       3, cv::LINE_AA);
+            cv::circle(img, {(int)tx9,(int)ty9}, (int)(tR*0.45f*pul),
+                       cv::Scalar(60,150,220), 2, cv::LINE_AA);
+            /* puck with motion trail */
+            for (int k2 = 1; k2 <= 4; k2++)
+                cv::circle(img, {(int)(px9-vx9*k2*1.2f),(int)(py9-vy9*k2*1.2f)},
+                           std::max(2,(int)(pR*(1.0f-k2*0.2f))),
+                           cv::Scalar(40,45,60), 1, cv::LINE_AA);
+            cv::circle(img, {(int)px9,(int)py9}, (int)pR+3,
+                       cv::Scalar(20,20,25), cv::FILLED, cv::LINE_AA);
+            cv::circle(img, {(int)px9,(int)py9}, (int)pR,
+                       cv::Scalar(240,120,90), cv::FILLED, cv::LINE_AA);
+            cv::circle(img, {(int)px9,(int)py9}, (int)(pR*0.55f),
+                       cv::Scalar(255,170,140), 2, cv::LINE_AA);
+            if (flash9 > 0) flash9--;
+            char hud9[48];
+            snprintf(hud9, sizeof hud9, "%d", score9);
+            cv::putText(img, hud9, {22,54}, cv::FONT_HERSHEY_DUPLEX, 1.7,
+                        cv::Scalar(20,20,20), 5, cv::LINE_AA);
+            cv::putText(img, hud9, {22,54}, cv::FONT_HERSHEY_DUPLEX, 1.7,
+                        cv::Scalar(80,200,255), 2, cv::LINE_AA);
+            if (streak9 > 2) {
+                snprintf(hud9, sizeof hud9, "x%d STREAK", streak9);
+                cv::putText(img, hud9, {22,82}, cv::FONT_HERSHEY_DUPLEX, 0.8,
+                            cv::Scalar(120,255,140), 2, cv::LINE_AA);
+            }
+            g_seg.mask.copyTo(prev);
             return;
         }
         if (mode == 119) {
@@ -6925,6 +8097,29 @@ struct PoseState {
 };
 static PoseState g_pose_s;
 
+static int pose_step_locked(unsigned char *data, int w, int h, int stride);
+
+/* Wrists from BlazePose for interactive modes: fills
+ * out[0..2] = left wrist x,y,vis and out[3..5] = right wrist.
+ * Returns 0 if the pose backend/model isn't available or tracking
+ * hasn't locked yet. */
+static int cv_pose_hands(unsigned char *data, int w, int h, int stride,
+                         float out[6])
+{
+    if (!data || w < 64 || h < 64) return 0;
+    if (!ort_available()) return 0;
+    try {
+        std::lock_guard<std::mutex> l(g_pose_s.mtx);
+        if (!pose_step_locked(data, w, h, stride)) return 0;
+        if (!g_pose_s.have || g_pose_s.good < 2) return 0;
+        out[0] = g_pose_s.lm[15][0]; out[1] = g_pose_s.lm[15][1];
+        out[2] = g_pose_s.lm[15][2];
+        out[3] = g_pose_s.lm[16][0]; out[4] = g_pose_s.lm[16][1];
+        out[5] = g_pose_s.lm[16][2];
+        return 1;
+    } catch (const std::exception &) { return 0; }
+}
+
 int cv_set_pose_model(const char *path)
 {
     if (!path || !*path || !path_exists(path)) return 0;
@@ -6941,23 +8136,11 @@ static const int POSE_BONES[][2] = {
     {11,12},{11,13},{13,15},{12,14},{14,16},{11,23},{12,24},{23,24},
     {23,25},{25,27},{24,26},{26,28},{0,11},{0,12}};
 
-void cv_fx_pose(unsigned char *data, int w, int h, int stride,
-                int mode, float fx)
+/* run the pose state machine + paced inference; caller holds
+ * g_pose_s.mtx. Returns 0 when the backend/model is unavailable. */
+static int pose_step_locked(unsigned char *data, int w, int h, int stride)
 {
-    if (!data || w < 64 || h < 64) return;
-    if (mode < 0) mode = 0;
-    if (mode > 5) mode = 5;
-    if (fx <= 0.0f) fx = 1.0f;
-    if (fx < 0.2f) fx = 0.2f;
-    if (fx > 3.0f) fx = 3.0f;
-    if (!ort_available()) {
-        warn_once("pose_ort", "posefx needs the ONNX Runtime backend — "
-                  "vcam-setup --ort, then make OPENCV=1 ORT=1");
-        return;
-    }
-    try {
-        std::lock_guard<std::mutex> l(g_pose_s.mtx);
-        if (g_pose_s.state < 0) return;
+        if (g_pose_s.state < 0) return 0;
         if (g_pose_s.state == 0) {
             std::string p = g_pose_s.path.empty()
                 ? model_dir() + "/pose_estimation_mediapipe_2023mar.onnx"
@@ -6966,9 +8149,9 @@ void cv_fx_pose(unsigned char *data, int w, int h, int stride,
                 g_pose_s.state = -1;
                 warn_once("pose_model",
                     "posefx: no pose model — run 'vcam-setup --models-pose'");
-                return;
+                return 0;
             }
-            if (!ort_pose_init(p.c_str())) { g_pose_s.state = -1; return; }
+            if (!ort_pose_init(p.c_str())) { g_pose_s.state = -1; return 0; }
             g_pose_s.state = 1;
             warn_once("pose_on", "posefx: body landmarks live — vcam can "
                       "see your skeleton now");
@@ -7030,7 +8213,7 @@ void cv_fx_pose(unsigned char *data, int w, int h, int stride,
             float lm195[195], conf = 0;
             if (!ort_pose_infer(in.data(), lm195, &conf)) {
                 g_pose_s.state = -1;
-                return;
+                return 0;
             }
             if (conf < 0.0f || conf > 1.0f)               /* raw logit */
                 conf = 1.0f / (1.0f + std::exp(-conf));
@@ -7084,6 +8267,27 @@ void cv_fx_pose(unsigned char *data, int w, int h, int stride,
         } else {
             g_pose_s.skip_left--;
         }
+    return 1;
+}
+
+void cv_fx_pose(unsigned char *data, int w, int h, int stride,
+                int mode, float fx)
+{
+    if (!data || w < 64 || h < 64) return;
+    if (mode < 0) mode = 0;
+    if (mode > 5) mode = 5;
+    if (fx <= 0.0f) fx = 1.0f;
+    if (fx < 0.2f) fx = 0.2f;
+    if (fx > 3.0f) fx = 3.0f;
+    if (!ort_available()) {
+        warn_once("pose_ort", "posefx needs the ONNX Runtime backend — "
+                  "vcam-setup --ort, then make OPENCV=1 ORT=1");
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> l(g_pose_s.mtx);
+        if (!pose_step_locked(data, w, h, stride)) return;
+        cv::Mat img(h, w, CV_8UC3, data, stride);
         if (!g_pose_s.have || g_pose_s.good < 2) return;   /* debounced */
         float (*L)[3] = g_pose_s.lm;
         auto P = [&](int i){ return cv::Point((int)L[i][0], (int)L[i][1]); };

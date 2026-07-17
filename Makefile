@@ -97,6 +97,12 @@ ifeq ($(OPENCV),1)
     CXXFLAGS  := -std=c++17 -O2 -Wall -Wextra -I include $(CV_CFLAGS)
     CV_OBJ    := src/opencv_fx.o
     LDFLAGS   += $(CV_LIBS)
+    # Optional X11: powers the 'virtual-room' screen-region grabber.
+    # Auto-detected; without libx11-dev the mode explains what to install.
+    ifeq ($(shell pkg-config --exists x11 && echo ok),ok)
+        CXXFLAGS += -DVCAM_HAVE_X11 $(shell pkg-config --cflags x11)
+        LDFLAGS  += $(shell pkg-config --libs x11)
+    endif
     LINK      := $(CXX)
     CFLAGS    += -DVCAM_HAVE_OPENCV=1
     $(info vcam: OpenCV enabled — module '$(OPENCV_PC)' version $(CV_VER))

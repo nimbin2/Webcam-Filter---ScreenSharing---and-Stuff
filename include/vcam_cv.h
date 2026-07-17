@@ -144,6 +144,12 @@ void cv_fx_paintflow(unsigned char *data, int w, int h, int stride,
 void cv_fx_speedlines(unsigned char *data, int w, int h, int stride,
                       float sens, float density);
 
+/* virtual-room (personfx 132): select the screen region containing the
+ * other person; vcam grabs it live, cuts the person out, and seats you
+ * both in a rendered room. */
+int  cv_room_set_region(int x, int y, int w, int h);
+void cv_room_off(void);
+
 /* posefx: BlazePose body landmarks (MediaPipe pose via ORT).
  * Model: <models>/pose_estimation_mediapipe_2023mar.onnx
  * (vcam-setup --models-pose) or 'filter posemodel <path>'.

@@ -288,6 +288,19 @@ if [ "${1:-}" = "ai" ]; then
     case "$T" in *slime*|*goo*|*sticky*|*gunge*) fadd "personfx 121" "slime (it clings to you)";; esac
     case "$T" in *leaf*|*leaves*|*autumn*|*wind*) fadd "personfx 122" "leaf storm (your wake blows them)";; esac
     case "$T" in *filing*|*magnet*field*|*"iron"*) fadd "personfx 123" "iron filings (you are the magnet)";; esac
+    case "$T" in *breakout*|*brick*break*|*arkanoid*) fadd "personfx 124" "breakout (you are the paddle)";; esac
+    case "$T" in *pinata*|*piñata*|*candy*) fadd "personfx 125" "pinata (break it open!)";; esac
+    case "$T" in *whip*|*wrecking*|*chain*|*pendulum*) fadd "personfx 126" "chain whip (swing it)";; esac
+    case "$T" in *plasma*|*orbs*|*charged*|*repel*) fadd "personfx 127" "plasma orbs (shove the formation)";; esac
+    case "$T" in *puck*|*hockey*|*target*) fadd "personfx 128" "target puck (shoot the ring)";; esac
+    case "$T" in *crate*|*carry*|*grab*|*"pick up"*) fadd "personfx 129" "carry crates (grab and stack)";; esac
+    case "$T" in *lift*|*beam*|*"both hands"*|*balance*) fadd "personfx 130" "two-hand lift (balance the beam)";; esac
+    case "$T" in *"virtual room"*|*"sit together"*|*"next to"*|*"same room"*|*"together"*)
+        fadd "personfx 132" "virtual room"
+        echo "  then select the other person:  vcam-ctl room pick";; esac
+    case "$T" in *wrist*|*"real hands"*|*"hand tracking"*|*gauntlet*)
+        fadd "personfx 131" "wrist magnet (tracked hands)"
+        echo "  hint: needs the pose model ->  vcam-setup --models-pose";; esac
     case "$T" in *ball*|*game*|*juggl*|*keepy*|*football*|*soccer*|*play*)
         fadd "personfx 108" "keepy-uppy (bounce the ball, keep it up!)";; esac
     case "$T" in *skeleton*|*bones*) fadd "posefx 0" "skeleton";; esac
@@ -343,6 +356,43 @@ show_help() { sed -n '/^# vcam-ctl/,/^$/p' "$0" | sed 's/^# \?//'; }
 # ── basic usage / help ───────────────────────────────────────
 if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     show_help
+    exit 0
+fi
+
+# ── room: virtual co-presence — you + a screen-region person ─
+# Usage:  vcam-ctl room pick            (draw the region with the mouse)
+#         vcam-ctl room set <x y w h>   (manual coordinates)
+#         vcam-ctl room off
+if [ "${1:-}" = "room" ]; then
+    shift
+    case "${1:-}" in
+        pick)
+            if ! command -v slop >/dev/null 2>&1; then
+                echo "'slop' not found — install it (sudo apt install slop), or:"
+                echo "    vcam-ctl room set <x> <y> <w> <h>"
+                exit 1
+            fi
+            echo "draw a rectangle around the OTHER person's video..."
+            G=$(slop -f "%x %y %w %h") || exit 1
+            # shellcheck disable=SC2086
+            set -- $G
+            "$0" filter roomregion "$1" "$2" "$3" "$4"
+            "$0" filter add personfx 132
+            echo "their size:  vcam-ctl filter set <idx> p5 1.2    their seat: p2 0.8"
+            ;;
+        set)
+            shift
+            "$0" filter roomregion "${1:?x}" "${2:?y}" "${3:?w}" "${4:?h}"
+            "$0" filter add personfx 132
+            ;;
+        off)
+            "$0" filter roomregion off
+            ;;
+        *)
+            echo "usage: vcam-ctl room pick | room set <x> <y> <w> <h> | room off"
+            exit 1
+            ;;
+    esac
     exit 0
 fi
 

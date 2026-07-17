@@ -60,6 +60,11 @@ void cv_fx_paintflow(unsigned char *d, int w, int h, int s, float st, float dc)
 void cv_fx_speedlines(unsigned char *d, int w, int h, int s, float a, float b)
 { (void)d; (void)w; (void)h; (void)s; (void)a; (void)b; }
 
+int  cv_room_set_region(int x, int y, int w, int h)
+{ (void)x; (void)y; (void)w; (void)h; return 0; }
+
+void cv_room_off(void) { }
+
 void cv_fx_pose(unsigned char *d, int w, int h, int s, int m, float fx)
 { (void)d; (void)w; (void)h; (void)s; (void)m; (void)fx; }
 
