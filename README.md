@@ -773,19 +773,3 @@ see the camera, missing build tools) are covered in
 | Video plays jerky/jumps back | (was) spin limit too tight | rebuild — limit raised, `vid_eof_sent` flag added |
 | `shell-init: getcwd error retrieving current directory` | Your *shell* sits in a deleted directory — **not a vcam bug** | `cd ~` in that terminal |
 | High CPU at 1080p | `blur` / `painterly` / `voronoi` are O(W·H·r²) | smaller param, drop to 720p, or pick cheaper filters |
-
----
-
-## License
-
-vcam is free software under the **GNU General Public License, version 2**
-(GPL-2.0-only). See [LICENSE](LICENSE) for the full text and [NOTICE](NOTICE)
-for third-party components.
-
-The dependencies are all GPL-2.0-compatible: FFmpeg (LGPL-2.1+, some parts
-GPL), libpng (permissive), and the ALSA/v4l2loopback runtime tools. One
-caveat worth knowing if you *redistribute builds*: if you bundle an FFmpeg
-compiled with `--enable-nonfree` (e.g. with `libfdk-aac`), that combined
-binary is not redistributable. vcam itself links only the standard LGPL
-FFmpeg libraries and shells out to whatever `ffmpeg` is on your PATH for
-recording, so this only matters if you package FFmpeg together with vcam.
