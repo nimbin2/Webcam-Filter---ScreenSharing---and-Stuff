@@ -38,3 +38,4 @@ core.*
 vgcore.*
 
 .built-opencv-1-ort-1
+.built-opencv-0-ort-0

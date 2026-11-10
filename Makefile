@@ -4,7 +4,7 @@
 CC      := gcc
 CXX     := g++
 
-CFLAGS  := -std=c11 -O2 -Wall -Wextra -Wpedantic \
+CFLAGS  := -std=c23 -O2 -Wall -Wextra -Wpedantic \
             -D_POSIX_C_SOURCE=200809L \
             -I include \
             $(shell pkg-config --cflags libavcodec libavformat libavutil libswscale) \
@@ -94,7 +94,7 @@ ifeq ($(OPENCV),1)
     # -isystem instead of -I: OpenCV's own headers shouldn't trip our -Wall
     CV_CFLAGS := $(patsubst -I%,-isystem %,$(shell pkg-config --cflags $(OPENCV_PC)))
     CV_LIBS   := $(shell pkg-config --libs   $(OPENCV_PC))
-    CXXFLAGS  := -std=c++17 -O2 -Wall -Wextra -I include $(CV_CFLAGS)
+    CXXFLAGS  := -std=c++26 -O2 -Wall -Wextra -I include $(CV_CFLAGS)
     CV_OBJ    := src/opencv_fx.o
     LDFLAGS   += $(CV_LIBS)
     # Optional X11: powers the 'virtual-room' screen-region grabber.
@@ -191,7 +191,7 @@ else
 endif
 
 $(TEST): src/test_screen.c
-	$(CC) -std=c11 -O2 -Wall -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+	$(CC) -std=c23 -O2 -Wall -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
 	    -o $@ src/test_screen.c
 
 # C objects depend on both headers so an ABI change triggers a rebuild.
@@ -220,7 +220,6 @@ endif
 	install -m 755 scripts/vcam-setup   $(DESTDIR)$(BINDIR)/
 	install -m 755 scripts/vcam-tune    $(DESTDIR)$(BINDIR)/
 	install -d $(DESTDIR)$(DOCDIR)
-	install -m 644 LICENSE              $(DESTDIR)$(DOCDIR)/
 	install -m 644 NOTICE               $(DESTDIR)$(DOCDIR)/
 	install -m 644 README.md            $(DESTDIR)$(DOCDIR)/
 	install -m 644 INSTALL.md           $(DESTDIR)$(DOCDIR)/
