@@ -14,7 +14,7 @@
  *
  *   status [json]              whole state: "OK k=v k=v ..." or one JSON line
  *   get <key>                  one value from status, e.g. "get cam_pos" → "OK br"
- *   version                    "OK vcam 1.1.0 (build abc1234)"  — full reference: API.md
+ *   version                    "OK vcam 1.1.1 (build abc1234)"  — full reference: API.md
  *   monitors                   one line per monitor: "OK <n> <name> WxH+X+Y"
  *
  *   share start [<n>|<name>|<WxH+X+Y>] [fit=stretch|contain]
@@ -811,9 +811,11 @@ static bool capture_handle(int fd, char **save)
             else if (!strncmp(t, "fps=", 4)) { fps = atoi(t + 4); if (fps <= 0) goto bad; continue; }
             else if (!strncmp(t, "fit=", 4)) { fit = parse_fit(t + 4); if (fit < 0) goto bad; continue; }
             else if (!strncmp(t, "res=", 4)) v = t + 4;
-            char tail;
+            /* parse into temporaries: a failed sscanf may still have
+             * written the first number (a bare fps "30" clobbered w) */
+            int pw, ph; char tail;
             if (!strcmp(v, "max"))                                   { w = h = -1; continue; }
-            if (sscanf(v, "%dx%d%c", &w, &h, &tail) == 2 && w > 0 && h > 0) continue;
+            if (sscanf(v, "%dx%d%c", &pw, &ph, &tail) == 2 && pw > 0 && ph > 0) { w = pw; h = ph; continue; }
             if (v == t && strspn(t, "0123456789") == strlen(t))      { fps = atoi(t); if (fps <= 0) goto bad; continue; }
             if (v == t)                                              { fmt = t; continue; }
         bad:
