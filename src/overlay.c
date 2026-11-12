@@ -4,6 +4,8 @@
  *
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
+ *
+ * Modified-by: Claude Opus 5.5 (even-height rounding in webcam aspect fix-up)
  */
 
 #include "vcam.h"
@@ -700,6 +702,7 @@ void overlay_tick(Overlay *o, const Frame *webcam_src)
                  * the user gave just width — recompute dst from real src. */
                 int new_dst_w = o->dst_w;
                 int new_dst_h = (int)((long)new_dst_w * sh / sw);
+                if (new_dst_h & 1) new_dst_h++;   /* same rounding as resolve_dims [Claude Opus 5.5] */
                 if (new_dst_h != o->dst_h) {
                     free(o->pixels);
                     o->pixels = calloc(1, (size_t)new_dst_w * new_dst_h * 3);

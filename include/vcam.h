@@ -4,6 +4,8 @@
  *
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
+ *
+ * Modified-by: Claude Opus 5.5 (control API declarations)
  */
 
 #pragma once
@@ -317,7 +319,7 @@ bool     registry_set_z (OverlayRegistry *r, const char *id, int target);
  *   quit
  * Responses are newline-terminated text lines.
  * ────────────────────────────────────────────── */
-#define VCAM_SOCK_PATH "/tmp/vcam.sock"
+#define VCAM_SOCK_PATH "/tmp/vcam.sock"   /* default; env VCAM_SOCK overrides */
 
 typedef struct {
     OverlayRegistry *registry;
@@ -328,6 +330,18 @@ typedef struct {
 
 bool ipc_start(IPCServer *srv, OverlayRegistry *reg);
 void ipc_stop (IPCServer *srv);
+const char *ipc_sock_path(void);   /* the path actually in use */
+
+/* ──────────────────────────────────────────────
+ * Control API (src/api.c) — high-level, script/app friendly commands
+ * on the same socket: status, get, share, cam, monitors, version.
+ * [Claude Opus 5.5]
+ * ────────────────────────────────────────────── */
+#define VCAM_VERSION "1.0.0"
+
+/* Returns true if <cmd> was an API command (reply already sent). */
+bool        api_handle(int fd, const char *cmd, char **save, OverlayRegistry *reg);
+const char *api_version_string(void);   /* "vcam 1.0.0 (build abc1234)" */
 
 /* ──────────────────────────────────────────────
  * V4L2 capture

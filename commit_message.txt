@@ -1,0 +1,23 @@
+Add control API for screen sharing and webcam PiP (vcam 1.0.0)
+
+New high-level commands on the IPC socket, built for other apps:
+- status [json] / get <key>: machine-readable state (share on/off,
+  fullscreen, monitor, cam position/size, cam_over_screen, ...)
+- share start|stop|toggle: fullscreen share of a monitor (by index,
+  name or WxH+X+Y), with optional cam=<pos> in one call
+- cam on|off|toggle|pos|move|size|margin|raise|get: webcam PiP control
+- monitors: server-side detection (sway, Hyprland, wlr-randr, xrandr,
+  /sys/class/drm fallback)
+- version: version + md5 build hash (also vcam --version, make version)
+
+IPC: one thread per client (commands serialised), so a long-lived
+controller no longer blocks vcam-ctl. VCAM_SOCK now also works for the
+daemon. vcam-ctl wraps the new commands with bare output and exit 1 on
+ERR.
+
+Also: webcam overlay aspect fix-up now rounds height like resolve_dims
+(no 1px jump on first frame), Makefile defaults to PREFIX=/usr, README
+gets a Control API section.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MZiVJi7adqtP79SuimnK7v

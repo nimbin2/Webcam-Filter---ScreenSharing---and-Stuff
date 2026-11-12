@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
+# Modified-by: Claude Opus 5.5 (api.c, build hash, PREFIX=/usr)
 
 CC      := gcc
 CXX     := g++
@@ -141,18 +142,24 @@ else
 endif
 
 # ── Install paths (overridable) ─────────────────────────────────────
-#   make install                       (default: /usr/local)
+#   make install                       (default: /usr → binaries in /usr/bin)
+#   make install PREFIX=/usr/local     (classic local prefix)
 #   make install PREFIX=$HOME/.local   (user-local)
 #   make install DESTDIR=/tmp/stage    (staged install for packaging)
-PREFIX  ?= /usr/local
+PREFIX  ?= /usr
 BINDIR  ?= $(PREFIX)/bin
 DOCDIR  ?= $(PREFIX)/share/doc/vcam
 DATADIR ?= $(PREFIX)/share/vcam
 
 SRCS := src/main.c src/frame.c src/capture.c src/output.c \
         src/overlay.c src/registry.c src/ipc.c src/filter.c \
-        src/record.c src/ort_rvm.c
+        src/record.c src/ort_rvm.c src/api.c
 OBJS := $(SRCS:.c=.o) $(CV_OBJ)
+
+# Build hash: md5 over every source input, so 'vcam --version' and
+# 'vcam-ctl version' tell you exactly which files a binary was built from.
+HASH_INPUTS := $(SRCS) $(wildcard include/*.h src/*.cpp src/opencv_stub.c scripts/*) Makefile
+BUILD_HASH  := $(shell cat $(HASH_INPUTS) 2>/dev/null | md5sum | cut -c1-7)
 BIN  := vcam
 TEST := test_screen
 
@@ -166,9 +173,16 @@ TEST := test_screen
 # and install the stub flavor over your OpenCV build.
 CONFIG_STAMP := .built-opencv-$(OPENCV)-ort-$(ORT)
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall version
 
 all: $(BIN) $(TEST)
+
+version:
+	@echo "vcam $$(sed -n 's/^#define VCAM_VERSION "\(.*\)"/\1/p' include/vcam.h) (build $(BUILD_HASH))"
+
+# api.c embeds the build hash → rebuild it whenever any input changes
+src/api.o: CFLAGS += -DVCAM_BUILD=\"$(BUILD_HASH)\"
+src/api.o: $(HASH_INPUTS)
 
 $(CONFIG_STAMP):
 	@rm -f .built-opencv-*

@@ -1,6 +1,6 @@
 # vcam — virtual webcam pipeline
 
-> 🤖 **This is 100% Vibecode by ClaudeCode.** Every line of C, every shell
+> 🤖 **This is 100% Vibecode by ClaudeCode — but tested.** Every line of C, every shell
 > script, and every word of this README was written by Claude through a
 > long iterative back-and-forth. No human authored any of it directly —
 > only the prompts that shaped it.
@@ -42,7 +42,7 @@ Full details — dependencies, build options, the one-time device setup —
 are in **[INSTALL.md](INSTALL.md)**. The short version:
 
 ```bash
-# 1. Dependencies (Debian / Ubuntu)
+# 1. Dependencies (Debian; names differ on other distros)
 sudo apt install \
     libv4l-dev libavcodec-dev libavformat-dev libavutil-dev \
     libswscale-dev libavdevice-dev libpng-dev \
@@ -295,7 +295,62 @@ vcam-ctl filter add mirror          # both corners are mirrored
 In `--no-input` mode (no cam captured) webcam overlays simply show
 black. If you want screencast + webcam corner, run vcam *without*
 `--no-input` and cover the base with a fullscreen screen overlay as
-shown above.
+shown above. To drive all of this from another app, see
+[Control API](#control-api-for-other-apps).
+
+---
+
+## Control API (for other apps)
+
+vcam listens on a Unix socket: `/tmp/vcam.sock` (override with `VCAM_SOCK`).
+One command per line, one-line replies: `OK …` or `ERR …`.
+Several apps can stay connected at the same time.
+
+| Command | What it does |
+|---|---|
+| `status` / `status json` | Whole state as `key=value` line, or one JSON line. |
+| `get <key>` | One value, e.g. `get cam_pos` → `OK br`. |
+| `share start [<n>\|<name>\|<WxH+X+Y>] [fit=stretch\|contain] [cam=<pos>\|off] [camw=N]` | Fullscreen share. Default: first monitor. |
+| `share stop` / `share toggle` | Stop / toggle sharing. |
+| `cam on [<pos>] [<w>]` / `cam off` / `cam toggle` | Webcam PiP. pos: `tl tr bl br center full`. |
+| `cam pos <pos>` / `cam move <x> <y>` / `cam size <w>` / `cam margin <px>` | Place the cam. |
+| `monitors` | `OK 1 DP-1 1920x1080+0+0` per monitor. |
+| `version` | `OK vcam 1.0.0 (build abc1234)` |
+
+Useful keys: `share`, `share_fullscreen`, `share_monitor`, `cam`,
+`cam_pos` (`tl tr bl br center full custom -`), `cam_x/y/w/h`,
+`cam_over_screen`, `input`, `recording`.
+`cam_over_screen=yes` means a cam is drawn on top of the shared screen.
+
+Shell (`vcam-ctl` strips `OK`, exits 1 on `ERR`):
+
+```bash
+vcam-ctl share start cam=br     # share monitor 1, cam bottom-right
+vcam-ctl get cam_pos            # → br
+vcam-ctl get cam_over_screen    # → yes
+vcam-ctl cam pos tl
+vcam-ctl status --json
+vcam-ctl share stop
+```
+
+Raw socket / Python:
+
+```bash
+printf 'status json\nquit\n' | ncat -U /tmp/vcam.sock
+```
+
+```python
+import socket
+s = socket.socket(socket.AF_UNIX); s.connect("/tmp/vcam.sock")
+f = s.makefile("rw")
+f.write("get cam_pos\n"); f.flush(); print(f.readline())   # OK br
+```
+
+Notes:
+
+- Run vcam *with* the webcam (no `--no-input`): the share covers the cam, the PiP sits on top.
+- Monitors are detected via sway, Hyprland, wlr-randr or xrandr (fallback: `/sys/class/drm`).
+- `fit=contain` keeps the screen's aspect ratio; the bars then show the webcam.
 
 ---
 
@@ -731,8 +786,10 @@ scripts/
 ```bash
 make              # build vcam and test_screen with -Wall -Wextra -Wpedantic -O2
 make clean
-sudo make install                       # → /usr/local/bin
+sudo make install                       # → /usr/bin
+sudo make uninstall
 make install PREFIX=$HOME/.local        # user-local, no root needed
+make version                            # version + md5 build hash
 ```
 
 To add a new source file, drop it in `src/` and append to `SRCS` in the
@@ -773,3 +830,5 @@ see the camera, missing build tools) are covered in
 | Video plays jerky/jumps back | (was) spin limit too tight | rebuild — limit raised, `vid_eof_sent` flag added |
 | `shell-init: getcwd error retrieving current directory` | Your *shell* sits in a deleted directory — **not a vcam bug** | `cd ~` in that terminal |
 | High CPU at 1080p | `blur` / `painterly` / `voronoi` are O(W·H·r²) | smaller param, drop to 720p, or pick cheaper filters |
+
+<!-- Modified-by: Claude Opus 5.5 (Control API section, install prefix, distro wording) -->

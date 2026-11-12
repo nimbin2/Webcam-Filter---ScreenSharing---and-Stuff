@@ -4,10 +4,14 @@
  *
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
+ *
+ * Modified-by: Claude Opus 5.5 (control API hook, multi-client, VCAM_SOCK)
  */
 
 /*
- * IPC server – Unix domain socket at /tmp/vcam.sock
+ * IPC server – Unix domain socket at /tmp/vcam.sock ($VCAM_SOCK overrides).
+ * Several clients may stay connected at once; commands are serialised.
+ * High-level commands (status/get/share/cam/monitors/version): api.c
  *
  * Protocol: newline-terminated UTF-8 text commands.
  *
@@ -39,6 +43,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <pthread.h>
+#include <time.h>
 
 /* ── helpers ─────────────────────────────────── */
 static void send_line(int fd, const char *msg)
@@ -195,6 +200,10 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
         send_line(client_fd, "OK noop");
         return;
     }
+
+    /* High-level control API (status, get, share, cam, monitors, version) */
+    if (api_handle(client_fd, cmd, &save, reg))
+        return;
 
     /* ── filter <subcmd> ──
      *   filter help
@@ -831,6 +840,15 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
         send_line(client_fd, "OK   z      <id> <N>                      explicit z-index (0=bottom, -1=top)");
         send_line(client_fd, "OK   filter help                          list available filters");
         send_line(client_fd, "OK   filter list/add/remove/clear/set     manage filter chain");
+        send_line(client_fd, "OK control API (one-line replies, for scripts/apps):");
+        send_line(client_fd, "OK   status [json]                        whole state as k=v line or JSON");
+        send_line(client_fd, "OK   get <key>                            one status value (e.g. get cam_pos)");
+        send_line(client_fd, "OK   share start [<n>|<name>|<WxH+X+Y>] [fit=stretch|contain] [cam=<pos>|off] [camw=N]");
+        send_line(client_fd, "OK   share stop|toggle|status             fullscreen screen share");
+        send_line(client_fd, "OK   cam on [<pos>] [<w>] | off | toggle  webcam PiP; pos tl|tr|bl|br|center|full");
+        send_line(client_fd, "OK   cam pos <pos> | move <x> <y> | size <w> [<h>] | margin <px> | raise | get");
+        send_line(client_fd, "OK   monitors                             list monitors (n name WxH+X+Y)");
+        send_line(client_fd, "OK   version                              vcam version + build hash");
         send_line(client_fd, "OK   quit                                 close the connection");
         return;
     }
@@ -1258,6 +1276,57 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
     send_line(client_fd, buf);
 }
 
+/* ── clients ─────────────────────────────────────
+ * Each connection gets its own detached thread, so a long-lived
+ * controller app never blocks vcam-ctl. g_cmd_lock serialises the
+ * actual command handling (handle_command was written single-threaded).
+ */
+#define MAX_CLIENTS 16
+static pthread_mutex_t g_cmd_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_cli_lock = PTHREAD_MUTEX_INITIALIZER;
+static int             g_cli_fds[MAX_CLIENTS];
+static int             g_cli_n = 0;
+static char            g_sock_path[108] = VCAM_SOCK_PATH;
+
+const char *ipc_sock_path(void) { return g_sock_path; }
+
+static bool client_register(int fd)
+{
+    pthread_mutex_lock(&g_cli_lock);
+    bool ok = g_cli_n < MAX_CLIENTS;
+    if (ok) g_cli_fds[g_cli_n++] = fd;
+    pthread_mutex_unlock(&g_cli_lock);
+    return ok;
+}
+
+static void client_unregister(int fd)
+{
+    pthread_mutex_lock(&g_cli_lock);
+    for (int i = 0; i < g_cli_n; i++)
+        if (g_cli_fds[i] == fd) { g_cli_fds[i] = g_cli_fds[--g_cli_n]; break; }
+    pthread_mutex_unlock(&g_cli_lock);
+}
+
+typedef struct { IPCServer *srv; int fd; } ClientArg;
+
+static void *client_thread(void *arg)
+{
+    ClientArg ca = *(ClientArg *)arg;
+    free(arg);
+
+    char line[1024];
+    while (ca.srv->running && read_line(ca.fd, line, sizeof line) >= 0) {
+        bool should_quit = (strcmp(line, "quit") == 0);
+        pthread_mutex_lock(&g_cmd_lock);
+        if (ca.srv->running) handle_command(ca.fd, line, ca.srv->registry);
+        pthread_mutex_unlock(&g_cmd_lock);
+        if (should_quit) break;
+    }
+    client_unregister(ca.fd);
+    close(ca.fd);
+    return NULL;
+}
+
 /* ── server thread ───────────────────────────── */
 static void *ipc_thread(void *arg)
 {
@@ -1288,14 +1357,28 @@ static void *ipc_thread(void *arg)
             break;
         }
 
-        char line[1024];
-        int n;
-        while ((n = read_line(client, line, sizeof line)) >= 0) {
-            bool should_quit = (strcmp(line, "quit") == 0);
-            handle_command(client, line, srv->registry);
-            if (should_quit) break;
+        if (!client_register(client)) {
+            send_line(client, "ERR too many clients");
+            close(client);
+            continue;
         }
-        close(client);
+        ClientArg *ca = malloc(sizeof *ca);
+        pthread_t th;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        bool started = false;
+        if (ca) {
+            ca->srv = srv;
+            ca->fd  = client;
+            started = pthread_create(&th, &attr, client_thread, ca) == 0;
+        }
+        if (!started) {
+            free(ca);
+            client_unregister(client);
+            close(client);
+        }
+        pthread_attr_destroy(&attr);
     }
     return NULL;
 }
@@ -1306,19 +1389,22 @@ bool ipc_start(IPCServer *srv, OverlayRegistry *reg)
     srv->registry = reg;
     srv->running  = true;
 
-    unlink(VCAM_SOCK_PATH);
+    const char *env = getenv("VCAM_SOCK");
+    if (env && *env) snprintf(g_sock_path, sizeof g_sock_path, "%s", env);
+
+    unlink(g_sock_path);
 
     srv->server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv->server_fd < 0) { perror("[ipc] socket"); return false; }
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, VCAM_SOCK_PATH, sizeof addr.sun_path - 1);
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", g_sock_path);
 
     if (bind(srv->server_fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         perror("[ipc] bind"); close(srv->server_fd); return false;
     }
-    chmod(VCAM_SOCK_PATH, 0600);
+    chmod(g_sock_path, 0600);
 
     if (listen(srv->server_fd, 4) < 0) {
         perror("[ipc] listen"); close(srv->server_fd); return false;
@@ -1328,7 +1414,7 @@ bool ipc_start(IPCServer *srv, OverlayRegistry *reg)
         perror("[ipc] pthread_create"); close(srv->server_fd); return false;
     }
 
-    fprintf(stderr, "[ipc] Listening on %s\n", VCAM_SOCK_PATH);
+    fprintf(stderr, "[ipc] Listening on %s\n", g_sock_path);
     return true;
 }
 
@@ -1338,5 +1424,19 @@ void ipc_stop(IPCServer *srv)
     shutdown(srv->server_fd, SHUT_RDWR);
     close(srv->server_fd);
     pthread_join(srv->thread, NULL);
-    unlink(VCAM_SOCK_PATH);
+
+    /* Kick connected clients out of read() and wait (max ~1s) until
+     * their threads are gone, so nothing touches the registry after. */
+    pthread_mutex_lock(&g_cli_lock);
+    for (int i = 0; i < g_cli_n; i++) shutdown(g_cli_fds[i], SHUT_RDWR);
+    pthread_mutex_unlock(&g_cli_lock);
+    for (int tries = 0; tries < 100; tries++) {
+        pthread_mutex_lock(&g_cli_lock);
+        int left = g_cli_n;
+        pthread_mutex_unlock(&g_cli_lock);
+        if (left == 0) break;
+        struct timespec ts = { 0, 10000000L };
+        nanosleep(&ts, NULL);
+    }
+    unlink(g_sock_path);
 }

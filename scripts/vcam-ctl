@@ -1,6 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 # vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
+# Modified-by: Claude Opus 5.5 (control API wrappers)
 #
 # vcam-ctl – complete runtime control for a running vcam process.
 #
@@ -77,6 +78,21 @@
 #                                "cam", default width 320, position tr.
 #                                "full" stretches it to the full output.
 #   webcam off                   Remove the "cam" overlay.
+#
+# Control API (script friendly: bare values, exit 1 on error):
+#   status [--json]              Whole state, one key=value per line (or JSON).
+#   get <key>                    One value, e.g. 'get cam_pos' → br
+#                                keys: share share_fullscreen share_monitor
+#                                cam cam_pos cam_x cam_y cam_w cam_h
+#                                cam_over_screen input recording … (see status)
+#   share start [<n>|<name>|<WxH+X+Y>] [fit=stretch|contain] [cam=<pos>|off] [camw=N]
+#                                Fullscreen share of a monitor (default: first).
+#   share stop | toggle | status
+#   cam on [<pos>] [<w>]         Webcam PiP. pos: tl tr bl br center full
+#   cam off | toggle | raise | get
+#   cam pos <pos> | move <x> <y> | size <w> [<h>] | margin <px>
+#   monitors                     List monitors as "n name WxH+X+Y".
+#   version                      vcam version + build hash.
 #
 # Recording (capture the vcam output to a file):
 #   record start [-o <file>] [-m <alsa-dev>] [--no-audio] [--crf N]
@@ -729,6 +745,32 @@ if [ "$1" = "webcam" ]; then
     echo "  vcam-ctl webcam off          # remove (if id was 'cam')"
     exit 0
 fi
+
+# ──────────────────────────────────────────────────────────────
+# control API — status / get / share / cam / monitors / version
+# [Claude Opus 5.5] Strips the "OK " / "OK bye" noise so output is
+# directly usable in scripts; exits 1 if vcam answered ERR.
+# ──────────────────────────────────────────────────────────────
+case "$1" in
+    status|get|share|cam|monitors|version)
+        require_running
+        if [ "$1" = "status" ] && { [ "${2:-}" = "--json" ] || [ "${2:-}" = "json" ]; }; then
+            ipc_send "status json" | head -n 1
+            exit 0
+        fi
+        OUT=$(ipc_send "$*" | grep -v '^OK bye$')
+        if printf '%s\n' "$OUT" | grep -q '^ERR'; then
+            printf '%s\n' "$OUT" >&2
+            exit 1
+        fi
+        if [ "$1" = "status" ]; then
+            printf '%s\n' "${OUT#OK }" | tr ' ' '\n'
+        else
+            printf '%s\n' "$OUT" | sed 's/^OK //'
+        fi
+        exit 0
+        ;;
+esac
 
 # ──────────────────────────────────────────────────────────────
 # record subcommand — drive an ffmpeg child to capture the vcam

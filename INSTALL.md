@@ -17,7 +17,7 @@ Wayland.
 
 ## Dependencies
 
-On Debian / Ubuntu (package names differ on other distros):
+On Debian (package names differ on other distros):
 
 ```bash
 sudo apt install \
@@ -53,7 +53,7 @@ and their licenses.
 ```bash
 git clone <repo-url> vcam && cd vcam
 make
-sudo make install                          # default → /usr/local/bin
+sudo make install                          # default → /usr/bin
 ```
 
 The build is warning-clean under `-Wall -Wextra -Wpedantic`. `make`
@@ -63,7 +63,7 @@ Choose a different destination if you prefer:
 
 ```bash
 make install PREFIX=$HOME/.local             # ~/.local/bin (no sudo)
-make install PREFIX=/usr                      # system-wide
+make install PREFIX=/usr/local                # classic local prefix
 make install DESTDIR=/tmp/pkg PREFIX=/usr     # staged, for packaging
 ```
 
@@ -257,3 +257,5 @@ reload the modules (or reboot).
 
 For usage and runtime issues (filters, recording, screen capture), see
 the Troubleshooting section in [README.md](README.md).
+
+<!-- Modified-by: Claude Opus 5.5 (install prefix, distro wording) -->

@@ -4,6 +4,8 @@
  *
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
+ *
+ * Modified-by: Claude Opus 5.5 (--version, g_no_input, socket path)
  */
 
 /*
@@ -55,6 +57,7 @@ int                     g_output_w = 0; /* extern'd by overlay.c */
 int                     g_output_h = 0;
 int                     g_output_fps = 30; /* extern'd by ipc.c (record) */
 Recorder               *g_recorder = NULL; /* extern'd by ipc.c */
+bool                    g_no_input = false; /* extern'd by api.c (status) */
 
 static void on_signal(int sig)
 {
@@ -129,6 +132,10 @@ int main(int argc, char *argv[])
                 dev = argv[i+1];
         }
         for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+                puts(api_version_string());
+                return 0;
+            }
             if (strcmp(argv[i], "--list-formats") == 0 ||
                 strcmp(argv[i], "--list") == 0) {
                 return capture_list_formats(dev) ? 0 : 1;
@@ -231,6 +238,7 @@ int main(int argc, char *argv[])
 "  --res WxH         Output resolution  (e.g. --res 1280x720)\n"
 "  -f <fps>          Frame rate\n"
 "  --list-formats    List the resolutions the input device supports, then exit\n"
+"  --version, -V     Print version + build hash, then exit\n"
 "  --no-input        Don't open a webcam (use screen overlays as source).\n"
 "                    Combine with --res and a fullscreen --screen overlay.\n\n"
 "Startup overlays:\n"
@@ -249,6 +257,9 @@ int main(int argc, char *argv[])
 "  vcam-ctl filter add <name> [<param>]\n"
 "  vcam-ctl filter remove <index>\n"
 "  vcam-ctl filter list / clear\n"
+"  vcam-ctl status [--json] | get <key>\n"
+"  vcam-ctl share start|stop|toggle\n"
+"  vcam-ctl cam on|off|pos|move|size\n"
             );
             registry_destroy(&g_registry);
             filter_chain_destroy(&g_filters);
@@ -258,6 +269,8 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[main] Unknown option: %s  (try --help)\n", argv[i]);
         }
     }
+
+    g_no_input = no_input;
 
     /* ── signals ── */
     signal(SIGINT,  on_signal);
@@ -322,7 +335,7 @@ int main(int argc, char *argv[])
     fprintf(stderr, "[main] Pipeline: %s → %s  %dx%d @ %d fps\n",
             no_input ? "(no input)" : input_dev,
             output_dev, width, height, fps);
-    fprintf(stderr, "[main] IPC socket: %s\n", VCAM_SOCK_PATH);
+    fprintf(stderr, "[main] IPC socket: %s\n", ipc_sock_path());
     fprintf(stderr, "[main] %d startup overlay(s), %d startup filter(s).\n",
             g_registry.count, g_filters.count);
 
