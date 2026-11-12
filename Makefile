@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
-# Modified-by: Claude Opus 5.5 (api.c, build hash, PREFIX=/usr)
+# Modified-by: Claude Opus 5.5 (api.c, build hash, PREFIX=/usr, API.md install)
 
 CC      := gcc
 CXX     := g++
@@ -238,6 +238,7 @@ endif
 	install -m 644 README.md            $(DESTDIR)$(DOCDIR)/
 	install -m 644 INSTALL.md           $(DESTDIR)$(DOCDIR)/
 	install -m 644 EXPRESSIONS.md       $(DESTDIR)$(DOCDIR)/
+	install -m 644 API.md               $(DESTDIR)$(DOCDIR)/
 	@echo
 	@echo "Installed to $(DESTDIR)$(BINDIR)/  (docs in $(DESTDIR)$(DOCDIR)/)"
 	@echo "Make sure that's on your PATH."

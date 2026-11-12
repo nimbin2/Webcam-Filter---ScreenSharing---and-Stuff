@@ -5,7 +5,8 @@
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
  *
- * Modified-by: Claude Opus 5.5 (--version, g_no_input, socket path)
+ * Modified-by: Claude Opus 5.5 (--version, g_no_input, socket path,
+ *              live capture mode switching)
  */
 
 /*
@@ -58,6 +59,105 @@ int                     g_output_h = 0;
 int                     g_output_fps = 30; /* extern'd by ipc.c (record) */
 Recorder               *g_recorder = NULL; /* extern'd by ipc.c */
 bool                    g_no_input = false; /* extern'd by api.c (status) */
+
+/* ── live capture switching ───────────────────── [Claude Opus 5.5]
+ * api.c validates a request and posts it with capture_request(); the
+ * main loop applies it between two frames (close → open new mode →
+ * reopen the old one if that fails) and signals the result back.
+ */
+static const char     *g_input_dev = "/dev/video1";
+static pthread_mutex_t g_cap_lock  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_cap_cond  = PTHREAD_COND_INITIALIZER;
+static CaptureState    g_cap_state;            /* current; guarded by g_cap_lock */
+static CaptureMode     g_req_mode;
+static bool            g_req_reopen;
+static int             g_req_fit = -1;
+static unsigned        g_req_seq, g_done_seq;
+static bool            g_req_ok;
+static char            g_req_err[192];
+
+const char *capture_device_path(void) { return g_input_dev; }
+
+void capture_state_get(CaptureState *st)
+{
+    pthread_mutex_lock(&g_cap_lock);
+    *st = g_cap_state;
+    pthread_mutex_unlock(&g_cap_lock);
+}
+
+static void capture_state_set(V4L2Capture *cap)
+{
+    pthread_mutex_lock(&g_cap_lock);
+    memset(&g_cap_state, 0, sizeof g_cap_state);
+    if (cap) {
+        g_cap_state.active = true;
+        capture_get(cap, &g_cap_state.mode, &g_cap_state.crop);
+    }
+    pthread_mutex_unlock(&g_cap_lock);
+}
+
+bool capture_request(const CaptureMode *mode, int fit, char *err, size_t errlen)
+{
+    pthread_mutex_lock(&g_cap_lock);
+    g_req_reopen = mode != NULL;
+    if (mode) g_req_mode = *mode;
+    g_req_fit = fit;
+    unsigned seq = ++g_req_seq;
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 6;
+    int rc = 0;
+    while (g_done_seq < seq && rc == 0)
+        rc = pthread_cond_timedwait(&g_cap_cond, &g_cap_lock, &dl);
+    bool done = g_done_seq >= seq;
+    bool ok   = done && g_req_ok;
+    if (!ok) snprintf(err, errlen, "%s", done ? g_req_err : "timeout (camera not responding)");
+    pthread_mutex_unlock(&g_cap_lock);
+    return ok;
+}
+
+/* Called by the main loop once per frame; cheap when nothing is pending. */
+static void capture_service(V4L2Capture **cap)
+{
+    pthread_mutex_lock(&g_cap_lock);
+    if (g_done_seq == g_req_seq) { pthread_mutex_unlock(&g_cap_lock); return; }
+    unsigned     seq    = g_req_seq;
+    CaptureMode  m      = g_req_mode;
+    bool         reopen = g_req_reopen;
+    int          fit    = g_req_fit;
+    CaptureState old    = g_cap_state;
+    pthread_mutex_unlock(&g_cap_lock);
+
+    bool crop = fit < 0 ? old.crop : fit == 1;
+    bool ok = true;
+    char err[192] = "";
+
+    if (reopen || !*cap) {
+        if (!reopen) m = old.mode;     /* fit change while camera is down: retry it */
+        if (*cap) { capture_close(*cap); *cap = NULL; }
+        *cap = capture_open_mode(g_input_dev, &m, g_output_w, g_output_h, crop);
+        if (!*cap) {
+            ok = false;
+            snprintf(err, sizeof err, "camera refused %s %dx%d@%d", m.fmt, m.w, m.h, m.fps);
+            if (old.active)
+                *cap = capture_open_mode(g_input_dev, &old.mode, g_output_w, g_output_h, old.crop);
+            if (!*cap)
+                snprintf(err + strlen(err), sizeof err - strlen(err), "; old mode failed too, no picture");
+        }
+    } else if (!capture_set_fit(*cap, crop)) {
+        ok = false;
+        snprintf(err, sizeof err, "out of memory changing fit");
+    }
+    fprintf(stderr, "[capture] switch %s → %s\n", ok ? "ok" : "FAILED", ok ? m.fmt : err);
+
+    capture_state_set(*cap);
+    pthread_mutex_lock(&g_cap_lock);
+    g_req_ok = ok;
+    snprintf(g_req_err, sizeof g_req_err, "%s", err);
+    g_done_seq = seq;
+    pthread_cond_broadcast(&g_cap_cond);
+    pthread_mutex_unlock(&g_cap_lock);
+}
 
 static void on_signal(int sig)
 {
@@ -288,6 +388,8 @@ int main(int argc, char *argv[])
     if (!no_input) {
         cap = capture_open(input_dev, &width, &height, &fps);
         if (!cap) { registry_destroy(&g_registry); filter_chain_destroy(&g_filters); return 1; }
+        g_input_dev = input_dev;
+        capture_state_set(cap);
     } else {
         if (width <= 0 || height <= 0) {
             fprintf(stderr, "[main] --no-input requires -W and -H\n");
@@ -345,6 +447,9 @@ int main(int argc, char *argv[])
     while (g_running) {
         struct timespec t0;
         clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        /* 0. Apply a pending live capture switch (from the API) */
+        if (!no_input) capture_service(&cap);
 
         /* 1. Capture the webcam (if open) into cam_buf */
         if (cap) {

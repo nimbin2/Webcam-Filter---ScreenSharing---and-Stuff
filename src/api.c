@@ -5,7 +5,7 @@
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
  *
- * Created-by: Claude Opus 5.5 (control API)
+ * Created-by: Claude Opus 5.5 (control API, live capture switching)
  */
 
 /*
@@ -14,7 +14,7 @@
  *
  *   status [json]              whole state: "OK k=v k=v ..." or one JSON line
  *   get <key>                  one value from status, e.g. "get cam_pos" → "OK br"
- *   version                    "OK vcam 1.0.0 (build abc1234)"
+ *   version                    "OK vcam 1.1.0 (build abc1234)"  — full reference: API.md
  *   monitors                   one line per monitor: "OK <n> <name> WxH+X+Y"
  *
  *   share start [<n>|<name>|<WxH+X+Y>] [fit=stretch|contain]
@@ -27,6 +27,12 @@
  *   cam move <x> <y>           free position (pos becomes "custom")
  *   cam size <w> [<h>]         keeps its anchor; h derived from aspect
  *   cam margin <px>            gap between cam and the output edge
+ *
+ *   capture [get]              current camera mode
+ *   capture formats [json]     every mode the camera offers
+ *   capture set [<fmt>] [<WxH>|max] [<fps>] [fit=crop|stretch]
+ *                              switch the camera live (output size stays)
+ *   capture fit crop|stretch   how a different aspect ratio is fitted
  *
  * The share overlay uses id "share", the cam overlay id "cam" (same id
  * as 'vcam-ctl webcam'). Status also recognises screen/webcam overlays
@@ -406,7 +412,7 @@ static int cam_h_for(int w)
  * Status: key/value list → plain, single key, or JSON
  * ══════════════════════════════════════════════════════════════ */
 typedef struct { const char *k; char v[80]; char t; } KV;   /* t: b=bool i=int s=str */
-#define MAX_KV 40
+#define MAX_KV 48
 
 static int kv_add(KV *kv, int n, const char *k, char t, const char *fmt, ...)
 {
@@ -437,6 +443,15 @@ static int build_status(OverlayRegistry *reg, KV *kv)
     n = kv_add(kv, n, "output_w",         'i', "%d", g_output_w);
     n = kv_add(kv, n, "output_h",         'i', "%d", g_output_h);
     n = kv_add(kv, n, "fps",              'i', "%d", g_output_fps);
+    CaptureState cs; memset(&cs, 0, sizeof cs);
+    if (!g_no_input) capture_state_get(&cs);
+    n = kv_add(kv, n, "capture",          'b', "%d", cs.active);
+    n = kv_add(kv, n, "capture_device",   's', "%s", g_no_input ? "-" : capture_device_path());
+    n = kv_add(kv, n, "capture_fmt",      's', "%s", cs.active ? cs.mode.fmt : "-");
+    n = kv_add(kv, n, "capture_w",        'i', "%d", cs.active ? cs.mode.w : 0);
+    n = kv_add(kv, n, "capture_h",        'i', "%d", cs.active ? cs.mode.h : 0);
+    n = kv_add(kv, n, "capture_fps",      'i', "%d", cs.active ? cs.mode.fps : 0);
+    n = kv_add(kv, n, "capture_fit",      's', "%s", cs.active ? (cs.crop ? "crop" : "stretch") : "-");
     n = kv_add(kv, n, "share",            'b', "%d", st.share);
     n = kv_add(kv, n, "share_id",         's', "%s", st.share ? st.share_id : "-");
     n = kv_add(kv, n, "share_fullscreen", 'b', "%d", full);
@@ -715,6 +730,128 @@ static bool share_handle(int fd, char **save, OverlayRegistry *reg)
 }
 
 /* ══════════════════════════════════════════════════════════════
+ * capture — live camera mode (format / resolution / fps)
+ * ══════════════════════════════════════════════════════════════ */
+#define MAX_MODES 128
+
+static void capture_reply(int fd)
+{
+    CaptureState cs;
+    capture_state_get(&cs);
+    if (!cs.active) {
+        reply(fd, "OK capture=off device=%s", capture_device_path());
+        return;
+    }
+    reply(fd, "OK capture=on device=%s fmt=%s w=%d h=%d fps=%d fit=%s output=%dx%d",
+          capture_device_path(), cs.mode.fmt, cs.mode.w, cs.mode.h, cs.mode.fps,
+          cs.crop ? "crop" : "stretch", g_output_w, g_output_h);
+}
+
+static int parse_fit(const char *v)
+{
+    if (!strcmp(v, "crop"))    return 1;
+    if (!strcmp(v, "stretch")) return 0;
+    return -2;
+}
+
+static bool capture_handle(int fd, char **save)
+{
+    char *sub = strtok_r(NULL, " \t", save);
+    char err[192] = "";
+
+    if (g_no_input && sub && strcmp(sub, "get") != 0) {
+        reply(fd, "ERR vcam runs with --no-input (no camera)");
+        return true;
+    }
+    if (!sub || !strcmp(sub, "get") || !strcmp(sub, "status")) {
+        if (g_no_input) reply(fd, "OK capture=off device=-");
+        else            capture_reply(fd);
+        return true;
+    }
+
+    if (!strcmp(sub, "formats") || !strcmp(sub, "modes")) {
+        char *a = strtok_r(NULL, " \t", save);
+        bool json = a && (!strcmp(a, "json") || !strcmp(a, "--json"));
+        CaptureMode m[MAX_MODES];
+        int n = capture_enum_modes(capture_device_path(), m, MAX_MODES);
+        if (n < 0) { reply(fd, "ERR cannot open %s", capture_device_path()); return true; }
+        if (!json) {
+            if (n == 0) { reply(fd, "ERR camera reports no usable modes"); return true; }
+            for (int i = 0; i < n; i++)
+                reply(fd, "OK %s %dx%d %d", m[i].fmt, m[i].w, m[i].h, m[i].fps);
+            return true;
+        }
+        char buf[3584]; size_t off = 0;
+        off += (size_t)snprintf(buf, sizeof buf, "{\"ok\":true,\"formats\":[");
+        for (int i = 0; i < n && off < sizeof buf; i++)
+            off += (size_t)snprintf(buf + off, sizeof buf - off,
+                                    "%s{\"fmt\":\"%s\",\"w\":%d,\"h\":%d,\"fps\":%d}",
+                                    i ? "," : "", m[i].fmt, m[i].w, m[i].h, m[i].fps);
+        if (off < sizeof buf) snprintf(buf + off, sizeof buf - off, "]}");
+        reply(fd, "%s", buf);
+        return true;
+    }
+
+    if (!strcmp(sub, "fit")) {
+        char *v = strtok_r(NULL, " \t", save);
+        int fit = v ? parse_fit(v) : -2;
+        if (fit < 0) { reply(fd, "ERR usage: capture fit crop|stretch"); return true; }
+        if (!capture_request(NULL, fit, err, sizeof err)) { reply(fd, "ERR %s", err); return true; }
+        capture_reply(fd);
+        return true;
+    }
+
+    if (!strcmp(sub, "set")) {
+        const char *fmt = NULL;
+        int w = 0, h = 0, fps = 0, fit = -1;
+        char *t;
+        while ((t = strtok_r(NULL, " \t", save))) {
+            const char *v = t;
+            if      (!strncmp(t, "fmt=", 4)) { fmt = t + 4; continue; }
+            else if (!strncmp(t, "fps=", 4)) { fps = atoi(t + 4); if (fps <= 0) goto bad; continue; }
+            else if (!strncmp(t, "fit=", 4)) { fit = parse_fit(t + 4); if (fit < 0) goto bad; continue; }
+            else if (!strncmp(t, "res=", 4)) v = t + 4;
+            char tail;
+            if (!strcmp(v, "max"))                                   { w = h = -1; continue; }
+            if (sscanf(v, "%dx%d%c", &w, &h, &tail) == 2 && w > 0 && h > 0) continue;
+            if (v == t && strspn(t, "0123456789") == strlen(t))      { fps = atoi(t); if (fps <= 0) goto bad; continue; }
+            if (v == t)                                              { fmt = t; continue; }
+        bad:
+            reply(fd, "ERR bad argument '%s' (capture set [<fmt>] [<WxH>|max] [<fps>] [fit=crop|stretch])", t);
+            return true;
+        }
+        if (!fmt && !w && !fps && fit < 0) {
+            reply(fd, "ERR usage: capture set [<fmt>] [<WxH>|max] [<fps>] [fit=crop|stretch]");
+            return true;
+        }
+
+        CaptureState cs;
+        capture_state_get(&cs);
+        CaptureMode chosen;
+        if (fmt || w || fps) {
+            CaptureMode m[MAX_MODES];
+            int n = capture_enum_modes(capture_device_path(), m, MAX_MODES);
+            if (n <= 0) { reply(fd, "ERR cannot read camera modes from %s", capture_device_path()); return true; }
+            if (!capture_choose(m, n, fmt, w, h, fps, cs.active ? &cs.mode : NULL,
+                                g_output_fps, &chosen, err, sizeof err)) {
+                reply(fd, "ERR %s", err);
+                return true;
+            }
+        }
+        bool reopen = fmt || w || fps;
+        if (!capture_request(reopen ? &chosen : NULL, fit, err, sizeof err)) {
+            reply(fd, "ERR %s", err);
+            return true;
+        }
+        capture_reply(fd);
+        return true;
+    }
+
+    reply(fd, "ERR capture: unknown subcommand (get|formats|set|fit)");
+    return true;
+}
+
+/* ══════════════════════════════════════════════════════════════
  * entry point — returns true if the command was handled here
  * ══════════════════════════════════════════════════════════════ */
 bool api_handle(int fd, const char *cmd, char **save, OverlayRegistry *reg)
@@ -728,6 +865,7 @@ bool api_handle(int fd, const char *cmd, char **save, OverlayRegistry *reg)
     if (!strcmp(cmd, "version")) { reply(fd, "OK %s", api_version_string()); return true; }
     if (!strcmp(cmd, "share"))   return share_handle(fd, save, reg);
     if (!strcmp(cmd, "cam"))     return cam_handle(fd, save, reg);
+    if (!strcmp(cmd, "capture")) return capture_handle(fd, save);
     if (!strcmp(cmd, "monitors")) {
         Monitor m[MAX_MON];
         int n = detect_monitors(m, MAX_MON);

@@ -302,55 +302,22 @@ shown above. To drive all of this from another app, see
 
 ## Control API (for other apps)
 
-vcam listens on a Unix socket: `/tmp/vcam.sock` (override with `VCAM_SOCK`).
-One command per line, one-line replies: `OK …` or `ERR …`.
-Several apps can stay connected at the same time.
-
-| Command | What it does |
-|---|---|
-| `status` / `status json` | Whole state as `key=value` line, or one JSON line. |
-| `get <key>` | One value, e.g. `get cam_pos` → `OK br`. |
-| `share start [<n>\|<name>\|<WxH+X+Y>] [fit=stretch\|contain] [cam=<pos>\|off] [camw=N]` | Fullscreen share. Default: first monitor. |
-| `share stop` / `share toggle` | Stop / toggle sharing. |
-| `cam on [<pos>] [<w>]` / `cam off` / `cam toggle` | Webcam PiP. pos: `tl tr bl br center full`. |
-| `cam pos <pos>` / `cam move <x> <y>` / `cam size <w>` / `cam margin <px>` | Place the cam. |
-| `monitors` | `OK 1 DP-1 1920x1080+0+0` per monitor. |
-| `version` | `OK vcam 1.0.0 (build abc1234)` |
-
-Useful keys: `share`, `share_fullscreen`, `share_monitor`, `cam`,
-`cam_pos` (`tl tr bl br center full custom -`), `cam_x/y/w/h`,
-`cam_over_screen`, `input`, `recording`.
-`cam_over_screen=yes` means a cam is drawn on top of the shared screen.
-
-Shell (`vcam-ctl` strips `OK`, exits 1 on `ERR`):
+Other programs control vcam over a Unix socket (`/tmp/vcam.sock`):
+start a fullscreen share, place the webcam PiP, switch the camera mode
+live, read the state.
 
 ```bash
 vcam-ctl share start cam=br     # share monitor 1, cam bottom-right
 vcam-ctl get cam_pos            # → br
 vcam-ctl get cam_over_screen    # → yes
-vcam-ctl cam pos tl
-vcam-ctl status --json
+vcam-ctl capture set MJPG 640x480 30   # switch camera live
+vcam-ctl status --json          # whole state as one JSON line
 vcam-ctl share stop
 ```
 
-Raw socket / Python:
-
-```bash
-printf 'status json\nquit\n' | ncat -U /tmp/vcam.sock
-```
-
-```python
-import socket
-s = socket.socket(socket.AF_UNIX); s.connect("/tmp/vcam.sock")
-f = s.makefile("rw")
-f.write("get cam_pos\n"); f.flush(); print(f.readline())   # OK br
-```
-
-Notes:
-
-- Run vcam *with* the webcam (no `--no-input`): the share covers the cam, the PiP sits on top.
-- Monitors are detected via sway, Hyprland, wlr-randr or xrandr (fallback: `/sys/class/drm`).
-- `fit=contain` keeps the screen's aspect ratio; the bars then show the webcam.
+**Full reference: [API.md](API.md).** It covers the protocol, every
+command and status key, and a ready-to-use Python client. To get a
+program written against the API, hand that file to a new chat.
 
 ---
 

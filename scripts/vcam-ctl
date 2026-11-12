@@ -92,7 +92,14 @@
 #   cam off | toggle | raise | get
 #   cam pos <pos> | move <x> <y> | size <w> [<h>] | margin <px>
 #   monitors                     List monitors as "n name WxH+X+Y".
+#   capture [get] | formats      Current camera mode / every mode it offers.
+#   capture set [<fmt>] [<WxH>|max] [<fps>] [fit=crop|stretch]
+#                                Switch the camera live, e.g. 'capture set MJPG 640x480 30'.
+#                                The output size stays; the picture is scaled to it.
+#   capture fit crop|stretch     How a different aspect ratio is fitted (default crop).
 #   version                      vcam version + build hash.
+#   Full API reference (protocol, all keys, client examples):
+#     API.md — installed to /usr/share/doc/vcam/API.md
 #
 # Recording (capture the vcam output to a file):
 #   record start [-o <file>] [-m <alsa-dev>] [--no-audio] [--crf N]
@@ -752,7 +759,7 @@ fi
 # directly usable in scripts; exits 1 if vcam answered ERR.
 # ──────────────────────────────────────────────────────────────
 case "$1" in
-    status|get|share|cam|monitors|version)
+    status|get|share|cam|capture|monitors|version)
         require_running
         if [ "$1" = "status" ] && { [ "${2:-}" = "--json" ] || [ "${2:-}" = "json" ]; }; then
             ipc_send "status json" | head -n 1

@@ -15,6 +15,7 @@ Through the API a program can:
 
 - start / stop a **fullscreen screen share** (the screen replaces the camera image),
 - show the **webcam as a picture-in-picture** (PiP) and move / resize it,
+- **switch the camera** format, resolution and fps live,
 - **read the state**: is sharing on, where is the cam, is the cam over the screen.
 
 vcam must already be running. The API does not start it.
@@ -64,7 +65,8 @@ command. vcam answers `#` with `OK noop`. Read lines until you see
 
 Most commands answer in about a millisecond. `share start` takes around
 0.3 s (it starts the screen capture). `share stop` can take up to about
-1 s (it waits for the capture process to end). Use a read timeout of at
+1 s (it waits for the capture process to end). `capture set` takes
+0.2 to 1 s (the camera is re-opened). Use a read timeout of at
 least **3 s**.
 
 ## Coordinates
@@ -83,9 +85,9 @@ The whole state in one line.
 
 ```
 → status
-← OK version=1.0.1 build=abc1234 input=webcam output_w=1280 output_h=720 fps=30 share=yes … recording=no
+← OK version=1.1.0 build=abc1234 input=webcam output_w=1280 output_h=720 fps=30 share=yes … recording=no
 → status json
-← {"ok":true,"version":"1.0.1","build":"abc1234","input":"webcam","output_w":1280,…,"recording":false}
+← {"ok":true,"version":"1.1.0","build":"abc1234","input":"webcam","output_w":1280,…,"recording":false}
 ```
 
 Plain form: `key=value` pairs separated by spaces, with booleans as `yes` / `no`.
@@ -94,11 +96,17 @@ Values never contain spaces.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `version` | string | vcam version, e.g. `1.0.1` |
+| `version` | string | vcam version, e.g. `1.1.0` |
 | `build` | string | md5 build hash (7 chars) |
 | `input` | string | `webcam`, or `none` if vcam was started with `--no-input` |
 | `output_w`, `output_h` | int | output frame size |
 | `fps` | int | output frame rate |
+| `capture` | bool | a camera is open and delivering |
+| `capture_device` | string | camera device, e.g. `/dev/video1`; `-` with `--no-input` |
+| `capture_fmt` | string | camera format, e.g. `MJPG`; `-` when off |
+| `capture_w`, `capture_h` | int | camera resolution (0 when off) |
+| `capture_fps` | int | camera frame rate (0 when off) |
+| `capture_fit` | string | `crop` or `stretch`; `-` when off |
 | `share` | bool | a screen overlay exists |
 | `share_id` | string | its overlay id (`share` when started via the API), `-` if none |
 | `share_fullscreen` | bool | the screen overlay covers the whole output |
@@ -139,7 +147,7 @@ One value from `status`, in plain form.
 ### `version`
 
 ```
-→ version   ← OK vcam 1.0.1 (build abc1234)
+→ version   ← OK vcam 1.1.0 (build abc1234)
 ```
 
 ### `monitors`
@@ -234,10 +242,67 @@ OK cam=off
 Errors: `ERR cam is off …` (from `move`, `size` and `raise`),
 `ERR unknown position (use tl|tr|bl|br|center|full)`, `ERR cam size too small`.
 
+### `capture …`: camera format, resolution and fps
+
+Switch the camera while vcam runs. The **output size never changes**:
+it is fixed at startup (`vcam --res WxH`), because apps reading the
+virtual camera depend on it. The camera picture is scaled to it.
+
+| Command | Effect |
+|---|---|
+| `capture` / `capture get` | current mode, no change |
+| `capture formats` | every mode, one line each: `OK <fmt> <WxH> <max fps>` (use the `#` marker) |
+| `capture formats json` | the same as one line: `{"ok":true,"formats":[{"fmt":"MJPG","w":1280,"h":720,"fps":30},…]}` |
+| `capture set [<fmt>] [<WxH>\|max] [<fps>] [fit=crop\|stretch]` | switch the camera live |
+| `capture fit crop\|stretch` | change only how the picture is fitted (no camera restart) |
+
+`capture set` takes its arguments in any order, and at least one is needed:
+
+| Argument | Values |
+|---|---|
+| `<fmt>` or `fmt=` | `MJPG` `YUYV` `NV12` `YU12` `BGR3` `RGB3` (any case, `MJPEG` also works), or `auto` = best for the size and fps |
+| `<WxH>` or `res=` | an exact size from `capture formats`, or `max` = the largest size that still reaches the fps |
+| `<fps>` or `fps=` | frame rate |
+| `fit=` | `crop` (default) keeps the aspect ratio and cuts the edges; `stretch` distorts instead |
+
+Rules:
+
+- A value you leave out keeps its current value, if the camera has that combination.
+  Otherwise vcam picks the best match for the values you did give.
+  A kept fps that the camera can't reach becomes the highest fps it can.
+- A value you give is **never** changed. If it's impossible, you get an error.
+
+Reply:
+
+```
+OK capture=on device=/dev/video1 fmt=YUYV w=640 h=480 fps=30 fit=crop output=1280x720
+```
+
+Examples, for a camera that offers YUYV 1280x720 at 10 fps max:
+
+```
+→ capture set YUYV 640x480 30   ← OK capture=on … fmt=YUYV w=640 h=480 fps=30 …
+→ capture set YUYV 1280x720 30  ← ERR YUYV 1280x720 supports at most 10 fps
+→ capture set YUYV              ← OK capture=on … fmt=YUYV w=1280 h=720 fps=10 …   (size kept)
+→ capture set 15                ← OK capture=on … fps=15 …                          (fps only)
+```
+
+Errors:
+
+- `ERR camera has no mode … (see 'capture formats')`
+- `ERR … supports at most N fps`
+- `ERR unknown format '…'`
+- `ERR camera refused …`: the camera rejected the mode; the **old mode is back**
+- `ERR vcam runs with --no-input (no camera)`
+
+A switch takes about 0.2 to 1 s, and the picture pauses briefly.
+A mode smaller than the output is upscaled, so it looks softer, but it
+needs less USB bandwidth and CPU.
+
 ## Behaviour to know
 
 - **State is not saved.** After a vcam restart there is no share and no cam,
-  and the margin is back to 0.
+  the margin is back to 0, and the camera uses the startup mode again.
 - **Other clients can change things** at any time (`vcam-ctl`, hotkeys,
   other apps). Don't cache state; read `status json` before deciding.
 - **`input=none`** (vcam started with `--no-input`): there is no camera,
@@ -343,6 +408,9 @@ printf 'status json\nquit\n' | ncat -U /tmp/vcam.sock     # or: socat - UNIX-CON
 read `share`, `cam` and `cam_over_screen`.
 
 **Corner hotkeys.** Bind `cam pos tl` / `tr` / `bl` / `br`.
+
+**Quality picker.** Fill a menu from `capture formats json`, then call
+`capture set <fmt> <WxH> <fps>` with the user's choice.
 
 **Wait for vcam.** Retry `connect()` every 0.5 s until it succeeds.
 

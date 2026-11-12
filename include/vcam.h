@@ -337,11 +337,11 @@ const char *ipc_sock_path(void);   /* the path actually in use */
  * on the same socket: status, get, share, cam, monitors, version.
  * [Claude Opus 5.5]
  * ────────────────────────────────────────────── */
-#define VCAM_VERSION "1.0.0"
+#define VCAM_VERSION "1.1.0"
 
 /* Returns true if <cmd> was an API command (reply already sent). */
 bool        api_handle(int fd, const char *cmd, char **save, OverlayRegistry *reg);
-const char *api_version_string(void);   /* "vcam 1.0.0 (build abc1234)" */
+const char *api_version_string(void);   /* "vcam 1.1.0 (build abc1234)" — see API.md */
 
 /* ──────────────────────────────────────────────
  * V4L2 capture
@@ -355,6 +355,42 @@ void         capture_close(V4L2Capture *cap);
 /* Enumerate and print every usable (format, resolution, fps) the
  * device supports. Returns false if the device can't be opened. */
 bool         capture_list_formats(const char *dev);
+
+/* ── live mode switching [Claude Opus 5.5] ── */
+typedef struct {
+    char fmt[8];      /* fourcc: "MJPG", "YUYV", ... */
+    int  w, h;
+    int  fps;         /* max fps when enumerated, actual fps when open */
+} CaptureMode;
+
+/* All usable modes (opens the device separately; safe while streaming).
+ * Returns the count, or -1 if the device can't be opened. */
+int          capture_enum_modes(const char *dev, CaptureMode *out, int max);
+/* Resolve a request against modes[]. Unset fields (fmt NULL/"", w/h 0,
+ * fps 0) keep *cur when possible; fmt "auto" = best, w = -1 = largest. */
+bool         capture_choose(const CaptureMode *modes, int n,
+                            const char *fmt, int w, int h, int fps,
+                            const CaptureMode *cur, int default_fps,
+                            CaptureMode *out, char *err, size_t errlen);
+/* Open in an exact mode; frames are scaled to out_w × out_h (crop keeps
+ * the aspect ratio by cutting the edges, otherwise stretch). */
+V4L2Capture *capture_open_mode(const char *dev, const CaptureMode *mode,
+                               int out_w, int out_h, bool crop);
+bool         capture_set_fit (V4L2Capture *cap, bool crop);
+void         capture_get     (const V4L2Capture *cap, CaptureMode *mode, bool *crop);
+
+/* Owned by main.c: the main loop applies requests between two frames. */
+typedef struct {
+    bool        active;    /* a camera is open */
+    CaptureMode mode;
+    bool        crop;
+} CaptureState;
+
+const char *capture_device_path(void);
+void        capture_state_get(CaptureState *st);
+/* mode NULL = keep mode (fit change only); fit -1 keep, 0 stretch, 1 crop.
+ * Blocks until applied (≤ 6 s). On failure the old mode is restored. */
+bool        capture_request(const CaptureMode *mode, int fit, char *err, size_t errlen);
 
 /* ──────────────────────────────────────────────
  * V4L2 loopback output

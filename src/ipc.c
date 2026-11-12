@@ -848,6 +848,9 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
         send_line(client_fd, "OK   cam on [<pos>] [<w>] | off | toggle  webcam PiP; pos tl|tr|bl|br|center|full");
         send_line(client_fd, "OK   cam pos <pos> | move <x> <y> | size <w> [<h>] | margin <px> | raise | get");
         send_line(client_fd, "OK   monitors                             list monitors (n name WxH+X+Y)");
+        send_line(client_fd, "OK   capture [get] | formats [json]       camera mode / modes the camera offers");
+        send_line(client_fd, "OK   capture set [<fmt>] [<WxH>|max] [<fps>] [fit=crop|stretch]   switch camera live");
+        send_line(client_fd, "OK   capture fit crop|stretch             fit a different aspect ratio");
         send_line(client_fd, "OK   version                              vcam version + build hash");
         send_line(client_fd, "OK   quit                                 close the connection");
         return;
