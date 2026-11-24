@@ -337,11 +337,11 @@ const char *ipc_sock_path(void);   /* the path actually in use */
  * on the same socket: status, get, share, cam, monitors, version.
  * [Claude Opus 5.5]
  * ────────────────────────────────────────────── */
-#define VCAM_VERSION "1.2.1"
+#define VCAM_VERSION "1.2.2"
 
 /* Returns true if <cmd> was an API command (reply already sent). */
 bool        api_handle(int fd, const char *cmd, char **save, OverlayRegistry *reg);
-const char *api_version_string(void);   /* "vcam 1.2.1 (build abc1234)" — see API.md */
+const char *api_version_string(void);   /* "vcam 1.2.2 (build abc1234)" — see API.md */
 
 /* ──────────────────────────────────────────────
  * V4L2 capture

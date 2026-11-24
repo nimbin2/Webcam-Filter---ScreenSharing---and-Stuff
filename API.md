@@ -86,9 +86,9 @@ The whole state in one line.
 
 ```
 → status
-← OK version=1.2.1 build=abc1234 input=webcam output_w=1280 output_h=720 fps=30 share=yes … recording=no
+← OK version=1.2.2 build=abc1234 input=webcam output_w=1280 output_h=720 fps=30 share=yes … recording=no
 → status json
-← {"ok":true,"version":"1.2.1","build":"abc1234","input":"webcam","output_w":1280,…,"recording":false}
+← {"ok":true,"version":"1.2.2","build":"abc1234","input":"webcam","output_w":1280,…,"recording":false}
 ```
 
 Plain form: `key=value` pairs separated by spaces, with booleans as `yes` / `no`.
@@ -97,7 +97,7 @@ Values never contain spaces.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `version` | string | vcam version, e.g. `1.2.1` |
+| `version` | string | vcam version, e.g. `1.2.2` |
 | `build` | string | md5 build hash (7 chars) |
 | `input` | string | `webcam`, or `none` if vcam was started with `--no-input` |
 | `output_w`, `output_h` | int | output frame size |
@@ -157,7 +157,7 @@ One value from `status`, in plain form.
 ### `version`
 
 ```
-→ version   ← OK vcam 1.2.1 (build abc1234)
+→ version   ← OK vcam 1.2.2 (build abc1234)
 ```
 
 ### `monitors`

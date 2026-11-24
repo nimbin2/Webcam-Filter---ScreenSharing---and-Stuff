@@ -7,7 +7,7 @@
  *
  * Modified-by: Claude Opus 5.5 (--version, g_no_input, socket path,
  *              live capture mode switching, default 1280x720, fast path,
- *              idle mode, stats, ML device options)
+ *              idle mode, stats, ML device options, libav log de-dup)
  */
 
 /*
@@ -52,6 +52,7 @@
 #include <poll.h>
 
 #include <libavutil/log.h>
+#include <stdarg.h>
 
 /* ── global state ─────────────────────────────── */
 static volatile bool    g_running = true;
@@ -243,6 +244,44 @@ static void stats_roll(StatsWin *w, const char *path, int fps)
     long total = w->total_out;
     memset(w, 0, sizeof *w);
     w->t0 = now; w->cpu0 = cpu; w->total_out = total;
+}
+
+/* ── libav log filter ──────────────────────────── [Claude Opus 5.5]
+ * Some webcams put metadata in every JPEG that FFmpeg can't parse, and it
+ * reports that at *error* level once per frame ("unable to decode APP
+ * fields"), 30 lines a second. Print each distinct message once, hide
+ * repeats. VCAM_AV_LOG=all shows everything. */
+#define AVLOG_SEEN_MAX 64
+static pthread_mutex_t g_avlog_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned        g_avlog_seen[AVLOG_SEEN_MAX];
+static int             g_avlog_n;
+
+static void avlog_once(void *avcl, int level, const char *fmt, va_list vl)
+{
+    if (level > av_log_get_level()) return;
+    char line[1024];
+    int prefix = 1;
+    va_list cp;
+    va_copy(cp, vl);
+    av_log_format_line2(avcl, level, fmt, cp, line, sizeof line, &prefix);
+    va_end(cp);
+
+    unsigned h = 2166136261u;                         /* FNV-1a */
+    for (const char *p = line; *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
+    pthread_mutex_lock(&g_avlog_lock);
+    for (int i = 0; i < g_avlog_n; i++)
+        if (g_avlog_seen[i] == h) { pthread_mutex_unlock(&g_avlog_lock); return; }
+    bool tracked = g_avlog_n < AVLOG_SEEN_MAX;
+    if (tracked) g_avlog_seen[g_avlog_n++] = h;
+    pthread_mutex_unlock(&g_avlog_lock);
+
+    size_t len = strlen(line);
+    if (tracked && len && line[len - 1] == '\n') {
+        line[len - 1] = '\0';
+        fprintf(stderr, "%s (repeats hidden)\n", line);
+    } else {
+        fputs(line, stderr);
+    }
 }
 
 static void on_signal(int sig)
@@ -506,6 +545,9 @@ int main(int argc, char *argv[])
      * (JPEG full-range YUV), "EOI missing, emulating" (slightly malformed
      * MJPEG from some webcams), etc. We still see real errors. */
     av_log_set_level(AV_LOG_ERROR);
+    const char *avl = getenv("VCAM_AV_LOG");
+    if (!avl || strcmp(avl, "all") != 0)
+        av_log_set_callback(avlog_once);
 
     /* ── open capture (unless --no-input) ── */
     V4L2Capture *cap = NULL;
