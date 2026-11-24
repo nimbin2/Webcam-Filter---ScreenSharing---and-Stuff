@@ -6,7 +6,8 @@
  * Public License version 2. See the LICENSE file for the full text.
  *
  * Modified-by: Claude Opus 5.5 (--version, g_no_input, socket path,
- *              live capture mode switching)
+ *              live capture mode switching, default 1280x720, fast path,
+ *              idle mode, stats, ML device options)
  */
 
 /*
@@ -38,6 +39,7 @@
 
 #include "vcam.h"
 #include "vcam_cv.h"
+#include "vcam_ort.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +48,8 @@
 #include <stdbool.h>
 #include <time.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <poll.h>
 
 #include <libavutil/log.h>
 
@@ -88,11 +92,9 @@ void capture_state_get(CaptureState *st)
 static void capture_state_set(V4L2Capture *cap)
 {
     pthread_mutex_lock(&g_cap_lock);
-    memset(&g_cap_state, 0, sizeof g_cap_state);
-    if (cap) {
-        g_cap_state.active = true;
-        capture_get(cap, &g_cap_state.mode, &g_cap_state.crop);
-    }
+    g_cap_state.active = cap != NULL;
+    if (cap) capture_get(cap, &g_cap_state.mode, &g_cap_state.crop);
+    /* closed: keep mode + crop, so idle can resume the same mode */
     pthread_mutex_unlock(&g_cap_lock);
 }
 
@@ -139,10 +141,11 @@ static void capture_service(V4L2Capture **cap)
         if (!*cap) {
             ok = false;
             snprintf(err, sizeof err, "camera refused %s %dx%d@%d", m.fmt, m.w, m.h, m.fps);
-            if (old.active)
+            if (old.active) {
                 *cap = capture_open_mode(g_input_dev, &old.mode, g_output_w, g_output_h, old.crop);
-            if (!*cap)
-                snprintf(err + strlen(err), sizeof err - strlen(err), "; old mode failed too, no picture");
+                if (!*cap)
+                    snprintf(err + strlen(err), sizeof err - strlen(err), "; old mode failed too, no picture");
+            }
         }
     } else if (!capture_set_fit(*cap, crop)) {
         ok = false;
@@ -157,6 +160,89 @@ static void capture_service(V4L2Capture **cap)
     g_done_seq = seq;
     pthread_cond_broadcast(&g_cap_cond);
     pthread_mutex_unlock(&g_cap_lock);
+}
+
+/* ── idle + stats ─────────────────────────────── [Claude Opus 5.5]
+ * Idle: when no other process has the loopback device open (see
+ * consumers.c) for IDLE_GRACE_S, the camera is released and one black
+ * frame per second keeps the virtual camera alive. An open() wakes us.
+ * Stats: per-stage times summed over ~1 s windows, published for 'stats'.
+ */
+#define IDLE_GRACE_S 3.0
+
+static volatile bool g_idle_auto = true;
+static volatile bool g_idle      = false;
+static volatile int  g_consumers = -1;
+
+bool vcam_idle_get(int *consumers, bool *idle_auto)
+{
+    if (consumers) *consumers = g_consumers;
+    if (idle_auto) *idle_auto = g_idle_auto;
+    return g_idle;
+}
+void vcam_idle_set_auto(bool on) { g_idle_auto = on; }
+
+static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static VcamStats       g_stats;            /* last published window */
+
+void vcam_stats_get(VcamStats *st)
+{
+    pthread_mutex_lock(&g_stats_lock);
+    *st = g_stats;
+    pthread_mutex_unlock(&g_stats_lock);
+}
+
+typedef struct {
+    struct timespec t0;
+    double cpu0;
+    long   in, out;
+    long   ns_cap, ns_fil, ns_comp, ns_out;
+    long   total_out;
+} StatsWin;
+
+static double ts_s(const struct timespec *t) { return t->tv_sec + t->tv_nsec / 1e9; }
+
+static double cpu_seconds(void)
+{
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 +
+           ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+}
+
+static long ns_between(const struct timespec *a, const struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) * 1000000000L + (b->tv_nsec - a->tv_nsec);
+}
+
+/* Publish the window if ≥ 1 s old, then start a new one. */
+static void stats_roll(StatsWin *w, const char *path, int fps)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double dt = ts_s(&now) - ts_s(&w->t0);
+    if (dt < 1.0) return;
+    double cpu = cpu_seconds();
+    VcamStats st = {0};
+    long n = w->out > 0 ? w->out : 1;
+    st.window_s   = dt;
+    st.fps_in     = w->in  / dt;
+    st.fps_out    = w->out / dt;
+    st.cpu        = (cpu - w->cpu0) / dt * 100.0;
+    snprintf(st.path, sizeof st.path, "%s", path);
+    st.capture_ms = w->ns_cap  / 1e6 / n;
+    st.filters_ms = w->ns_fil  / 1e6 / n;
+    st.compose_ms = w->ns_comp / 1e6 / n;
+    st.output_ms  = w->ns_out  / 1e6 / n;
+    st.work_ms    = st.capture_ms + st.filters_ms + st.compose_ms + st.output_ms;
+    st.budget_ms  = fps > 0 ? 1000.0 / fps : 0;
+    st.frames     = w->total_out;
+    pthread_mutex_lock(&g_stats_lock);
+    g_stats = st;
+    pthread_mutex_unlock(&g_stats_lock);
+    long total = w->total_out;
+    memset(w, 0, sizeof *w);
+    w->t0 = now; w->cpu0 = cpu; w->total_out = total;
 }
 
 static void on_signal(int sig)
@@ -221,6 +307,10 @@ int main(int argc, char *argv[])
     const char *output_dev = "/dev/video0";
     int  width = 0, height = 0, fps = 0;
     bool no_input = false;     /* --no-input: skip webcam capture entirely */
+    const char *ml_device  = getenv("VCAM_ML_DEVICE");   /* auto|npu|cpu */
+    const char *npu_config = getenv("VCAM_NPU_CONFIG");
+    int  ml_threads = 0;       /* 0 = vcam default (4) */
+    bool ml_async   = true;
 
     /* Pre-scan for --list-formats (and the -i that feeds it). This is a
      * query-and-exit mode, so we handle it before the main parse and
@@ -275,6 +365,30 @@ int main(int argc, char *argv[])
 
         } else if (strcmp(argv[i], "--no-input") == 0) {
             no_input = true;
+
+        } else if (strcmp(argv[i], "--idle") == 0 && i+1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "auto") && strcmp(v, "off")) {
+                fprintf(stderr, "vcam: --idle takes auto|off\n");
+                return 1;
+            }
+            g_idle_auto = strcmp(v, "auto") == 0;
+
+        } else if (strcmp(argv[i], "--ml-device") == 0 && i+1 < argc) {
+            ml_device = argv[++i];
+            if (strcmp(ml_device, "auto") && strcmp(ml_device, "npu") && strcmp(ml_device, "cpu")) {
+                fprintf(stderr, "vcam: --ml-device takes auto|npu|cpu\n");
+                return 1;
+            }
+
+        } else if (strcmp(argv[i], "--ml-threads") == 0 && i+1 < argc) {
+            ml_threads = atoi(argv[++i]);
+
+        } else if (strcmp(argv[i], "--ml-async") == 0 && i+1 < argc) {
+            ml_async = strcmp(argv[++i], "off") != 0;
+
+        } else if (strcmp(argv[i], "--npu-config") == 0 && i+1 < argc) {
+            npu_config = argv[++i];
 
         } else if (strcmp(argv[i], "--filter") == 0 && i+1 < argc) {
             /* --filter <name> [<param>] */
@@ -335,12 +449,20 @@ int main(int argc, char *argv[])
 "Pipeline:\n"
 "  -i <dev>          Input webcam       (default /dev/video1)\n"
 "  -o <dev>          Output loopback    (default /dev/video0)\n"
-"  --res WxH         Output resolution  (e.g. --res 1280x720)\n"
+"  --res WxH         Output resolution  (default 1280x720, or the camera mode\n"
+"                    closest to it; see --list-formats)\n"
 "  -f <fps>          Frame rate\n"
 "  --list-formats    List the resolutions the input device supports, then exit\n"
 "  --version, -V     Print version + build hash, then exit\n"
 "  --no-input        Don't open a webcam (use screen overlays as source).\n"
-"                    Combine with --res and a fullscreen --screen overlay.\n\n"
+"                    Combine with --res and a fullscreen --screen overlay.\n"
+"  --idle auto|off   auto (default): release the camera and idle while no app\n"
+"                    reads the virtual camera\n\n"
+"Machine learning (portrait/background, posefx, depthfx, genai):\n"
+"  --ml-device auto|npu|cpu   auto (default): NPU if usable, else CPU\n"
+"  --ml-threads N    CPU threads per model (default 4)\n"
+"  --ml-async on|off on (default): models run beside the video, never stall it\n"
+"  --npu-config FILE Vitis AI config file for the NPU (env VCAM_NPU_CONFIG)\n\n"
 "Startup overlays:\n"
 "  --img    <id> <x> <y> [<w> [<h>]] <file>\n"
 "  --vid    <id> <x> <y> [<w> [<h>]] <file>\n"
@@ -360,6 +482,7 @@ int main(int argc, char *argv[])
 "  vcam-ctl status [--json] | get <key>\n"
 "  vcam-ctl share start|stop|toggle\n"
 "  vcam-ctl cam on|off|pos|move|size\n"
+"  vcam-ctl stats [--json] | idle [auto|off] | ml\n"
             );
             registry_destroy(&g_registry);
             filter_chain_destroy(&g_filters);
@@ -371,6 +494,7 @@ int main(int argc, char *argv[])
     }
 
     g_no_input = no_input;
+    ort_config(ml_device, ml_threads, npu_config, ml_async);
 
     /* ── signals ── */
     signal(SIGINT,  on_signal);
@@ -386,6 +510,11 @@ int main(int argc, char *argv[])
     /* ── open capture (unless --no-input) ── */
     V4L2Capture *cap = NULL;
     if (!no_input) {
+        /* No --res: 1280x720 (or the closest mode) instead of the camera's
+         * maximum — a 5 MP output costs ~5x the CPU and apps scale it down. */
+        if ((width <= 0 || height <= 0) &&
+            capture_default_size(input_dev, 1280, 720, fps, &width, &height))
+            fprintf(stderr, "[main] no --res given: using %dx%d\n", width, height);
         cap = capture_open(input_dev, &width, &height, &fps);
         if (!cap) { registry_destroy(&g_registry); filter_chain_destroy(&g_filters); return 1; }
         g_input_dev = input_dev;
@@ -443,6 +572,24 @@ int main(int argc, char *argv[])
 
     long frame_ns = fps > 0 ? (1000000000L / fps) : 33333333L;
 
+    /* ── idle detection ── */
+    Consumers cons;
+    bool cons_ok = consumers_init(&cons, output_dev);
+    if (cons_ok)
+        fprintf(stderr, "[main] idle: %s (%d reader(s) now)\n",
+                g_idle_auto ? "auto" : "off", cons.count);
+    else
+        fprintf(stderr, "[main] idle: unavailable (cannot watch %s) — always running\n",
+                output_dev);
+    g_consumers = cons_ok ? cons.count : -1;
+
+    struct timespec last_reader, last_black = {0}, last_reopen = {0};
+    clock_gettime(CLOCK_MONOTONIC, &last_reader);
+    StatsWin win = {0};
+    clock_gettime(CLOCK_MONOTONIC, &win.t0);
+    win.cpu0 = cpu_seconds();
+    const char *path = "full";
+
     /* ── main loop ── */
     while (g_running) {
         struct timespec t0;
@@ -451,51 +598,131 @@ int main(int argc, char *argv[])
         /* 0. Apply a pending live capture switch (from the API) */
         if (!no_input) capture_service(&cap);
 
-        /* 1. Capture the webcam (if open) into cam_buf */
-        if (cap) {
-            if (!capture_read(cap, cam_buf))
-                continue;
+        /* 0b. Idle? Nobody reading for IDLE_GRACE_S, not recording. */
+        if (cons_ok) g_consumers = consumers_update(&cons);
+        bool want_idle = cons_ok && g_idle_auto && g_consumers == 0 &&
+                         !recorder_active(g_recorder);
+        if (!want_idle) last_reader = t0;
+        bool idle_now = want_idle && ns_between(&last_reader, &t0) >= IDLE_GRACE_S * 1e9;
+        if (idle_now != g_idle) {
+            g_idle = idle_now;
+            fprintf(stderr, "[main] %s\n", idle_now
+                    ? "idle: no app reads the virtual camera — camera released"
+                    : g_consumers > 0 ? "awake: an app opened the virtual camera"
+                    : !g_idle_auto     ? "awake: idle switched off"
+                    :                    "awake: recording");
+            if (!idle_now) last_reopen.tv_sec = 0;   /* reopen right away */
+        }
+        if (idle_now) {
+            if (cap) { capture_close(cap); cap = NULL; capture_state_set(NULL); }
+            if (ns_between(&last_black, &t0) >= 1000000000L) {
+                output_write_black(out);
+                last_black = t0;
+            }
+            path = "idle";
+            stats_roll(&win, path, fps);
+            struct pollfd pfd = { cons.ifd, POLLIN, 0 };
+            poll(&pfd, 1, 100);           /* wakes at once on open() */
+            continue;
+        }
+
+        /* 0c. Camera closed (after idle, or lost): reopen, retry every 2 s */
+        if (!no_input && !cap && ns_between(&last_reopen, &t0) >= 2000000000L) {
+            CaptureState cs;
+            capture_state_get(&cs);
+            last_reopen = t0;
+            if (cs.mode.w > 0) {
+                cap = capture_open_mode(g_input_dev, &cs.mode, width, height, cs.crop);
+                capture_state_set(cap);
+                fprintf(stderr, "[main] camera %s (%s %dx%d@%d)\n",
+                        cap ? "reopened" : "reopen failed, retrying",
+                        cs.mode.fmt, cs.mode.w, cs.mode.h, cs.mode.fps);
+            }
+        }
+
+        /* Fast path: nothing needs BGR → camera YUV straight into the
+         * loopback buffer (no YUV→BGR→YUV, no copies). */
+        pthread_mutex_lock(&g_filters.lock);
+        int nfilters = g_filters.count;
+        pthread_mutex_unlock(&g_filters.lock);
+        bool fast = cap && nfilters == 0 && g_registry.count == 0 &&
+                    !recorder_active(g_recorder);
+        struct timespec ta, tb, tc, td;
+
+        if (fast) {
+            int ostride;
+            uint8_t *obuf = output_begin(out, &ostride);
+            if (!obuf) continue;
+            if (!capture_read_yuyv(cap, obuf, ostride))
+                continue;                 /* buffer stays free for next time */
+            win.in++;
+            clock_gettime(CLOCK_MONOTONIC, &tc);
+            output_commit(out);
+            clock_gettime(CLOCK_MONOTONIC, &td);
+            win.ns_cap += capture_last_work_ns(cap);
+            win.ns_out += ns_between(&tc, &td);
+            path = "fast";
         } else {
-            memset(cam_buf->data, 0,
-                   (size_t)cam_buf->stride * cam_buf->height);
+            /* 1. Capture the webcam (if open) into cam_buf */
+            if (cap) {
+                if (!capture_read(cap, cam_buf))
+                    continue;
+                win.in++;
+                win.ns_cap += capture_last_work_ns(cap);
+                path = "full";
+            } else {
+                memset(cam_buf->data, 0,
+                       (size_t)cam_buf->stride * cam_buf->height);
+                path = "nocam";
+            }
+            clock_gettime(CLOCK_MONOTONIC, &ta);
+
+            /* 2. Apply filter chain to cam_buf — filters operate on the
+             *    raw camera stream, so they affect both the base AND any
+             *    webcam-corner overlays consistently. */
+            filter_chain_apply(&g_filters, cam_buf);
+            clock_gettime(CLOCK_MONOTONIC, &tb);
+
+            /* 3. Build the base frame. Default = filtered cam. With
+             *    --no-input the base is black (screen/image overlays will
+             *    paint on top). */
+            if (!no_input) {
+                memcpy(frame->data, cam_buf->data,
+                       (size_t)cam_buf->stride * cam_buf->height);
+            } else {
+                memset(frame->data, 0,
+                       (size_t)frame->stride * frame->height);
+            }
+
+            /* 4. Composite overlays. Webcam overlays read from cam_buf
+             *    (so they always show the latest filtered cam, not the
+             *    accumulating composite). */
+            pthread_mutex_lock(&g_registry.lock);
+            for (int i = 0; i < g_registry.count; i++) {
+                Overlay *o = g_registry.slots[i].overlay;
+                overlay_tick(o, cam_buf);
+                overlay_blit(o, frame);
+            }
+            pthread_mutex_unlock(&g_registry.lock);
+            clock_gettime(CLOCK_MONOTONIC, &tc);
+
+            output_write(out, frame);
+
+            /* Mirror the composed frame to the recorder, if active.
+             * This is BGR24 — same format we asked ffmpeg to expect
+             * via -f rawvideo -pixel_format bgr24. */
+            if (recorder_active(g_recorder)) {
+                recorder_write_frame(g_recorder, frame->data,
+                                     (size_t)frame->stride * frame->height);
+            }
+            clock_gettime(CLOCK_MONOTONIC, &td);
+            win.ns_fil  += ns_between(&ta, &tb);
+            win.ns_comp += ns_between(&tb, &tc);
+            win.ns_out  += ns_between(&tc, &td);
         }
-
-        /* 2. Apply filter chain to cam_buf — filters operate on the
-         *    raw camera stream, so they affect both the base AND any
-         *    webcam-corner overlays consistently. */
-        filter_chain_apply(&g_filters, cam_buf);
-
-        /* 3. Build the base frame. Default = filtered cam. With
-         *    --no-input the base is black (screen/image overlays will
-         *    paint on top). */
-        if (!no_input) {
-            memcpy(frame->data, cam_buf->data,
-                   (size_t)cam_buf->stride * cam_buf->height);
-        } else {
-            memset(frame->data, 0,
-                   (size_t)frame->stride * frame->height);
-        }
-
-        /* 4. Composite overlays. Webcam overlays read from cam_buf
-         *    (so they always show the latest filtered cam, not the
-         *    accumulating composite). */
-        pthread_mutex_lock(&g_registry.lock);
-        for (int i = 0; i < g_registry.count; i++) {
-            Overlay *o = g_registry.slots[i].overlay;
-            overlay_tick(o, cam_buf);
-            overlay_blit(o, frame);
-        }
-        pthread_mutex_unlock(&g_registry.lock);
-
-        output_write(out, frame);
-
-        /* Mirror the composed frame to the recorder, if active.
-         * This is BGR24 — same format we asked ffmpeg to expect
-         * via -f rawvideo -pixel_format bgr24. */
-        if (recorder_active(g_recorder)) {
-            recorder_write_frame(g_recorder, frame->data,
-                                 (size_t)frame->stride * frame->height);
-        }
+        win.out++;
+        win.total_out++;
+        stats_roll(&win, path, fps);
 
         /* Frame pacing */
         struct timespec t1;
@@ -509,6 +736,7 @@ int main(int argc, char *argv[])
         }
     }
 
+    consumers_close(&cons);
     fprintf(stderr, "\n[main] Shutting down.\n");
 
     ipc_stop(&g_ipc);

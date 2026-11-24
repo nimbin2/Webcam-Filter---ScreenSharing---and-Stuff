@@ -321,6 +321,22 @@ program written against the API, hand that file to a new chat.
 
 ---
 
+## CPU use, idle and NPU
+
+- **Default 1280x720.** Without `--res`, vcam uses 1280x720 (or the
+  closest camera mode), not the camera's maximum.
+- **Fast path.** With no filters, overlays or recording, camera frames go
+  straight into the virtual camera, without the RGB round trip.
+- **Idle.** While no app has the virtual camera open, vcam releases the
+  camera (LED off) and uses almost no CPU. It wakes when an app opens it.
+  `--idle off` disables this.
+- **NPU.** ML filters run on a Ryzen AI NPU when the ONNX Runtime vcam is
+  built against includes AMD's Vitis AI provider; otherwise on the CPU.
+  `vcam-ctl ml` shows where each model runs.
+- **Measure.** `vcam-ctl stats` shows CPU and time per pipeline step.
+
+---
+
 ## Filters (111 total, 12 categories)
 
 Filters run in chain order on every frame from the webcam, *before*
@@ -798,4 +814,4 @@ see the camera, missing build tools) are covered in
 | `shell-init: getcwd error retrieving current directory` | Your *shell* sits in a deleted directory — **not a vcam bug** | `cd ~` in that terminal |
 | High CPU at 1080p | `blur` / `painterly` / `voronoi` are O(W·H·r²) | smaller param, drop to 720p, or pick cheaper filters |
 
-<!-- Modified-by: Claude Opus 5.5 (Control API section, install prefix, distro wording) -->
+<!-- Modified-by: Claude Opus 5.5 (Control API section, CPU/idle/NPU section, install prefix, distro wording) -->

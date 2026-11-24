@@ -5,7 +5,8 @@
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
  *
- * Created-by: Claude Opus 5.5 (control API, live capture switching)
+ * Created-by: Claude Opus 5.5 (control API, live capture switching,
+ *             stats, idle, ML device)
  */
 
 /*
@@ -34,12 +35,17 @@
  *                              switch the camera live (output size stays)
  *   capture fit crop|stretch   how a different aspect ratio is fitted
  *
+ *   stats [json]               per-stage timings, fps, CPU of the last ~1 s
+ *   idle [auto|off]            release the camera while no app reads it
+ *   ml [device auto|npu|cpu]   where the ML filters run (NPU / CPU)
+ *
  * The share overlay uses id "share", the cam overlay id "cam" (same id
  * as 'vcam-ctl webcam'). Status also recognises screen/webcam overlays
  * added by other commands.
  */
 
 #include "vcam.h"
+#include "vcam_ort.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -412,7 +418,7 @@ static int cam_h_for(int w)
  * Status: key/value list → plain, single key, or JSON
  * ══════════════════════════════════════════════════════════════ */
 typedef struct { const char *k; char v[80]; char t; } KV;   /* t: b=bool i=int s=str */
-#define MAX_KV 48
+#define MAX_KV 64
 
 static int kv_add(KV *kv, int n, const char *k, char t, const char *fmt, ...)
 {
@@ -452,6 +458,21 @@ static int build_status(OverlayRegistry *reg, KV *kv)
     n = kv_add(kv, n, "capture_h",        'i', "%d", cs.active ? cs.mode.h : 0);
     n = kv_add(kv, n, "capture_fps",      'i', "%d", cs.active ? cs.mode.fps : 0);
     n = kv_add(kv, n, "capture_fit",      's', "%s", cs.active ? (cs.crop ? "crop" : "stretch") : "-");
+    int consumers = -1; bool idle_auto = true;
+    bool idle = vcam_idle_get(&consumers, &idle_auto);
+    VcamStats vs; vcam_stats_get(&vs);
+    n = kv_add(kv, n, "idle",             'b', "%d", idle);
+    n = kv_add(kv, n, "idle_mode",        's', "%s", idle_auto ? "auto" : "off");
+    n = kv_add(kv, n, "consumers",        'i', "%d", consumers);
+    n = kv_add(kv, n, "path",             's', "%s", vs.path[0] ? vs.path : "-");
+    n = kv_add(kv, n, "ml_device",        's', "%s", ort_ml_device());
+    n = kv_add(kv, n, "ml_threads",       'i', "%d", ort_ml_threads());
+    n = kv_add(kv, n, "npu",              'b', "%d", ort_npu_hw());
+    n = kv_add(kv, n, "npu_runtime",      'b', "%d", ort_available() && ort_npu_runtime());
+    n = kv_add(kv, n, "ml_matting",       's', "%s", ort_model_device(ORT_M_RVM));
+    n = kv_add(kv, n, "ml_pose",          's', "%s", ort_model_device(ORT_M_POSE));
+    n = kv_add(kv, n, "ml_depth",         's', "%s", ort_model_device(ORT_M_DEPTH));
+    n = kv_add(kv, n, "ml_genai",         's', "%s", ort_model_device(ORT_M_I2I));
     n = kv_add(kv, n, "share",            'b', "%d", st.share);
     n = kv_add(kv, n, "share_id",         's', "%s", st.share ? st.share_id : "-");
     n = kv_add(kv, n, "share_fullscreen", 'b', "%d", full);
@@ -854,6 +875,43 @@ static bool capture_handle(int fd, char **save)
 }
 
 /* ══════════════════════════════════════════════════════════════
+ * stats / idle / ml
+ * ══════════════════════════════════════════════════════════════ */
+static void cmd_stats(int fd, bool json)
+{
+    VcamStats st; vcam_stats_get(&st);
+    int consumers = -1;
+    bool idle = vcam_idle_get(&consumers, NULL);
+    const char *f = json
+        ? "{\"ok\":true,\"window_s\":%.2f,\"path\":\"%s\",\"idle\":%s,\"consumers\":%d,"
+          "\"fps_in\":%.1f,\"fps_out\":%.1f,\"cpu\":%.1f,\"budget_ms\":%.1f,\"work_ms\":%.2f,"
+          "\"capture_ms\":%.2f,\"filters_ms\":%.2f,\"compose_ms\":%.2f,\"output_ms\":%.2f,"
+          "\"ml_matting_ms\":%.1f,\"ml_pose_ms\":%.1f,\"ml_depth_ms\":%.1f,\"ml_genai_ms\":%.1f,"
+          "\"frames\":%ld}"
+        : "OK window_s=%.2f path=%s idle=%s consumers=%d fps_in=%.1f fps_out=%.1f cpu=%.1f "
+          "budget_ms=%.1f work_ms=%.2f capture_ms=%.2f filters_ms=%.2f compose_ms=%.2f "
+          "output_ms=%.2f ml_matting_ms=%.1f ml_pose_ms=%.1f ml_depth_ms=%.1f ml_genai_ms=%.1f "
+          "frames=%ld";
+    reply(fd, f, st.window_s, st.path[0] ? st.path : "-",
+          json ? (idle ? "true" : "false") : (idle ? "yes" : "no"), consumers,
+          st.fps_in, st.fps_out, st.cpu, st.budget_ms, st.work_ms,
+          st.capture_ms, st.filters_ms, st.compose_ms, st.output_ms,
+          ort_model_ms(ORT_M_RVM), ort_model_ms(ORT_M_POSE),
+          ort_model_ms(ORT_M_DEPTH), ort_model_ms(ORT_M_I2I), st.frames);
+}
+
+static void ml_reply(int fd)
+{
+    reply(fd, "OK device=%s threads=%d async=%s npu=%s npu_runtime=%s "
+              "matting=%s pose=%s depth=%s genai=%s",
+          ort_ml_device(), ort_ml_threads(), ort_ml_async() ? "on" : "off",
+          ort_npu_hw() ? "yes" : "no",
+          ort_available() && ort_npu_runtime() ? "yes" : "no",
+          ort_model_device(ORT_M_RVM), ort_model_device(ORT_M_POSE),
+          ort_model_device(ORT_M_DEPTH), ort_model_device(ORT_M_I2I));
+}
+
+/* ══════════════════════════════════════════════════════════════
  * entry point — returns true if the command was handled here
  * ══════════════════════════════════════════════════════════════ */
 bool api_handle(int fd, const char *cmd, char **save, OverlayRegistry *reg)
@@ -868,6 +926,32 @@ bool api_handle(int fd, const char *cmd, char **save, OverlayRegistry *reg)
     if (!strcmp(cmd, "share"))   return share_handle(fd, save, reg);
     if (!strcmp(cmd, "cam"))     return cam_handle(fd, save, reg);
     if (!strcmp(cmd, "capture")) return capture_handle(fd, save);
+    if (!strcmp(cmd, "stats")) {
+        char *a = strtok_r(NULL, " \t", save);
+        cmd_stats(fd, a && (!strcmp(a, "json") || !strcmp(a, "--json")));
+        return true;
+    }
+    if (!strcmp(cmd, "idle")) {
+        char *a = strtok_r(NULL, " \t", save);
+        if (a && strcmp(a, "auto") && strcmp(a, "off")) { reply(fd, "ERR usage: idle [auto|off]"); return true; }
+        if (a) vcam_idle_set_auto(!strcmp(a, "auto"));
+        int consumers = -1; bool idle_auto = true;
+        bool idle = vcam_idle_get(&consumers, &idle_auto);
+        reply(fd, "OK idle=%s mode=%s consumers=%d", idle ? "yes" : "no",
+              idle_auto ? "auto" : "off", consumers);
+        return true;
+    }
+    if (!strcmp(cmd, "ml")) {
+        char *a = strtok_r(NULL, " \t", save);
+        if (a && !strcmp(a, "device")) {
+            char *v = strtok_r(NULL, " \t", save);
+            if (!v || !ort_set_device(v)) { reply(fd, "ERR usage: ml device auto|npu|cpu"); return true; }
+        } else if (a) {
+            reply(fd, "ERR usage: ml [device auto|npu|cpu]"); return true;
+        }
+        ml_reply(fd);
+        return true;
+    }
     if (!strcmp(cmd, "monitors")) {
         Monitor m[MAX_MON];
         int n = detect_monitors(m, MAX_MON);

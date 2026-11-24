@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 # vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
-# Modified-by: Claude Opus 5.5 (control API wrappers)
+# Modified-by: Claude Opus 5.5 (control API wrappers, stats/idle/ml, --version)
 #
 # vcam-ctl – complete runtime control for a running vcam process.
 #
@@ -97,7 +97,10 @@
 #                                Switch the camera live, e.g. 'capture set MJPG 640x480 30'.
 #                                The output size stays; the picture is scaled to it.
 #   capture fit crop|stretch     How a different aspect ratio is fitted (default crop).
-#   version                      vcam version + build hash.
+#   version | --version          vcam version + build hash.
+#   stats [--json]               Per-stage timings, fps, CPU of the last ~1 s.
+#   idle [auto|off]              Release the camera while no app reads it (default auto).
+#   ml [device auto|npu|cpu]     Where the ML filters run; shows NPU status.
 #   Full API reference (protocol, all keys, client examples):
 #     API.md — installed to /usr/share/doc/vcam/API.md
 #
@@ -759,10 +762,14 @@ fi
 # directly usable in scripts; exits 1 if vcam answered ERR.
 # ──────────────────────────────────────────────────────────────
 case "$1" in
-    status|get|share|cam|capture|monitors|version)
+    --version|-V) set -- version ;;
+esac
+case "$1" in
+    status|get|share|cam|capture|stats|idle|ml|monitors|version)
         require_running
-        if [ "$1" = "status" ] && { [ "${2:-}" = "--json" ] || [ "${2:-}" = "json" ]; }; then
-            ipc_send "status json" | head -n 1
+        if { [ "$1" = "status" ] || [ "$1" = "stats" ]; } &&
+           { [ "${2:-}" = "--json" ] || [ "${2:-}" = "json" ]; }; then
+            ipc_send "$1 json" | head -n 1
             exit 0
         fi
         OUT=$(ipc_send "$*" | grep -v '^OK bye$')
@@ -770,7 +777,7 @@ case "$1" in
             printf '%s\n' "$OUT" >&2
             exit 1
         fi
-        if [ "$1" = "status" ]; then
+        if [ "$1" = "status" ] || [ "$1" = "stats" ]; then
             printf '%s\n' "${OUT#OK }" | tr ' ' '\n'
         else
             printf '%s\n' "$OUT" | sed 's/^OK //'

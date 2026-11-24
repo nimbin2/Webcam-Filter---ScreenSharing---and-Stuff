@@ -5,7 +5,7 @@
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
  *
- * Modified-by: Claude Opus 5.5 (control API declarations)
+ * Modified-by: Claude Opus 5.5 (control API, fast path, idle, stats, ML devices)
  */
 
 #pragma once
@@ -337,11 +337,11 @@ const char *ipc_sock_path(void);   /* the path actually in use */
  * on the same socket: status, get, share, cam, monitors, version.
  * [Claude Opus 5.5]
  * ────────────────────────────────────────────── */
-#define VCAM_VERSION "1.1.1"
+#define VCAM_VERSION "1.2.1"
 
 /* Returns true if <cmd> was an API command (reply already sent). */
 bool        api_handle(int fd, const char *cmd, char **save, OverlayRegistry *reg);
-const char *api_version_string(void);   /* "vcam 1.1.1 (build abc1234)" — see API.md */
+const char *api_version_string(void);   /* "vcam 1.2.1 (build abc1234)" — see API.md */
 
 /* ──────────────────────────────────────────────
  * V4L2 capture
@@ -377,6 +377,13 @@ bool         capture_choose(const CaptureMode *modes, int n,
 V4L2Capture *capture_open_mode(const char *dev, const CaptureMode *mode,
                                int out_w, int out_h, bool crop);
 bool         capture_set_fit (V4L2Capture *cap, bool crop);
+/* Fast path: next frame as YUYV (out size) straight into dst. */
+bool         capture_read_yuyv(V4L2Capture *cap, uint8_t *dst, int dstride);
+/* ns spent on the last frame from dequeue to requeue (decode + convert). */
+long         capture_last_work_ns(const V4L2Capture *cap);
+/* Size to use when --res is not given (pref if available, else nearest). */
+bool         capture_default_size(const char *dev, int pref_w, int pref_h, int fps,
+                                  int *w, int *h);
 void         capture_get     (const V4L2Capture *cap, CaptureMode *mode, bool *crop);
 
 /* Owned by main.c: the main loop applies requests between two frames. */
@@ -403,7 +410,38 @@ V4L2Output *output_open (const char *dev, int w, int h, int fps);
  * Screen / webcam overlays clamp against these to avoid being clipped. */
 extern int g_output_w;
 extern int g_output_h;
-bool        output_write(V4L2Output *out, const Frame *frame);
+bool        output_write(V4L2Output *out, const Frame *frame);   /* BGR24 frame */
+/* Fast path [Claude Opus 5.5]: write YUYV straight into a free mmap buffer,
+ * then queue it. begin() returns NULL if no buffer is free (drop the frame). */
+uint8_t    *output_begin (V4L2Output *out, int *stride);
+bool        output_commit(V4L2Output *out);
+bool        output_write_black(V4L2Output *out);   /* idle frame */
+
+/* ── readers of the virtual camera (src/consumers.c) [Claude Opus 5.5] ── */
+typedef struct {
+    int  ifd;          /* inotify fd, -1 if unavailable */
+    int  count;        /* other processes with the device open */
+    char path[4096];   /* resolved device node */
+    long recheck_ms, next_scan_ms;   /* pending rescans (monotonic ms) */
+} Consumers;
+bool consumers_init  (Consumers *c, const char *dev);
+int  consumers_update(Consumers *c);   /* drain events, return count (-1 = unknown) */
+int  consumers_scan  (const Consumers *c);
+void consumers_close (Consumers *c);
+
+/* ── idle + stats, owned by main.c ── */
+typedef struct {
+    double window_s;              /* length of the measured window */
+    double fps_in, fps_out;       /* camera frames read / frames written */
+    double cpu;                   /* vcam process CPU, % of one core */
+    char   path[8];               /* fast | full | idle | nocam */
+    double capture_ms, filters_ms, compose_ms, output_ms, work_ms;  /* per frame */
+    double budget_ms;             /* 1000 / output fps */
+    long   frames;                /* frames written since start */
+} VcamStats;
+void vcam_stats_get(VcamStats *st);
+bool vcam_idle_get(int *consumers, bool *idle_auto);   /* returns: idle now */
+void vcam_idle_set_auto(bool on);
 void        output_close(V4L2Output *out);
 
 /* ──────────────────────────────────────────────

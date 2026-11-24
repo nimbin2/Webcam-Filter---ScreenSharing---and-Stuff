@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # vcam — Copyright (C) 2026 the vcam authors. GPL-2.0, see LICENSE.
-# Modified-by: Claude Opus 5.5 (api.c, build hash, PREFIX=/usr, API.md install)
+# Modified-by: Claude Opus 5.5 (api.c, consumers.c, build hash, PREFIX=/usr, API.md install)
 
 CC      := gcc
 CXX     := g++
@@ -153,7 +153,7 @@ DATADIR ?= $(PREFIX)/share/vcam
 
 SRCS := src/main.c src/frame.c src/capture.c src/output.c \
         src/overlay.c src/registry.c src/ipc.c src/filter.c \
-        src/record.c src/ort_rvm.c src/api.c
+        src/record.c src/ort_rvm.c src/api.c src/consumers.c
 OBJS := $(SRCS:.c=.o) $(CV_OBJ)
 
 # Build hash: md5 over every source input, so 'vcam --version' and

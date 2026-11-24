@@ -96,6 +96,21 @@ void ort_rvm_reset(void);
 /* Release the session and all state. Safe in every build. */
 void ort_shutdown(void);
 
+/* ── ML device selection [Claude Opus 5.5] ──
+ * Every model is loaded through one builder: on the Ryzen AI NPU (Vitis AI
+ * execution provider) when allowed and available, else on the CPU with a
+ * thread cap. A model that fails on the NPU falls back alone. */
+enum { ORT_M_RVM, ORT_M_POSE, ORT_M_DEPTH, ORT_M_I2I, ORT_NMODELS };
+void        ort_config(const char *device, int threads, const char *npu_config, bool async);
+bool        ort_set_device(const char *device);  /* auto|npu|cpu, for models loaded later */
+const char *ort_ml_device(void);     /* requested device */
+int         ort_ml_threads(void);
+bool        ort_ml_async(void);      /* matting runs beside the video loop */
+bool        ort_npu_hw(void);        /* /dev/accel/accel0 driven by amdxdna */
+bool        ort_npu_runtime(void);   /* this ONNX Runtime has the Vitis AI EP */
+const char *ort_model_device(int m); /* "npu" | "cpu" | "off" */
+double      ort_model_ms(int m);     /* average inference time, 0 = never run */
+
 #ifdef __cplusplus
 }
 #endif

@@ -4,6 +4,9 @@
  *
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
+ *
+ * Modified-by: Claude Opus 5.5 (one session builder for all models: NPU via
+ *              Vitis AI EP with per-model CPU fallback, thread cap, timing)
  */
 
 /*
@@ -26,6 +29,63 @@
 #include "vcam_ort.h"
 
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+#include <time.h>
+#include <sys/stat.h>
+
+/* ── ML device config [Claude Opus 5.5] ───────────────────────────── */
+static char   g_ml_req[8]     = "auto";   /* auto | npu | cpu */
+static int    g_ml_threads    = 4;
+static char   g_npu_cfg[1024] = "";
+static bool   g_ml_async      = true;
+static double g_mms[ORT_NMODELS];          /* avg inference ms */
+
+static bool valid_dev(const char *d)
+{
+    return d && (!strcmp(d, "auto") || !strcmp(d, "npu") || !strcmp(d, "cpu"));
+}
+
+void ort_config(const char *device, int threads, const char *npu_config, bool async)
+{
+    if (valid_dev(device)) snprintf(g_ml_req, sizeof g_ml_req, "%s", device);
+    if (threads > 0) g_ml_threads = threads;
+    if (npu_config && *npu_config) snprintf(g_npu_cfg, sizeof g_npu_cfg, "%s", npu_config);
+    g_ml_async = async;
+}
+
+bool ort_set_device(const char *device)
+{
+    if (!valid_dev(device)) return false;
+    snprintf(g_ml_req, sizeof g_ml_req, "%s", device);
+    return true;
+}
+
+const char *ort_ml_device(void)  { return g_ml_req; }
+int         ort_ml_threads(void) { return g_ml_threads; }
+bool        ort_ml_async(void)   { return g_ml_async; }
+double      ort_model_ms(int m)  { return m >= 0 && m < ORT_NMODELS ? g_mms[m] : 0; }
+
+/* Ryzen AI NPU present: /dev/accel/accel0 usable and driven by amdxdna. */
+bool ort_npu_hw(void)
+{
+    if (access("/dev/accel/accel0", R_OK | W_OK) != 0) return false;
+    char link[PATH_MAX];
+    ssize_t n = readlink("/sys/class/accel/accel0/device/driver", link, sizeof link - 1);
+    if (n <= 0) return false;
+    link[n] = '\0';
+    const char *base = strrchr(link, '/');
+    return strcmp(base ? base + 1 : link, "amdxdna") == 0;
+}
+
+static __attribute__((unused)) void ms_note(int m, const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0->tv_sec) * 1e3 + (t1.tv_nsec - t0->tv_nsec) / 1e6;
+    g_mms[m] = g_mms[m] == 0 ? ms : g_mms[m] * 0.9 + ms * 0.1;
+}
 
 #if VCAM_HAVE_ORT
 
@@ -57,6 +117,154 @@ static int ok(OrtStatus *st, const char *where)
     fprintf(stderr, "[vcam/ort] %s failed: %s\n", where, A->GetErrorMessage(st));
     A->ReleaseStatus(st);
     return 0;
+}
+
+/* ── one session builder for every model [Claude Opus 5.5] ──
+ * g_so          : CPU, thread-capped (shared)
+ * npu_options() : per model, + Vitis AI EP (Ryzen AI NPU); ops the NPU
+ *                 can't run stay on the CPU inside ORT. If a model fails to
+ *                 load on the NPU, only that model falls back to g_so. */
+static int         g_npu_rt = -1;          /* Vitis AI EP in this ORT: -1 unknown */
+static const char *g_mdev[ORT_NMODELS];    /* "npu" / "cpu" once loaded */
+static const char *MNAME[ORT_NMODELS] = { "matting", "pose", "depth", "img2img" };
+
+static int common_init(void)
+{
+    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!A) {
+        fprintf(stderr, "[vcam/ort] ORT C API version %d unavailable in this "
+                        "libonnxruntime\n", ORT_API_VERSION);
+        return 0;
+    }
+    if (!g_env &&
+        !ok(A->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "vcam", &g_env), "CreateEnv"))
+        return 0;
+    if (!g_so) {
+        if (!ok(A->CreateSessionOptions(&g_so), "CreateSessionOptions")) return 0;
+        if (!ok(A->SetSessionGraphOptimizationLevel(g_so, ORT_ENABLE_ALL),
+                "SetGraphOptimizationLevel")) return 0;
+        /* ORT's default is one thread per core — a single model then
+         * loads every core. Cap it (--ml-threads). */
+        if (!ok(A->SetIntraOpNumThreads(g_so, g_ml_threads), "SetIntraOpNumThreads"))
+            return 0;
+    }
+    if (!g_mi &&
+        !ok(A->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_mi),
+            "CreateCpuMemoryInfo"))
+        return 0;
+    if (!g_alloc &&
+        !ok(A->GetAllocatorWithDefaultOptions(&g_alloc), "GetAllocator"))
+        return 0;
+    return 1;
+}
+
+bool ort_npu_runtime(void)
+{
+    if (g_npu_rt >= 0) return g_npu_rt == 1;
+    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!A) return false;
+    char **names = NULL;
+    int n = 0;
+    g_npu_rt = 0;
+    if (ok(A->GetAvailableProviders(&names, &n), "GetAvailableProviders")) {
+        for (int i = 0; i < n; i++)
+            if (!strcmp(names[i], "VitisAIExecutionProvider")) g_npu_rt = 1;
+        A->ReleaseAvailableProviders(names, n);
+    }
+    return g_npu_rt == 1;
+}
+
+static void mkdir_p(const char *path)
+{
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    for (char *p = tmp + 1; *p; p++)
+        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+    mkdir(tmp, 0755);
+}
+
+/* Session options with the Vitis AI EP for one model. Compiling for the
+ * NPU takes a while on first load; cache_dir/cache_key keep the result
+ * for the next start. The caller releases the options after CreateSession. */
+static OrtSessionOptions *npu_options(const char *model_path)
+{
+    OrtSessionOptions *so = NULL;
+    if (!ok(A->CreateSessionOptions(&so), "CreateSessionOptions(npu)")) return NULL;
+    A->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL);
+    A->SetIntraOpNumThreads(so, g_ml_threads);   /* for ops left on the CPU */
+
+    char cache[PATH_MAX];
+    const char *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+    if (xdg && *xdg) snprintf(cache, sizeof cache, "%s/vcam/npu", xdg);
+    else             snprintf(cache, sizeof cache, "%s/.cache/vcam/npu", home ? home : "/tmp");
+    mkdir_p(cache);
+
+    char key[256];                               /* model file name, no .onnx */
+    const char *base = strrchr(model_path, '/');
+    snprintf(key, sizeof key, "%s", base ? base + 1 : model_path);
+    char *dot = strrchr(key, '.');
+    if (dot) *dot = '\0';
+
+    const char *keys[16], *vals[16];
+    size_t n = 0;
+    keys[n] = "cache_dir";                   vals[n++] = cache;
+    keys[n] = "cache_key";                   vals[n++] = key;
+    keys[n] = "enable_cache_file_io_in_mem"; vals[n++] = "0";   /* INT8: write cache */
+    if (g_npu_cfg[0]) { keys[n] = "config_file"; vals[n++] = g_npu_cfg; }
+    /* Extra / override options: VCAM_NPU_OPTIONS="key=value,key=value" */
+    char extra[1024];
+    const char *ev = getenv("VCAM_NPU_OPTIONS");
+    if (ev && *ev) {
+        snprintf(extra, sizeof extra, "%s", ev);
+        char *save = NULL;
+        for (char *kv = strtok_r(extra, ",", &save); kv && n < 16; kv = strtok_r(NULL, ",", &save)) {
+            char *eq = strchr(kv, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            keys[n] = kv; vals[n++] = eq + 1;
+        }
+    }
+    if (!ok(A->SessionOptionsAppendExecutionProvider(so, "VitisAI", keys, vals, n),
+            "AppendExecutionProvider(VitisAI)")) {
+        A->ReleaseSessionOptions(so);
+        return NULL;
+    }
+    return so;
+}
+
+/* Create a session for model m on the best allowed device. */
+static OrtSession *open_session(const char *model_path, int m)
+{
+    OrtSession *s = NULL;
+    bool want = strcmp(g_ml_req, "cpu") != 0;
+    bool hw   = ort_npu_hw();
+    bool rt   = ort_npu_runtime();
+    if (want && hw && rt) {
+        OrtSessionOptions *so = npu_options(model_path);
+        bool up = so && ok(A->CreateSession(g_env, model_path, so, &s), "CreateSession(npu)");
+        if (so) A->ReleaseSessionOptions(so);
+        if (up) {
+            g_mdev[m] = "npu";
+            fprintf(stderr, "[vcam/ort] %s model on the NPU\n", MNAME[m]);
+            return s;
+        }
+        s = NULL;
+        fprintf(stderr, "[vcam/ort] %s model: NPU load failed — using the CPU\n", MNAME[m]);
+    } else if (!strcmp(g_ml_req, "npu")) {
+        fprintf(stderr, "[vcam/ort] NPU requested but not usable (hardware %s, "
+                        "Vitis AI runtime %s) — %s model on the CPU\n",
+                hw ? "ok" : "missing", rt ? "ok" : "missing", MNAME[m]);
+    }
+    if (!ok(A->CreateSession(g_env, model_path, g_so, &s), "CreateSession"))
+        return NULL;
+    g_mdev[m] = "cpu";
+    fprintf(stderr, "[vcam/ort] %s model on the CPU (%d threads)\n", MNAME[m], g_ml_threads);
+    return s;
+}
+
+const char *ort_model_device(int m)
+{
+    return m >= 0 && m < ORT_NMODELS && g_mdev[m] ? g_mdev[m] : "off";
 }
 
 static void release_rec(void)
@@ -134,30 +342,9 @@ int ort_rvm_init(const char *model_path)
     if (g_sess) { pthread_mutex_unlock(&g_mtx); return 1; }   /* already up */
     g_dead = 0;
 
-    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-    if (!A) {
-        fprintf(stderr, "[vcam/ort] ORT C API version %d unavailable in this "
-                        "libonnxruntime\n", ORT_API_VERSION);
-        goto fail;
-    }
-    if (!g_env &&
-        !ok(A->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "vcam", &g_env), "CreateEnv"))
-        goto fail;
-    if (!g_so) {
-        if (!ok(A->CreateSessionOptions(&g_so), "CreateSessionOptions")) goto fail;
-        if (!ok(A->SetSessionGraphOptimizationLevel(g_so, ORT_ENABLE_ALL),
-                "SetGraphOptimizationLevel")) goto fail;
-        /* leave intra-op threads at ORT's default (all cores) */
-    }
-    if (!g_mi &&
-        !ok(A->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_mi),
-            "CreateCpuMemoryInfo"))
-        goto fail;
-    if (!g_alloc &&
-        !ok(A->GetAllocatorWithDefaultOptions(&g_alloc), "GetAllocator"))
-        goto fail;
+    if (!common_init()) goto fail;
 
-    if (!ok(A->CreateSession(g_env, model_path, g_so, &g_sess), "CreateSession"))
+    if (!(g_sess = open_session(model_path, ORT_M_RVM)))
         goto fail;
     if (!verify_iface()) {
         A->ReleaseSession(g_sess); g_sess = NULL;
@@ -178,7 +365,7 @@ fail:
     return 0;
 }
 
-int ort_rvm_infer(const float *src_chw, int iw, int ih, float ds,
+static int rvm_infer_impl(const float *src_chw, int iw, int ih, float ds,
                   float *pha_out)
 {
     if (!src_chw || !pha_out || iw < 16 || ih < 16) return 0;
@@ -273,21 +460,8 @@ int ort_pose_init(const char *model_path)
     pthread_mutex_lock(&g_mtx);
     if (g_pose) { pthread_mutex_unlock(&g_mtx); return 1; }
     g_pose_dead = 0;
-    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-    if (!A) goto fail;
-    if (!g_env && !ok(A->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "vcam", &g_env),
-                      "CreateEnv")) goto fail;
-    if (!g_so) {
-        if (!ok(A->CreateSessionOptions(&g_so), "CreateSessionOptions")) goto fail;
-        if (!ok(A->SetSessionGraphOptimizationLevel(g_so, ORT_ENABLE_ALL),
-                "SetGraphOptimizationLevel")) goto fail;
-    }
-    if (!g_mi && !ok(A->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
-                     &g_mi), "CreateCpuMemoryInfo")) goto fail;
-    if (!g_alloc && !ok(A->GetAllocatorWithDefaultOptions(&g_alloc),
-                        "GetAllocator")) goto fail;
-    if (!ok(A->CreateSession(g_env, model_path, g_so, &g_pose),
-            "CreateSession(pose)")) goto fail;
+    if (!common_init()) goto fail;
+    if (!(g_pose = open_session(model_path, ORT_M_POSE))) goto fail;
     {
         size_t nin = 0;
         if (!ok(A->SessionGetInputCount(g_pose, &nin), "pose InCount") ||
@@ -318,7 +492,7 @@ fail:
     return 0;
 }
 
-int ort_pose_infer(const float *rgb_nhwc_256, float *landmarks195, float *conf1)
+static int pose_infer_impl(const float *rgb_nhwc_256, float *landmarks195, float *conf1)
 {
     if (!rgb_nhwc_256 || !landmarks195 || !conf1) return 0;
     pthread_mutex_lock(&g_mtx);
@@ -397,21 +571,8 @@ int ort_depth_init(const char *model_path)
     pthread_mutex_lock(&g_mtx);
     if (g_dep) { pthread_mutex_unlock(&g_mtx); return 1; }
     g_dep_dead = 0;
-    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-    if (!A) goto fail;
-    if (!g_env && !ok(A->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "vcam", &g_env),
-                      "CreateEnv")) goto fail;
-    if (!g_so) {
-        if (!ok(A->CreateSessionOptions(&g_so), "CreateSessionOptions")) goto fail;
-        if (!ok(A->SetSessionGraphOptimizationLevel(g_so, ORT_ENABLE_ALL),
-                "SetGraphOptimizationLevel")) goto fail;
-    }
-    if (!g_mi && !ok(A->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
-                     &g_mi), "CreateCpuMemoryInfo")) goto fail;
-    if (!g_alloc && !ok(A->GetAllocatorWithDefaultOptions(&g_alloc),
-                        "GetAllocator")) goto fail;
-    if (!ok(A->CreateSession(g_env, model_path, g_so, &g_dep),
-            "CreateSession(depth)")) goto fail;
+    if (!common_init()) goto fail;
+    if (!(g_dep = open_session(model_path, ORT_M_DEPTH))) goto fail;
     {
         size_t nin = 0, nout = 0;
         if (!ok(A->SessionGetInputCount(g_dep, &nin), "depth InCount") ||
@@ -440,7 +601,7 @@ fail:
     return 0;
 }
 
-int ort_depth_infer(const float *rgb_chw_256, float *depth_out_65536)
+static int depth_infer_impl(const float *rgb_chw_256, float *depth_out_65536)
 {
     if (!rgb_chw_256 || !depth_out_65536) return 0;
     pthread_mutex_lock(&g_mtx);
@@ -506,21 +667,8 @@ int ort_i2i_init(const char *model_path)
     pthread_mutex_lock(&g_mtx);
     if (g_i2i) { pthread_mutex_unlock(&g_mtx); return 1; }
     g_i2i_dead = 0;
-    if (!A) A = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-    if (!A) goto fail;
-    if (!g_env && !ok(A->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "vcam", &g_env),
-                      "CreateEnv")) goto fail;
-    if (!g_so) {
-        if (!ok(A->CreateSessionOptions(&g_so), "CreateSessionOptions")) goto fail;
-        if (!ok(A->SetSessionGraphOptimizationLevel(g_so, ORT_ENABLE_ALL),
-                "SetGraphOptimizationLevel")) goto fail;
-    }
-    if (!g_mi && !ok(A->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
-                     &g_mi), "CreateCpuMemoryInfo")) goto fail;
-    if (!g_alloc && !ok(A->GetAllocatorWithDefaultOptions(&g_alloc),
-                        "GetAllocator")) goto fail;
-    if (!ok(A->CreateSession(g_env, model_path, g_so, &g_i2i),
-            "CreateSession(i2i)")) goto fail;
+    if (!common_init()) goto fail;
+    if (!(g_i2i = open_session(model_path, ORT_M_I2I))) goto fail;
     {
         size_t nin = 0, nout = 0;
         if (!ok(A->SessionGetInputCount(g_i2i, &nin), "i2i InputCount") ||
@@ -563,7 +711,7 @@ fail:
     return 0;
 }
 
-int ort_i2i_infer(const float *in, int w, int h, float *out)
+static int i2i_infer_impl(const float *in, int w, int h, float *out)
 {
     if (!in || !out || w < 16 || h < 16) return 0;
     pthread_mutex_lock(&g_mtx);
@@ -632,6 +780,7 @@ void ort_shutdown(void)
     if (g_i2i) { A->ReleaseSession(g_i2i); g_i2i = NULL; }
     if (g_sess) { A->ReleaseSession(g_sess); g_sess = NULL; }
     if (g_so)   { A->ReleaseSessionOptions(g_so); g_so = NULL; }
+    for (int i = 0; i < ORT_NMODELS; i++) g_mdev[i] = NULL;
     if (g_mi)   { A->ReleaseMemoryInfo(g_mi); g_mi = NULL; }
     if (g_env)  { A->ReleaseEnv(g_env); g_env = NULL; }
     g_alloc = NULL;   /* default allocator is not owned */
@@ -639,7 +788,41 @@ void ort_shutdown(void)
     pthread_mutex_unlock(&g_mtx);
 }
 
+/* timed public entry points (time shows up in 'vcam-ctl stats') */
+int ort_rvm_infer(const float *src_chw, int iw, int ih, float ds, float *pha_out)
+{
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    int r = rvm_infer_impl(src_chw, iw, ih, ds, pha_out);
+    if (r) ms_note(ORT_M_RVM, &t0);
+    return r;
+}
+int ort_pose_infer(const float *rgb_nhwc_256, float *landmarks195, float *conf1)
+{
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    int r = pose_infer_impl(rgb_nhwc_256, landmarks195, conf1);
+    if (r) ms_note(ORT_M_POSE, &t0);
+    return r;
+}
+int ort_depth_infer(const float *rgb_chw_256, float *depth_out_65536)
+{
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    int r = depth_infer_impl(rgb_chw_256, depth_out_65536);
+    if (r) ms_note(ORT_M_DEPTH, &t0);
+    return r;
+}
+int ort_i2i_infer(const float *in, int w, int h, float *out)
+{
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    int r = i2i_infer_impl(in, w, h, out);
+    if (r) ms_note(ORT_M_I2I, &t0);
+    return r;
+}
+
 #else /* !VCAM_HAVE_ORT — stubs so everything links without ORT */
+
+bool ort_npu_runtime(void) { return false; }
+const char *ort_model_device(int m) { (void)m; return "off"; }
+
 
 bool ort_available(void) { return false; }
 

@@ -6,7 +6,8 @@
  * Public License version 2. See the LICENSE file for the full text.
  *
  * Modified-by: Claude Opus 5.5 (live mode switching: enum/choose/open_mode,
- *              scale+crop into a fixed output size)
+ *              scale+crop into a fixed output size; YUYV fast path,
+ *              default-size choice, work timing, planar-format fix)
  */
 
 #include "vcam.h"
@@ -20,6 +21,8 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <strings.h>
+#include <time.h>
+#include <sys/select.h>
 #include <linux/videodev2.h>
 
 #include <libavcodec/avcodec.h>
@@ -59,6 +62,15 @@ struct V4L2Capture {
     int    scale_w, scale_h;
     int    crop_x, crop_y;
     Frame *tmp;               /* only when cropping is needed */
+
+    /* Fast path (capture_read_yuyv): straight to the loopback's YUYV */
+    struct SwsContext *ysws;
+    int    ysws_fmt, ysws_w, ysws_h;
+    uint8_t *ytmp;            /* oversized YUYV frame when cropping */
+    size_t   ytmp_len;
+
+    struct timespec work_t0;  /* set when a buffer is dequeued */
+    long   last_work_ns;      /* dequeue → requeue of the last frame */
 };
 
 static bool capture_start(V4L2Capture *cap, const char *device,
@@ -510,6 +522,8 @@ static bool setup_scaling(V4L2Capture *cap)
         if (!cap->tmp) return false;
     }
     if (cap->sws) { sws_freeContext(cap->sws); cap->sws = NULL; }
+    if (cap->ysws) { sws_freeContext(cap->ysws); cap->ysws = NULL; }
+    free(cap->ytmp); cap->ytmp = NULL; cap->ytmp_len = 0;
     if (cap->pixfmt != V4L2_PIX_FMT_MJPEG) {
         cap->sws = sws_getContext(sw, sh, cap->sws_src_fmt,
                                   cap->scale_w, cap->scale_h, AV_PIX_FMT_BGR24,
@@ -660,7 +674,15 @@ static bool capture_start(V4L2Capture *cap, const char *device,
 }
 
 /* ── read one frame ───────────────────────────── */
-bool capture_read(V4L2Capture *cap, Frame *out)
+static long ns_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000000000L + (t1.tv_nsec - t0->tv_nsec);
+}
+
+/* Wait (max 2 s) for a filled buffer and dequeue it. */
+static bool dequeue(V4L2Capture *cap, struct v4l2_buffer *buf)
 {
     fd_set fds;
     FD_ZERO(&fds);
@@ -668,26 +690,55 @@ bool capture_read(V4L2Capture *cap, Frame *out)
     struct timeval tv = { .tv_sec = 2 };
     if (select(cap->fd + 1, &fds, NULL, NULL, &tv) <= 0)
         return false;
+    clock_gettime(CLOCK_MONOTONIC, &cap->work_t0);   /* waiting is not work */
 
-    struct v4l2_buffer buf = {0};
-    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    if (xioctl(cap->fd, VIDIOC_DQBUF, &buf) < 0) {
-        if (errno == EAGAIN) return false;
-        perror("VIDIOC_DQBUF");
+    memset(buf, 0, sizeof *buf);
+    buf->type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf->memory = V4L2_MEMORY_MMAP;
+    if (xioctl(cap->fd, VIDIOC_DQBUF, buf) < 0) {
+        if (errno != EAGAIN) perror("VIDIOC_DQBUF");
         return false;
     }
+    return true;
+}
+
+static void requeue(V4L2Capture *cap, struct v4l2_buffer *buf)
+{
+    if (xioctl(cap->fd, VIDIOC_QBUF, buf) < 0)
+        perror("VIDIOC_QBUF (re-enqueue)");
+    cap->last_work_ns = ns_since(&cap->work_t0);
+}
+
+long capture_last_work_ns(const V4L2Capture *cap) { return cap ? cap->last_work_ns : 0; }
+
+static bool decode_mjpeg(V4L2Capture *cap, const struct v4l2_buffer *buf)
+{
+    cap->mjpeg_pkt->data = cap->bufs[buf->index].start;
+    cap->mjpeg_pkt->size = buf->bytesused;
+    return avcodec_send_packet(cap->mjpeg_ctx, cap->mjpeg_pkt) == 0 &&
+           avcodec_receive_frame(cap->mjpeg_ctx, cap->mjpeg_frame) == 0;
+}
+
+/* Plane pointers + line sizes for a raw (non-MJPEG) buffer. Passing only
+ * plane 0 (as before) crashed planar formats like NV12 / YU12. */
+static void raw_planes(const V4L2Capture *cap, const struct v4l2_buffer *buf,
+                       uint8_t *src[4], int sl[4])
+{
+    av_image_fill_linesizes(sl, cap->sws_src_fmt, cap->width);
+    av_image_fill_pointers(src, cap->sws_src_fmt, cap->height,
+                           cap->bufs[buf->index].start, sl);
+}
+
+bool capture_read(V4L2Capture *cap, Frame *out)
+{
+    struct v4l2_buffer buf;
+    if (!dequeue(cap, &buf)) return false;
 
     bool ok = false;
 
     if (cap->pixfmt == V4L2_PIX_FMT_MJPEG) {
         /* Decode JPEG → AVFrame → BGR24 via swscale */
-        cap->mjpeg_pkt->data = cap->bufs[buf.index].start;
-        cap->mjpeg_pkt->size = buf.bytesused;
-
-        if (avcodec_send_packet(cap->mjpeg_ctx, cap->mjpeg_pkt) == 0 &&
-            avcodec_receive_frame(cap->mjpeg_ctx, cap->mjpeg_frame) == 0) {
-
+        if (decode_mjpeg(cap, &buf)) {
             /* Build/refresh swscale context if needed */
             int src_fmt = cap->mjpeg_frame->format;
             int src_w   = cap->mjpeg_frame->width;
@@ -717,23 +768,164 @@ bool capture_read(V4L2Capture *cap, Frame *out)
             }
         }
     } else {
-        const uint8_t *src[4]   = { cap->bufs[buf.index].start, NULL, NULL, NULL };
-        int            sl[4]    = { 0 };
-        av_image_fill_linesizes(sl, cap->sws_src_fmt, cap->width);
+        uint8_t *src[4] = { 0 };
+        int      sl[4]  = { 0 };
+        raw_planes(cap, &buf, src, sl);
 
         Frame         *target   = cap->tmp ? cap->tmp : out;
         uint8_t       *dst[4]   = { target->data, NULL, NULL, NULL };
         int            dl[4]    = { target->stride, 0, 0, 0 };
 
-        sws_scale(cap->sws, src, sl, 0, cap->height, dst, dl);
+        sws_scale(cap->sws, (const uint8_t *const *)src, sl, 0, cap->height, dst, dl);
         if (cap->tmp) crop_into(cap, out);
         ok = true;
     }
 
-    if (xioctl(cap->fd, VIDIOC_QBUF, &buf) < 0)
-        perror("VIDIOC_QBUF (re-enqueue)");
-
+    requeue(cap, &buf);
     return ok;
+}
+
+/* ── fast path: camera → YUYV (the loopback format) ─────────────
+ * Used when nothing needs BGR (no filters, overlays or recording).
+ * Skips YUV→BGR→YUV; for same-size MJPEG it is a plain interleave. */
+static uint8_t g_lut_y[256], g_lut_c[256];
+static bool    g_lut_ready;
+
+static void lut_init(void)
+{
+    if (g_lut_ready) return;
+    for (int i = 0; i < 256; i++) {   /* JPEG full range → video limited range */
+        g_lut_y[i] = (uint8_t)(16 + (i * 219 + 127) / 255);
+        g_lut_c[i] = (uint8_t)(128 + ((i - 128) * 224 + (i >= 128 ? 127 : -127)) / 255);
+    }
+    g_lut_ready = true;
+}
+
+/* 4:2:2 or 4:2:0 planar (vsub 1 / 2) → YUYV, same size. */
+static void planar_to_yuyv(uint8_t *const data[], const int ls[], int w, int h,
+                           int vsub, bool full, uint8_t *dst, int dstride)
+{
+    lut_init();
+    for (int y = 0; y < h; y++) {
+        const uint8_t *py = data[0] + (size_t)y * ls[0];
+        const uint8_t *pu = data[1] + (size_t)(y / vsub) * ls[1];
+        const uint8_t *pv = data[2] + (size_t)(y / vsub) * ls[2];
+        uint8_t *d = dst + (size_t)y * dstride;
+        if (full) {
+            for (int x = 0; x < w / 2; x++) {
+                d[0] = g_lut_y[py[0]]; d[1] = g_lut_c[pu[x]];
+                d[2] = g_lut_y[py[1]]; d[3] = g_lut_c[pv[x]];
+                d += 4; py += 2;
+            }
+        } else {
+            for (int x = 0; x < w / 2; x++) {
+                d[0] = py[0]; d[1] = pu[x]; d[2] = py[1]; d[3] = pv[x];
+                d += 4; py += 2;
+            }
+        }
+    }
+}
+
+/* Any format/size → YUYV at out size (scale + optional centre crop). */
+static bool sws_to_yuyv(V4L2Capture *cap, uint8_t *const src[], const int sl[],
+                        int fmt, int sw, int sh, uint8_t *dst, int dstride)
+{
+    bool cropping = cap->tmp != NULL;               /* setup_scaling decided */
+    int  tw = cropping ? (cap->scale_w + 1) & ~1 : cap->out_w;   /* YUYV needs even */
+    int  th = cropping ? cap->scale_h : cap->out_h;
+    if (!cap->ysws || cap->ysws_fmt != fmt || cap->ysws_w != sw || cap->ysws_h != sh) {
+        if (cap->ysws) sws_freeContext(cap->ysws);
+        cap->ysws = sws_getContext(sw, sh, fmt, tw, th, AV_PIX_FMT_YUYV422,
+                                   SWS_BILINEAR, NULL, NULL, NULL);
+        cap->ysws_fmt = fmt; cap->ysws_w = sw; cap->ysws_h = sh;
+        if (!cap->ysws) return false;
+    }
+    if (!cropping) {
+        uint8_t *d[4] = { dst, NULL, NULL, NULL };
+        int      dl[4] = { dstride, 0, 0, 0 };
+        sws_scale(cap->ysws, (const uint8_t *const *)src, sl, 0, sh, d, dl);
+        return true;
+    }
+    size_t need = (size_t)tw * 2 * th;
+    if (cap->ytmp_len < need) {
+        free(cap->ytmp);
+        cap->ytmp = malloc(need);
+        cap->ytmp_len = cap->ytmp ? need : 0;
+        if (!cap->ytmp) return false;
+    }
+    uint8_t *d[4] = { cap->ytmp, NULL, NULL, NULL };
+    int      dl[4] = { tw * 2, 0, 0, 0 };
+    sws_scale(cap->ysws, (const uint8_t *const *)src, sl, 0, sh, d, dl);
+    int cx = ((tw - cap->out_w) / 2) & ~1;          /* keep U/V pairs intact */
+    int cy = (th - cap->out_h) / 2;
+    for (int y = 0; y < cap->out_h; y++)
+        memcpy(dst + (size_t)y * dstride,
+               cap->ytmp + (size_t)(y + cy) * tw * 2 + (size_t)cx * 2,
+               (size_t)cap->out_w * 2);
+    return true;
+}
+
+bool capture_read_yuyv(V4L2Capture *cap, uint8_t *dst, int dstride)
+{
+    struct v4l2_buffer buf;
+    if (!dequeue(cap, &buf)) return false;
+    bool ok = false;
+
+    if (cap->pixfmt == V4L2_PIX_FMT_MJPEG) {
+        if (decode_mjpeg(cap, &buf)) {
+            AVFrame *f = cap->mjpeg_frame;
+            int  fmt  = f->format;
+            int  vsub = (fmt == AV_PIX_FMT_YUVJ420P || fmt == AV_PIX_FMT_YUV420P) ? 2
+                      : (fmt == AV_PIX_FMT_YUVJ422P || fmt == AV_PIX_FMT_YUV422P) ? 1 : 0;
+            bool full = fmt == AV_PIX_FMT_YUVJ420P || fmt == AV_PIX_FMT_YUVJ422P ||
+                        f->color_range == AVCOL_RANGE_JPEG;
+            if (vsub && f->width == cap->out_w && f->height == cap->out_h && !(f->width & 1)) {
+                planar_to_yuyv(f->data, f->linesize, f->width, f->height, vsub, full, dst, dstride);
+                ok = true;
+            } else {
+                ok = sws_to_yuyv(cap, f->data, f->linesize, fmt, f->width, f->height, dst, dstride);
+            }
+        }
+    } else if (cap->pixfmt == V4L2_PIX_FMT_YUYV &&
+               cap->width == cap->out_w && cap->height == cap->out_h) {
+        const uint8_t *s = cap->bufs[buf.index].start;   /* already YUYV: copy */
+        for (int y = 0; y < cap->height; y++)
+            memcpy(dst + (size_t)y * dstride, s + (size_t)y * cap->width * 2,
+                   (size_t)cap->width * 2);
+        ok = true;
+    } else {
+        uint8_t *src[4] = { 0 };
+        int      sl[4]  = { 0 };
+        raw_planes(cap, &buf, src, sl);
+        ok = sws_to_yuyv(cap, src, sl, cap->sws_src_fmt, cap->width, cap->height, dst, dstride);
+    }
+
+    requeue(cap, &buf);
+    return ok;
+}
+
+/* Default size when --res is not given: pref (e.g. 1280x720) if the camera
+ * has it at fps, else the smallest mode covering it, else the largest. */
+bool capture_default_size(const char *device, int pref_w, int pref_h, int fps,
+                          int *w, int *h)
+{
+    CaptureMode m[128];
+    int n = capture_enum_modes(device, m, 128);
+    if (n <= 0) return false;
+    int target = fps > 0 ? fps : 30;
+    const CaptureMode *exact = NULL, *cover = NULL, *largest = NULL;
+    for (int i = 0; i < n; i++) {
+        if (m[i].fps > 0 && m[i].fps < target) continue;
+        long a = (long)m[i].w * m[i].h;
+        if (m[i].w == pref_w && m[i].h == pref_h) exact = &m[i];
+        if (m[i].w >= pref_w && m[i].h >= pref_h &&
+            (!cover || a < (long)cover->w * cover->h)) cover = &m[i];
+        if (!largest || a > (long)largest->w * largest->h) largest = &m[i];
+    }
+    const CaptureMode *pick = exact ? exact : cover ? cover : largest;
+    if (!pick) return false;
+    *w = pick->w; *h = pick->h;
+    return true;
 }
 
 /* ── close ──────────────────────────────────── */
@@ -745,6 +937,8 @@ void capture_close(V4L2Capture *cap)
     for (int i = 0; i < cap->nbuf; i++)
         munmap(cap->bufs[i].start, cap->bufs[i].length);
     if (cap->sws) sws_freeContext(cap->sws);
+    if (cap->ysws) sws_freeContext(cap->ysws);
+    free(cap->ytmp);
     if (cap->mjpeg_ctx)   avcodec_free_context(&cap->mjpeg_ctx);
     if (cap->mjpeg_pkt)   av_packet_free(&cap->mjpeg_pkt);
     if (cap->mjpeg_frame) av_frame_free(&cap->mjpeg_frame);

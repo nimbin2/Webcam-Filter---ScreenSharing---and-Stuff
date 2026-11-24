@@ -5,7 +5,7 @@
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
  *
- * Modified-by: Claude Opus 5.5 (control API hook, multi-client, VCAM_SOCK)
+ * Modified-by: Claude Opus 5.5 (control API hook, multi-client, VCAM_SOCK, help)
  */
 
 /*
@@ -851,6 +851,9 @@ static void handle_command(int client_fd, char *line, OverlayRegistry *reg)
         send_line(client_fd, "OK   capture [get] | formats [json]       camera mode / modes the camera offers");
         send_line(client_fd, "OK   capture set [<fmt>] [<WxH>|max] [<fps>] [fit=crop|stretch]   switch camera live");
         send_line(client_fd, "OK   capture fit crop|stretch             fit a different aspect ratio");
+        send_line(client_fd, "OK   stats [json]                         per-stage timings, fps, CPU (last ~1 s)");
+        send_line(client_fd, "OK   idle [auto|off]                      release the camera while no app reads it");
+        send_line(client_fd, "OK   ml [device auto|npu|cpu]             where ML filters run (NPU / CPU)");
         send_line(client_fd, "OK   version                              vcam version + build hash");
         send_line(client_fd, "OK   quit                                 close the connection");
         return;

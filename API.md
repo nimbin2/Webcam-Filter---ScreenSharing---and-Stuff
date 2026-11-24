@@ -16,6 +16,7 @@ Through the API a program can:
 - start / stop a **fullscreen screen share** (the screen replaces the camera image),
 - show the **webcam as a picture-in-picture** (PiP) and move / resize it,
 - **switch the camera** format, resolution and fps live,
+- **watch CPU use** per pipeline step, and see where the ML filters run (NPU or CPU),
 - **read the state**: is sharing on, where is the cam, is the cam over the screen.
 
 vcam must already be running. The API does not start it.
@@ -85,9 +86,9 @@ The whole state in one line.
 
 ```
 → status
-← OK version=1.1.1 build=abc1234 input=webcam output_w=1280 output_h=720 fps=30 share=yes … recording=no
+← OK version=1.2.1 build=abc1234 input=webcam output_w=1280 output_h=720 fps=30 share=yes … recording=no
 → status json
-← {"ok":true,"version":"1.1.1","build":"abc1234","input":"webcam","output_w":1280,…,"recording":false}
+← {"ok":true,"version":"1.2.1","build":"abc1234","input":"webcam","output_w":1280,…,"recording":false}
 ```
 
 Plain form: `key=value` pairs separated by spaces, with booleans as `yes` / `no`.
@@ -96,7 +97,7 @@ Values never contain spaces.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `version` | string | vcam version, e.g. `1.1.1` |
+| `version` | string | vcam version, e.g. `1.2.1` |
 | `build` | string | md5 build hash (7 chars) |
 | `input` | string | `webcam`, or `none` if vcam was started with `--no-input` |
 | `output_w`, `output_h` | int | output frame size |
@@ -107,6 +108,15 @@ Values never contain spaces.
 | `capture_w`, `capture_h` | int | camera resolution (0 when off) |
 | `capture_fps` | int | camera frame rate (0 when off) |
 | `capture_fit` | string | `crop` or `stretch`; `-` when off |
+| `idle` | bool | vcam is idle: no reader, camera released (see `idle`) |
+| `idle_mode` | string | `auto` or `off` |
+| `consumers` | int | processes that have the virtual camera open; `-1` = unknown |
+| `path` | string | `fast`, `full`, `idle` or `nocam` (see `stats`) |
+| `ml_device` | string | requested ML device: `auto`, `npu`, `cpu` |
+| `ml_threads` | int | CPU threads per ML model |
+| `npu` | bool | Ryzen AI NPU hardware present |
+| `npu_runtime` | bool | the ONNX Runtime in use can drive the NPU |
+| `ml_matting`, `ml_pose`, `ml_depth`, `ml_genai` | string | where each model runs: `npu`, `cpu`, `off` |
 | `share` | bool | a screen overlay exists |
 | `share_id` | string | its overlay id (`share` when started via the API), `-` if none |
 | `share_fullscreen` | bool | the screen overlay covers the whole output |
@@ -147,7 +157,7 @@ One value from `status`, in plain form.
 ### `version`
 
 ```
-→ version   ← OK vcam 1.1.1 (build abc1234)
+→ version   ← OK vcam 1.2.1 (build abc1234)
 ```
 
 ### `monitors`
@@ -299,10 +309,79 @@ A switch takes about 0.2 to 1 s, and the picture pauses briefly.
 A mode smaller than the output is upscaled, so it looks softer, but it
 needs less USB bandwidth and CPU.
 
+### `stats` and `stats json`
+
+What vcam spent per frame over the last ~1 s. Useful to watch CPU use.
+
+```
+→ stats
+← OK window_s=1.00 path=fast idle=no consumers=1 fps_in=30.0 fps_out=30.0 cpu=8.4 budget_ms=33.3 work_ms=4.95 capture_ms=4.90 filters_ms=0.00 compose_ms=0.00 output_ms=0.05 ml_matting_ms=0.0 ml_pose_ms=0.0 ml_depth_ms=0.0 ml_genai_ms=0.0 frames=1234
+```
+
+| Key | Meaning |
+|---|---|
+| `path` | `fast`: camera straight to the output (no filters, overlays or recording); `full`: the full BGR pipeline; `idle`: nobody reads, camera released; `nocam`: no camera picture |
+| `fps_in`, `fps_out` | camera frames read, frames written to the virtual camera |
+| `cpu` | vcam's CPU use, % of one core (all threads) |
+| `budget_ms` | time available per frame (1000 / fps) |
+| `work_ms` | `capture_ms` + `filters_ms` + `compose_ms` + `output_ms`, per frame |
+| `capture_ms` | decode + convert of a camera frame (waiting for the camera is not counted) |
+| `ml_*_ms` | average time per inference of each ML model; 0 = not used |
+| `frames` | frames written since start |
+
+`stats json` returns the same as one JSON object.
+
+### `idle [auto|off]`
+
+With `auto` (default), vcam goes idle when no other process has the
+virtual camera open for 3 s:
+
+- it releases the real camera (its LED goes off),
+- it sends one black frame per second, so the virtual camera stays visible.
+
+When an app opens the virtual camera, vcam wakes up at once and reopens
+the camera in its last mode; that takes about 0.3 s. Recording keeps vcam
+awake. `off` keeps vcam running all the time.
+
+```
+→ idle        ← OK idle=yes mode=auto consumers=0
+→ idle off    ← OK idle=yes mode=off consumers=0     (wakes on the next frame)
+```
+
+vcam counts processes it may inspect in `/proc`: those of the same user,
+or all when vcam runs as root. A reader under a different user would not
+wake it; use `idle off` in that setup.
+
+### `ml [device auto|npu|cpu]`
+
+Where the ML filters run (background matting, `posefx`, `depthfx`,
+`genai`). `auto` (default) uses the Ryzen AI NPU when it is usable,
+else the CPU.
+
+```
+→ ml             ← OK device=auto threads=4 async=on npu=yes npu_runtime=no matting=cpu pose=off depth=off genai=off
+→ ml device cpu  ← OK device=cpu …
+```
+
+| Key | Meaning |
+|---|---|
+| `npu` | NPU hardware present (`/dev/accel/accel0`, driver `amdxdna`) |
+| `npu_runtime` | the ONNX Runtime vcam uses has the Vitis AI provider (needed for the NPU) |
+| `matting`, `pose`, `depth`, `genai` | where each model runs: `npu`, `cpu`, or `off` (not loaded) |
+
+A model that fails to load on the NPU runs on the CPU, alone. A device
+change applies to models loaded afterwards; restart vcam to move
+loaded ones. Startup options: `--ml-device`, `--ml-threads N` (CPU
+threads per model, default 4), `--ml-async on|off`, `--npu-config FILE`.
+
 ## Behaviour to know
 
 - **State is not saved.** After a vcam restart there is no share and no cam,
   the margin is back to 0, and the camera uses the startup mode again.
+- **Default output size is 1280x720** (or the camera mode closest to it)
+  unless vcam is started with `--res`.
+- **While idle** the virtual camera shows black and `capture=no`. Any
+  `capture set` still works; it is applied when vcam wakes.
 - **Other clients can change things** at any time (`vcam-ctl`, hotkeys,
   other apps). Don't cache state; read `status json` before deciding.
 - **`input=none`** (vcam started with `--no-input`): there is no camera,
@@ -408,6 +487,9 @@ printf 'status json\nquit\n' | ncat -U /tmp/vcam.sock     # or: socat - UNIX-CON
 read `share`, `cam` and `cam_over_screen`.
 
 **Corner hotkeys.** Bind `cam pos tl` / `tr` / `bl` / `br`.
+
+**CPU monitor.** Poll `stats json` every second and show `cpu`, `path`
+and `fps_out`.
 
 **Quality picker.** Fill a menu from `capture formats json`, then call
 `capture set <fmt> <WxH> <fps>` with the user's choice.

@@ -4,6 +4,8 @@
  *
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
+ *
+ * Modified-by: Claude Opus 5.5 (RVM matting on a worker thread, --ml-async)
  */
 
 /*
@@ -41,6 +43,8 @@
 #include <cstring>
 #include <string>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
 #include <memory>
 #include <sys/stat.h>
 #include <chrono>
@@ -402,6 +406,102 @@ bool ensure_seg()
  *   2. OpenCV DNN — kept as a fallback; on current OpenCV 5 graph
  *      engines it loads but MISCOMPUTES (empty matte), which the
  *      dead-matte gate below detects, falling through to PP-HumanSeg. */
+/* One RVM pass on ONNX Runtime: frame → full-size alpha (CV_32F), or
+ * empty on failure. Thread-safe: ort_rvm_infer serialises on its lock. */
+cv::Mat rvm_ort_once(const cv::Mat &bgr, int size_w)
+{
+    /* size_w = refinement resolution (the quality knob).
+     * downsample_ratio pins the heavy encoder at ~256px
+     * regardless — RVM's intended realtime operation, which
+     * we can finally use because ORT computes it right. */
+    int IW = size_w;
+    double sc = (double)IW / bgr.cols;
+    int iw = std::max(64, ((int)(bgr.cols*sc)/16)*16);
+    int ih = std::max(64, ((int)(bgr.rows*sc)/16)*16);
+    float ds = (float)std::min(1.0, std::max(0.25, 256.0 / iw));
+    cv::Mat small2;
+    cv::resize(bgr, small2, cv::Size(iw, ih), 0, 0, cv::INTER_AREA);
+    cv::Mat src = cv::dnn::blobFromImage(small2, 1.0/255.0,
+                      cv::Size(iw, ih), cv::Scalar(), true, false);
+    cv::Mat pha(ih, iw, CV_32F);
+    if (!ort_rvm_infer((const float*)src.ptr<float>(0), iw, ih, ds, pha.ptr<float>(0)))
+        return cv::Mat();
+    cv::Mat full;
+    cv::resize(pha, full, bgr.size(), 0, 0, cv::INTER_LINEAR);
+    cv::min(full, 1.0, full);
+    cv::max(full, 0.0, full);
+    return full;
+}
+
+/* ── RVM beside the video loop [Claude Opus 5.5] ──
+ * The video thread hands the newest frame to a worker and immediately
+ * uses the newest finished mask (one inference old). The video never
+ * waits for the model; the mask updates at whatever rate the model
+ * manages (CPU or NPU). Only the first frame (or a size change) runs
+ * synchronously, so there is always a mask. --ml-async off restores
+ * the old inline behaviour. */
+struct RvmAsync {
+    std::mutex m;
+    std::condition_variable cv;
+    std::thread th;
+    bool started = false, stop = false, failed = false, has_job = false;
+    cv::Mat job;  int job_w = 0;
+    cv::Mat result;                       /* never written in place */
+} g_ra;
+
+void rvm_worker()
+{
+    std::unique_lock<std::mutex> lk(g_ra.m);
+    for (;;) {
+        g_ra.cv.wait(lk, [] { return g_ra.stop || g_ra.has_job; });
+        if (g_ra.stop) return;
+        cv::Mat bgr = std::move(g_ra.job);
+        int w = g_ra.job_w;
+        g_ra.has_job = false;
+        lk.unlock();
+        cv::Mat a;
+        try { a = rvm_ort_once(bgr, w); } catch (...) { a.release(); }
+        lk.lock();
+        if (a.empty()) { g_ra.failed = true; return; }
+        g_ra.result = a;                  /* new buffer each time */
+    }
+}
+
+cv::Mat rvm_async(const cv::Mat &bgr, int size_w)
+{
+    std::unique_lock<std::mutex> lk(g_ra.m);
+    if (g_ra.failed) return cv::Mat();
+    if (g_ra.result.empty() || g_ra.result.size() != bgr.size()) {
+        lk.unlock();                      /* first frame / new size: inline once */
+        cv::Mat a = rvm_ort_once(bgr, size_w);
+        if (a.empty()) return cv::Mat();
+        lk.lock();
+        g_ra.result = a;
+    }
+    g_ra.job = bgr.clone();               /* newest frame replaces a pending one */
+    g_ra.job_w = size_w;
+    g_ra.has_job = true;
+    if (!g_ra.started) { g_ra.started = true; g_ra.th = std::thread(rvm_worker); }
+    cv::Mat out = g_ra.result.clone();    /* callers modify their mask in place */
+    lk.unlock();
+    g_ra.cv.notify_one();
+    return out;
+}
+
+void rvm_async_stop()
+{
+    {
+        std::lock_guard<std::mutex> l(g_ra.m);
+        g_ra.stop = true;
+    }
+    g_ra.cv.notify_all();
+    if (g_ra.th.joinable()) g_ra.th.join();
+    std::lock_guard<std::mutex> l(g_ra.m);
+    g_ra.started = g_ra.stop = g_ra.failed = g_ra.has_job = false;
+    g_ra.job.release();
+    g_ra.result.release();
+}
+
 cv::Mat rvm_infer(const cv::Mat &bgr, int size_w)
 {
     if (g_seg.rvm_state < 0) return cv::Mat();
@@ -420,32 +520,9 @@ cv::Mat rvm_infer(const cv::Mat &bgr, int size_w)
                         "(reference runtime — correct, temporally-stable mattes)");
             }
             if (g_seg.ort_state == 1) {
-                /* size_w = refinement resolution (the quality knob).
-                 * downsample_ratio pins the heavy encoder at ~256px
-                 * regardless — RVM's intended realtime operation, which
-                 * we can finally use because ORT computes it right. */
-                int IW = size_w;
-                double sc = (double)IW / bgr.cols;
-                int iw = std::max(64, ((int)(bgr.cols*sc)/16)*16);
-                int ih = std::max(64, ((int)(bgr.rows*sc)/16)*16);
-                float ds = (float)std::min(1.0, std::max(0.25, 256.0 / iw));
-                cv::Mat small2;
-                cv::resize(bgr, small2, cv::Size(iw, ih), 0, 0, cv::INTER_AREA);
-                cv::Mat src = cv::dnn::blobFromImage(small2, 1.0/255.0,
-                                  cv::Size(iw, ih), cv::Scalar(), true, false);
-                cv::Mat pha(ih, iw, CV_32F);
-                if (ort_rvm_infer((const float*)src.ptr<float>(0), iw, ih, ds,
-                                  pha.ptr<float>(0))) {
-                    const char *dbg = std::getenv("VCAM_CV_DEBUG");
-                    if (dbg && *dbg=='1' && g_seg.counter < 6)
-                        std::fprintf(stderr, "[vcam/ort] pha mean=%.4f\n",
-                                     cv::mean(pha)[0]);
-                    cv::Mat full;
-                    cv::resize(pha, full, bgr.size(), 0, 0, cv::INTER_LINEAR);
-                    cv::min(full, 1.0, full);
-                    cv::max(full, 0.0, full);
-                    return full;
-                }
+                cv::Mat a = ort_ml_async() ? rvm_async(bgr, size_w)
+                                           : rvm_ort_once(bgr, size_w);
+                if (!a.empty()) return a;
                 g_seg.ort_state = -1;         /* backend died; fall through */
             }
         } catch (const std::exception &e) {
@@ -8794,6 +8871,7 @@ void cv_clear_bg_image(void)
 
 void cv_shutdown(void)
 {
+    rvm_async_stop();   /* worker uses ORT: stop it first */
     ort_shutdown();
     try {
         { std::lock_guard<std::mutex> l(g_face.mtx); g_face.det.reset(); g_face.faces.release(); }

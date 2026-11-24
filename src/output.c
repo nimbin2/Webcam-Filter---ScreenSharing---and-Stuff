@@ -4,6 +4,9 @@
  *
  * This program is free software under the terms of the GNU General
  * Public License version 2. See the LICENSE file for the full text.
+ *
+ * Modified-by: Claude Opus 5.5 (output_begin/commit for the fast path,
+ *              black frames for idle, BT.601 tag matches the conversion)
  */
 
 /*
@@ -56,6 +59,7 @@ struct V4L2Output {
     OutBuf bufs[NUM_OUT_BUFS];
     int    nbuf;
     bool   streaming;             /* STREAMON called yet? */
+    int    cur;                   /* buffer handed out by output_begin, or -1 */
 
     struct SwsContext *sws;       /* BGR24 → YUYV422 */
 };
@@ -71,6 +75,7 @@ V4L2Output *output_open(const char *device, int width, int height, int fps)
 {
     V4L2Output *out = calloc(1, sizeof *out);
     if (!out) return NULL;
+    out->cur = -1;
 
     out->fd = open(device, O_RDWR);
     if (out->fd < 0) {
@@ -106,12 +111,12 @@ V4L2Output *output_open(const char *device, int width, int height, int fps)
     fmt.fmt.pix.field              = V4L2_FIELD_NONE;
     fmt.fmt.pix.bytesperline       = width * 2;
     fmt.fmt.pix.sizeimage          = width * height * 2;
-    /* Use BT.709 for HD, BT.601 for SD — same as real cameras */
-    fmt.fmt.pix.colorspace         = (height >= 720)
-                                      ? V4L2_COLORSPACE_REC709
-                                      : V4L2_COLORSPACE_SMPTE170M;
-    fmt.fmt.pix.ycbcr_enc          = V4L2_YCBCR_ENC_DEFAULT;
-    fmt.fmt.pix.quantization       = V4L2_QUANTIZATION_DEFAULT;
+    /* BT.601, limited range: that is what every conversion in vcam
+     * produces (swscale's default matrix, and JPEG is 601). Tagging
+     * HD as 709 made colour-aware consumers shift colours slightly. */
+    fmt.fmt.pix.colorspace         = V4L2_COLORSPACE_SMPTE170M;
+    fmt.fmt.pix.ycbcr_enc          = V4L2_YCBCR_ENC_601;
+    fmt.fmt.pix.quantization       = V4L2_QUANTIZATION_LIM_RANGE;
     fmt.fmt.pix.xfer_func          = V4L2_XFER_FUNC_DEFAULT;
 
     if (xioctl(out->fd, VIDIOC_S_FMT, &fmt) < 0) {
@@ -186,43 +191,40 @@ V4L2Output *output_open(const char *device, int width, int height, int fps)
 
     fprintf(stderr, "[output] %s  %dx%d @ %d fps  YUYV422  "
                     "colorspace=%s  buffers=%d (streaming I/O)\n",
-            device, out->width, out->height, fps,
-            (out->height >= 720) ? "BT.709" : "BT.601",
-            out->nbuf);
+            device, out->width, out->height, fps, "BT.601", out->nbuf);
     return out;
 }
 
-bool output_write(V4L2Output *out, const Frame *frame)
+/* Hand out a free mmap'd buffer to write one YUYV frame into. */
+uint8_t *output_begin(V4L2Output *out, int *stride)
 {
-    /* Find a free (not-queued) buffer */
     int idx = -1;
     for (int i = 0; i < out->nbuf; i++) {
         if (!out->bufs[i].queued) { idx = i; break; }
     }
-
     if (idx < 0) {
         /* All buffers in kernel — dequeue one back */
         struct v4l2_buffer buf = {0};
         buf.type   = V4L2_BUF_TYPE_VIDEO_OUTPUT;
         buf.memory = V4L2_MEMORY_MMAP;
         if (xioctl(out->fd, VIDIOC_DQBUF, &buf) < 0) {
-            if (errno == EAGAIN) return true;
-            perror("[output] VIDIOC_DQBUF");
-            return false;
+            if (errno != EAGAIN) perror("[output] VIDIOC_DQBUF");
+            return NULL;
         }
         idx = buf.index;
         out->bufs[idx].queued = false;
     }
+    out->cur = idx;
+    if (stride) *stride = out->width * 2;
+    return out->bufs[idx].start;
+}
 
-    /* Convert BGR24 → YUYV422 directly into the mmap'd buffer */
-    const uint8_t *src[4] = { frame->data, NULL, NULL, NULL };
-    int src_stride[4]     = { frame->stride, 0, 0, 0 };
-    uint8_t *dst[4]       = { out->bufs[idx].start, NULL, NULL, NULL };
-    int dst_stride[4]     = { out->width * 2, 0, 0, 0 };
-
-    sws_scale(out->sws, src, src_stride, 0, out->height, dst, dst_stride);
-
-    /* Queue it to the kernel */
+/* Queue the buffer from output_begin() to the kernel. */
+bool output_commit(V4L2Output *out)
+{
+    int idx = out->cur;
+    if (idx < 0) return false;
+    out->cur = -1;
     struct v4l2_buffer qbuf = {0};
     qbuf.type      = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     qbuf.memory    = V4L2_MEMORY_MMAP;
@@ -246,6 +248,33 @@ bool output_write(V4L2Output *out, const Frame *frame)
         fprintf(stderr, "[output] streaming started\n");
     }
     return true;
+}
+
+bool output_write(V4L2Output *out, const Frame *frame)
+{
+    int stride;
+    uint8_t *dstp = output_begin(out, &stride);
+    if (!dstp) return errno == EAGAIN;   /* consumer is behind: drop frame */
+
+    /* Convert BGR24 → YUYV422 directly into the mmap'd buffer */
+    const uint8_t *src[4] = { frame->data, NULL, NULL, NULL };
+    int src_stride[4]     = { frame->stride, 0, 0, 0 };
+    uint8_t *dst[4]       = { dstp, NULL, NULL, NULL };
+    int dst_stride[4]     = { stride, 0, 0, 0 };
+    sws_scale(out->sws, src, src_stride, 0, out->height, dst, dst_stride);
+    return output_commit(out);
+}
+
+/* One black YUYV frame (Y=16, U=V=128) — used while idle. */
+bool output_write_black(V4L2Output *out)
+{
+    int stride;
+    uint8_t *dstp = output_begin(out, &stride);
+    if (!dstp) return errno == EAGAIN;
+    uint32_t *p = (uint32_t *)dstp;
+    size_t n = (size_t)out->frame_size / 4;
+    for (size_t i = 0; i < n; i++) p[i] = 0x80108010u;   /* bytes 16,128,16,128 */
+    return output_commit(out);
 }
 
 void output_close(V4L2Output *out)
