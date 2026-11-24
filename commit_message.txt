@@ -1,23 +1,35 @@
-Add control API for screen sharing and webcam PiP (vcam 1.0.0)
+Cut idle CPU, add fast path, stats and NPU-ready ML (vcam 1.2.1)
 
-New high-level commands on the IPC socket, built for other apps:
-- status [json] / get <key>: machine-readable state (share on/off,
-  fullscreen, monitor, cam position/size, cam_over_screen, ...)
-- share start|stop|toggle: fullscreen share of a monitor (by index,
-  name or WxH+X+Y), with optional cam=<pos> in one call
-- cam on|off|toggle|pos|move|size|margin|raise|get: webcam PiP control
-- monitors: server-side detection (sway, Hyprland, wlr-randr, xrandr,
-  /sys/class/drm fallback)
-- version: version + md5 build hash (also vcam --version, make version)
+Performance:
+- Default output 1280x720 (or the closest camera mode) instead of the
+  camera maximum; a 5 MP output cost ~5x the CPU for nothing.
+- Fast path: with no filters, overlays or recording, camera frames go
+  straight into the loopback buffer as YUYV (LUT interleave for MJPEG,
+  plain copy for YUYV) instead of YUV -> BGR -> YUV.
+- Idle mode (--idle auto|off, API 'idle'): when no other process has the
+  loopback open for 3 s, release the camera and send one black frame per
+  second; wake immediately on open(). inotify triggers, /proc counts
+  (src/consumers.c).
+- 'stats [json]': per-stage ms, fps in/out, process CPU, path.
 
-IPC: one thread per client (commands serialised), so a long-lived
-controller no longer blocks vcam-ctl. VCAM_SOCK now also works for the
-daemon. vcam-ctl wraps the new commands with bare output and exit 1 on
-ERR.
+ML / NPU:
+- One session builder for all four ONNX models: Ryzen AI NPU via the
+  Vitis AI EP when hardware (/dev/accel/accel0, amdxdna) and runtime are
+  present, per-model CPU fallback, compiled-model cache in
+  ~/.cache/vcam/npu. --ml-device auto|npu|cpu, --npu-config, API 'ml'.
+- CPU threads per model capped (--ml-threads, default 4) instead of all
+  cores.
+- RVM matting runs on a worker thread (--ml-async on|off): the video
+  never waits for the model.
+- Inference time per model in 'stats'.
 
-Also: webcam overlay aspect fix-up now rounds height like resolve_dims
-(no 1px jump on first frame), Makefile defaults to PREFIX=/usr, README
-gets a Control API section.
+Fixes:
+- Output tagged BT.601 limited range, matching what vcam produces
+  (HD was tagged BT.709).
+- Planar camera formats (NV12, YU12) passed only plane 0 to swscale.
+- vcam-ctl --version.
+- consumers.c: request X/Open explicitly for realpath() (glibc 2.43
+  hides it under plain _POSIX_C_SOURCE=200809L).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01MZiVJi7adqtP79SuimnK7v
